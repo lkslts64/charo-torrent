@@ -78,16 +78,18 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 			b.WriteString(strconv.Itoa(len(s)) + ":" + string(s))
 			break
 		}
-		if v.IsNil() {
-			b.WriteString("le")
-			break
-		}
-		b.WriteString("l")
-		for i := 0; i < v.Len(); i++ {
-			if err := encode(v.Index(i), b); err != nil {
-				return err
+		if t.Elem().Kind() != reflect.Uint8 {
+			if v.IsNil() {
+				b.WriteString("le")
+				break
 			}
+			b.WriteString("l")
+			for i := 0; i < v.Len(); i++ {
+				if err := encode(v.Index(i), b); err != nil {
+					return err
+				}
 
+			}
 		}
 		b.WriteString("e")
 	//d<bencoded string><bencoded element>e
