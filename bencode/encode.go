@@ -15,7 +15,11 @@ import (
 //emptiness, then a tag should be added like: `bencode:"-"
 func Encode(v interface{}) ([]byte, error) {
 	var b bytes.Buffer
-	err := encode(reflect.ValueOf(v), &b)
+	val := reflect.ValueOf(v)
+	if !val.IsValid() {
+		return []byte(""), nil
+	}
+	err := encode(val, &b)
 	if err != nil {
 		return nil, err
 	}
@@ -31,18 +35,18 @@ func Encode(v interface{}) ([]byte, error) {
 //int64 should be enough for most of the torrents sizes.
 func encode(v reflect.Value, b *bytes.Buffer) error {
 	if !v.IsValid() {
-		return nil
+		panic("did not expected zero value at start of encode func.Developers mistake!")
 	}
 	t := v.Type()
 	switch t.Kind() {
-	//'dereference' pointer or look 'inside' the interface.
+	//'dereference' pointer.
 	case reflect.Ptr:
 		if !v.Elem().IsValid() { //propably equivilent to v.isNil()
-			handleNilValuePtr(t, b)
-		}
-		if err := encode(v.Elem(), b); err != nil {
+			handleNilPtr(t, b)
+		} else if err := encode(v.Elem(), b); err != nil {
 			return err
 		}
+	//look inside the interface.
 	case reflect.Interface:
 		//ignore nil interfaces?- tricky decision
 		if !v.Elem().IsValid() {
@@ -51,25 +55,20 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 		if err := encode(v.Elem(), b); err != nil {
 			return err
 		}
-	//i<integer encoded in base ten ASCII>e
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		s := strconv.FormatInt(v.Int(), 10)
 		b.WriteString("i" + s + "e")
-	//i<integer encoded in base ten ASCII>e
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		s := strconv.FormatUint(v.Uint(), 10)
 		b.WriteString("i" + s + "e")
-	//bool is like integer values.True corresponds to 1 and false to 0.
 	case reflect.Bool:
 		if v.Bool() {
 			b.WriteString("i1e")
 			break
 		}
 		b.WriteString("i0e")
-	//<string length encoded in base ten ASCII>:<string data>
 	case reflect.String:
 		b.WriteString(strconv.Itoa(len(v.String())) + ":" + v.String())
-	// l<bencoded values>e
 	case reflect.Slice:
 		//if it's a slice of Uint8 (aka bytes), then encode as string.
 		//else, as bencode type.
@@ -92,7 +91,6 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 			}
 		}
 		b.WriteString("e")
-	//d<bencoded string><bencoded element>e
 	case reflect.Map:
 		if t.Key().Kind() != reflect.String {
 			return errors.New("map keys are not of type string")
@@ -113,7 +111,6 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 		}
 		b.WriteString("e")
 	//treat struct like dicts - field name is the key of the dict.
-	//d<bencoded string><bencoded element>e
 	case reflect.Struct:
 		if v.NumField() == 0 {
 			b.WriteString("de")
@@ -126,7 +123,7 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 		b.WriteString("d")
 		for i := 0; i < v.NumField(); i++ {
 			fvalue := v.FieldByName(sf[i].Name)
-			//if field is a nil pointer and struct tag == omitempty , then ignore this field.
+			//if bencode tag == "-" OR field is a nil pointer and struct tag == omitempty , then ignore this field.
 			if sf[i].Tag.Get("bencode") == "-" || (fvalue.Type().Kind() == reflect.Ptr && !fvalue.Elem().IsValid() && sf[i].Tag.Get("empty") == "omit") {
 				continue
 			}
@@ -143,7 +140,7 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 	return nil
 }
 
-func handleNilValuePtr(t reflect.Type, b *bytes.Buffer) {
+func handleNilPtr(t reflect.Type, b *bytes.Buffer) {
 	e := t.Elem()
 	switch e.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
