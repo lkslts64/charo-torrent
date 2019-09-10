@@ -3,7 +3,9 @@ package bencode
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	//"io/ioutil"
 	"reflect"
 	"strconv"
 )
@@ -18,12 +20,14 @@ func Decode(data []byte, v interface{}) error {
 		return errors.New("Provided pointers is nil.")
 	}
 	r := benReader{bytes.NewBuffer(data)}
-	err := decode(r, val)
+	err := decode(r, val.Elem())
 	if err != nil {
 		return err
 	}
-	_, err = r.b.ReadByte()
+	b, err := r.b.ReadByte()
 	if err == nil || err != io.EOF {
+		//left, _ := ioutil.ReadAll(r.b)
+		fmt.Println(string(b), "AAAAAAAAAAAAA")
 		return errors.New("data structure provided was filled but bencoded buffer wasn't consumed")
 	}
 	return nil
@@ -36,14 +40,39 @@ func decode(r benReader, v reflect.Value) error {
 	if !v.IsValid() {
 		panic("did not expected zero value at start of decode func.Developer's mistake!")
 	}
+	if !v.CanSet() {
+		fmt.Println(v.Type())
+	}
 	t := v.Type()
 	switch v.Kind() {
+	//TODO: handle properly interface types ( nil - empty interfaces)
 	case reflect.Interface:
-		if !v.Elem().IsValid() {
-			handleNilInterface(r, v)
-		} else if err := decode(r, v.Elem()); err != nil {
-			return err
+		if v.NumMethod() == 0 {
+			err := handleNilInterface(r, v)
+			if err != nil {
+				return err
+			}
+		} else {
+			return errors.New("Cant handle non empty interfaces right now...")
 		}
+		/*if !v.Elem().IsValid() && v.NumMethod() == 0 {
+			err := handleNilInterface(r, v)
+			if err != nil {
+				return err
+			}
+		} else {
+			e := reflect.New(v.Elem().Type()).Elem()
+			err := decode(r, e)
+			if err != nil {
+				return err
+			}
+			v.Set(e)
+		}
+
+		else if err := decode(r, v.Elem()); err != nil {
+			return err
+		}*/
+
 	case reflect.Ptr:
 		//if pointer is nil,create a new zeroed (but not nil) value of type v.Elem()
 		//and pass this to decode. After, set this value to v.Elem()
@@ -89,7 +118,8 @@ func decode(r benReader, v reflect.Value) error {
 			v.SetBytes(bytes)
 			break
 		}
-		err := r.readBenList(v)
+		v, err := r.readBenList(v)
+		fmt.Println("MAIN:", v)
 		if err != nil {
 			return err
 		}
@@ -124,6 +154,7 @@ func (r benReader) readBenString() ([]byte, error) {
 	if len(str) != int(str_len) {
 		return nil, errors.New("length of string does not correspond to his actual length")
 	}
+	fmt.Println("str_len is:", str_len, "and str is:", string(str))
 	return str, nil
 }
 
@@ -133,7 +164,7 @@ func (r benReader) readBenInt() (int64, error) {
 		return -1, err
 	}
 	if benInt[0] != 'i' {
-		return -1, errors.New("Wanted integer but bencoded hasn't")
+		return -1, errors.New("Wanted integer but bencoded hasn't. benInt :" + string(benInt))
 	}
 	num, err := strconv.ParseInt(benInt[1:len(benInt)-1], 10, 64)
 	if err != nil {
@@ -169,13 +200,14 @@ func (r benReader) readBenBool() (bool, error) {
 }
 
 //v can be only of type reflect.Slice.
-func (r benReader) readBenList(v reflect.Value) error {
+func (r benReader) readBenList(v reflect.Value) (reflect.Value, error) {
+	var dummy reflect.Value
 	b, err := r.b.ReadByte()
 	if err != nil {
-		return err
+		return dummy, err
 	}
 	if b != 'l' {
-		return errors.New("Bencoded has list whereas data structure doesn't.")
+		return dummy, errors.New("Bencoded has list whereas data structure doesn't.")
 	}
 	//create a new value whos type is the type of the elements of the slice(v).
 	//this is the type that we will expect to be contained in the bencoded string.
@@ -185,22 +217,22 @@ func (r benReader) readBenList(v reflect.Value) error {
 	//after decoding, append the decoded value to the slice (v).
 	for {
 		if b, err = r.b.ReadByte(); err != nil {
-			return err
+			return dummy, err
 		}
 		if b == 'e' {
 			break
 		}
 		err = r.b.UnreadByte()
 		if err != nil {
-			return err
+			return dummy, err
 		}
 		err := decode(r, e)
 		if err != nil {
-			return err
+			return dummy, err
 		}
-		reflect.Append(v, e)
+		v.Set(reflect.Append(v, e))
 	}
-	return nil
+	return v, nil
 }
 
 //v can be only of type reflect.Map.
@@ -288,7 +320,7 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 //if we have a nil interface, then we dont
 //know which bencoded type to expect. What
 //we can do is set the interface to the type
-//the next bencoded values will be.
+//the next bencoded value will be.
 func handleNilInterface(r benReader, v reflect.Value) error {
 	b, err := r.b.ReadByte()
 	if err != nil {
@@ -297,14 +329,17 @@ func handleNilInterface(r benReader, v reflect.Value) error {
 	switch {
 	case b == 'i':
 		var num int64
-		err = setNilInterface(r, v, reflect.ValueOf(num))
-	case b >= 48 && b <= 57:
+		err = setNilInterface(r, v, reflect.ValueOf(&num).Elem())
+	case b >= '0' && b <= '9':
+		fmt.Println("got into handle string nil eface:", v)
 		var s string
-		err = setNilInterface(r, v, reflect.ValueOf(s))
+		err = setNilInterface(r, v, reflect.ValueOf(&s).Elem())
 	case b == 'l':
-		err = setNilInterface(r, v, reflect.ValueOf([]interface{}{}))
+		err = setNilInterface(r, v, reflect.ValueOf(&[]interface{}{}).Elem())
 	case b == 'd':
-		err = setNilInterface(r, v, reflect.ValueOf(map[string]interface{}{}))
+		err = setNilInterface(r, v, reflect.ValueOf(&map[string]interface{}{}).Elem())
+	default:
+		return errors.New("No case was satisfied in handleNilInterface. byte is: " + string(b))
 	}
 	if err != nil {
 		return err
@@ -312,20 +347,19 @@ func handleNilInterface(r benReader, v reflect.Value) error {
 	return nil
 }
 
-//set the specified value (v) to interface (i), and call decode
-//on the no longer nil interface.Before decode, call unreadbyte
-//to unread the byte read from handleNilInterface. The goal of
-//this func is to fill a nil-empty interface with an underlying
-//type in a transparent way.
+//We know what type the interface should have (see handleNilInterface),
+//so we call decode to get the data from the bencoded buffer and after
+//we Set the data to the interface (i).
 func setNilInterface(r benReader, i, v reflect.Value) error {
-	i.Set(v)
 	err := r.b.UnreadByte()
 	if err != nil {
 		return err
 	}
-	err = decode(r, i)
+	err = decode(r, v)
+	fmt.Println("GO MAIN SETNIL:", v)
 	if err != nil {
 		return err
 	}
+	i.Set(v)
 	return nil
 }
