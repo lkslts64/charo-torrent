@@ -4,8 +4,9 @@ import (
 	"testing"
 
 	"fmt"
+
 	"github.com/stretchr/testify/assert"
-	//"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/require"
 )
 
 type random_decode_test struct {
@@ -23,7 +24,13 @@ var random_decode_tests = []random_decode_test{
 		[]interface{}{int64(5), int64(10), int64(15), int64(20), "bencode"}},
 	{"ldedee", []interface{}{map[string]interface{}{}, map[string]interface{}{}}},
 	{"le", []interface{}{}},
-	{"d1:rd6:\xd4/\xe2F\x00\x01e1:t3:\x9a\x87\x011:v4:TR%=1:y1:re", map[string]interface{}{
+	/*{"d1:rd6:\xd4/\xe2F\x00\x01e1:t3:\x9a\x87\x011:v4:TR%=1:y1:re", map[string]interface{}{
+		"r": map[string]interface{}{},
+		"t": "\x9a\x87\x01",
+		"v": "TR%=",
+		"y": "r",
+	}},*/
+	{"d1:rde1:t3:\x9a\x87\x011:v4:TR%=1:y1:re", map[string]interface{}{
 		"r": map[string]interface{}{},
 		"t": "\x9a\x87\x01",
 		"v": "TR%=",
@@ -43,4 +50,28 @@ func TestRandomDecode(t *testing.T) {
 		fmt.Println(value, value)
 
 	}
+}
+
+func TestIgnoreUnmarshalTypeError(t *testing.T) {
+	s := struct {
+		Ignore int
+		Normal int
+	}{}
+
+	err := Decode([]byte("d6:Ignorei5454e5:helloi54534ee"), &s)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println(s)
+}
+
+func TestDecodeCustomSlice(t *testing.T) {
+	type flag byte
+	var fs3 []flag
+	// We do a longer slice then a shorter slice to see if the buffers are
+	// shared.
+	require.NoError(t, Decode([]byte("3:\x01\x10\xff"), &fs3))
+	//require.NoError(t, Decode([]byte("3:\x01\x10\xff2:\x04\x0f"), &fs2))
+	assert.EqualValues(t, []flag{1, 16, 255}, fs3)
+	//assert.EqualValues(t, []flag{4, 15}, fs2)
 }
