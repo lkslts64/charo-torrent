@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"fmt"
+	"io/ioutil"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,7 +53,7 @@ func TestRandomDecode(t *testing.T) {
 	}
 }
 
-func TestIgnoreUnmarshalTypeError(t *testing.T) {
+func TestSimpleDict(t *testing.T) {
 	s := struct {
 		Ignore int
 		Normal int
@@ -74,4 +75,19 @@ func TestDecodeCustomSlice(t *testing.T) {
 	//require.NoError(t, Decode([]byte("3:\x01\x10\xff2:\x04\x0f"), &fs2))
 	assert.EqualValues(t, []flag{1, 16, 255}, fs3)
 	//assert.EqualValues(t, []flag{4, 15}, fs2)
+}
+
+//Test a real torrent file.
+func TestTorrentFile(t *testing.T) {
+	data, err := ioutil.ReadFile("test/alice.torrent")
+	if err != nil {
+		fmt.Println(err)
+	}
+	var i interface{}
+	err = Decode(data, &i)
+	if err != nil {
+		fmt.Println(err)
+	}
+	fmt.Println(i)
+
 }
