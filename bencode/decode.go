@@ -63,6 +63,7 @@ func decode(r benReader, v reflect.Value) error {
 				return err
 			}
 			v.Elem().Set(e)
+			//or v.Set(e.Addr)
 		} else if err := decode(r, v.Elem()); err != nil {
 			return err
 		}
@@ -268,29 +269,71 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 	if b != 'd' {
 		return errors.New("Bencoded has dict whereas data structure doesn't.")
 	}
+	t := v.Type()
+	var benKey []byte
+	nonOmit := map[string]struct{}{}
+	fnames := map[string]string{}
+	//Store which struct fields must always be present in the bencoded buffer as keys (nonOmit)
+	//and what names the struct fields should have (fnames).
 	for i := 0; i < v.NumField(); i++ {
-		//ignore fields that have bencode tag set to '-'.
-		if val := v.Type().Field(i).Tag.Get("bencode"); val == "-" {
+		sf := t.Field(i)
+		key := sf.Tag.Get("bencode")
+		if key == "-" {
 			continue
 		}
-		//we may want to use the bencoded key to compare it with
-		//the struct field name, but ignore it for now.
-		_, err := r.readBenString()
+		if ekey := sf.Tag.Get("empty"); ekey != "omit" {
+			nonOmit[sf.Name] = struct{}{}
+		}
+		if key != "" {
+			fnames[key] = sf.Name
+		} else {
+			fnames[sf.Name] = sf.Name
+		}
+	}
+	//decode loop
+	for {
+		if b, err = r.b.ReadByte(); err != nil {
+			return err
+		}
+		if b == 'e' {
+			break
+		}
+		err = r.b.UnreadByte()
 		if err != nil {
 			return err
 		}
-		fv := v.Field(i)
-		err = decode(r, fv)
+		benKey, err = r.readBenString()
 		if err != nil {
 			return err
 		}
+		sbenKey := string(benKey)
+		//if there is a struct field with the same name as bencoded key,
+		//decode the field value and delete the key from the nonOmit dict
+		//if the key has not tag empty:"omit"
+		if fname, ok := fnames[sbenKey]; ok {
+			_, ok = nonOmit[fname]
+			if ok {
+				delete(nonOmit, fname)
+			}
+			fv := v.FieldByName(fname)
+			if !fv.IsValid() {
+				panic("Developer mistake.Decode struct: Got field value zero with fname: " + fname)
+			}
+			err = decode(r, fv)
+			if err != nil {
+				return err
+			}
+		} else {
+			return errors.New("No struct field with name: " + sbenKey)
+		}
 	}
-	b, err = r.b.ReadByte()
-	if err != nil {
-		return err
-	}
-	if b != 'e' {
-		return errors.New("No 'e' at end of dictionary")
+	//check if all mandatory fields were present in bencoded buffer.
+	if len(nonOmit) != 0 {
+		var s string
+		for k := range nonOmit {
+			s = s + "," + k
+		}
+		return errors.New("Some filled of the struct were not filled and they were not to be ommited: " + s)
 	}
 	return nil
 }
