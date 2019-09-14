@@ -53,17 +53,36 @@ func TestRandomDecode(t *testing.T) {
 	}
 }
 
-func TestSimpleDict(t *testing.T) {
+func TestSimpleStruct(t *testing.T) {
 	s := struct {
-		Ignore int
-		Normal int
+		Normal int `bencode:"hello" empty:"omit"`
+		Ignore int `bencode:"amg" empty:"omit"`
 	}{}
 
-	err := Decode([]byte("d6:Ignorei5454e5:helloi54534ee"), &s)
+	err := Decode([]byte("d3:amgi5ee"), &s)
+	if err != nil {
+		t.Error(err)
+	}
+	fmt.Println(s)
+}
+
+type S struct {
+	Ignore int
+	Normal int
+}
+
+func TestDecodeEface(t *testing.T) {
+	//var s S
+	var i interface{}
+	err := Decode([]byte("d6:Ignorei5454e5:helloi54534ee"), &i)
 	if err != nil {
 		fmt.Println(err)
 	}
-	fmt.Println(s)
+	s, ok := i.(S)
+	fmt.Println(ok, i, "blabla")
+	if ok {
+		fmt.Println(s)
+	}
 }
 
 func TestDecodeCustomSlice(t *testing.T) {
@@ -78,16 +97,20 @@ func TestDecodeCustomSlice(t *testing.T) {
 }
 
 //Test a real torrent file.
-func TestTorrentFile(t *testing.T) {
-	data, err := ioutil.ReadFile("test/alice.torrent")
-	if err != nil {
-		fmt.Println(err)
-	}
-	var i interface{}
-	err = Decode(data, &i)
-	if err != nil {
-		fmt.Println(err)
-	}
-	fmt.Println(i)
+func TestTorrentFiles(t *testing.T) {
+	files := []string{"test/alice.torrent", "test/a.torrent"}
+	for _, f := range files {
+		data, err := ioutil.ReadFile(f)
+		if err != nil {
+			fmt.Println(err)
+		}
+		var i interface{}
+		err = Decode(data, &i)
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(i)
+		fmt.Println("-------------------------------------------------------------------------")
 
+	}
 }
