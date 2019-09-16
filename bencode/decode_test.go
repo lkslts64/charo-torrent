@@ -53,6 +53,29 @@ func TestRandomDecode(t *testing.T) {
 	}
 }
 
+func TestStructWithDuplicateTags(t *testing.T) {
+	s := struct {
+		Normal  int    `bencode:"amg" empty:"omit"`
+		Ignore  string `bencode:"amg" empty:"omit"`
+		Another string
+	}{}
+
+	err := Decode([]byte("d3:amgi5e7:Another4:memee"), &s)
+	assert.EqualValues(t, struct {
+		Normal  int
+		Ignore  string
+		Another string
+	}{
+		Normal:  5,
+		Ignore:  "",
+		Another: "meme",
+	}, s)
+	if err != nil {
+		t.Error(err)
+	}
+	fmt.Println(s)
+}
+
 func TestSimpleStruct(t *testing.T) {
 	s := struct {
 		Normal int `bencode:"hello" empty:"omit"`

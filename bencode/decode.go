@@ -6,6 +6,7 @@ import (
 	"io"
 	"reflect"
 	"strconv"
+	"strings"
 )
 
 //Decode the bencoded string based on v.
@@ -195,17 +196,14 @@ func (r benReader) readBenList(v reflect.Value) error {
 	//until you traverse an 'e' who is the first byte of a bencoded value.
 	//after decoding, append the decoded value to the slice (v).
 	for {
-		if b, err = r.b.ReadByte(); err != nil {
-			return err
-		}
-		if b == 'e' {
-			break
-		}
-		err = r.b.UnreadByte()
+		ok, err := r.CheckEnd()
 		if err != nil {
 			return err
 		}
-		err := decode(r, e)
+		if ok {
+			break
+		}
+		err = decode(r, e)
 		if err != nil {
 			return err
 		}
@@ -216,12 +214,9 @@ func (r benReader) readBenList(v reflect.Value) error {
 
 //v can be only of type reflect.Map.
 func (r benReader) readBenDictMap(v reflect.Value) error {
-	b, err := r.b.ReadByte()
+	err := r.AssertDictStart()
 	if err != nil {
 		return err
-	}
-	if b != 'd' {
-		return errors.New("Bencoded has dict whereas data structure doesn't.")
 	}
 	t := v.Type()
 	keyType := t.Key()
@@ -237,15 +232,12 @@ func (r benReader) readBenDictMap(v reflect.Value) error {
 	//Iterate and start decoding values until you see an 'e' as the
 	//first byte of a bencoded value.
 	for {
-		if b, err = r.b.ReadByte(); err != nil {
-			return err
-		}
-		if b == 'e' {
-			break
-		}
-		err = r.b.UnreadByte()
+		ok, err := r.CheckEnd()
 		if err != nil {
 			return err
+		}
+		if ok {
+			break
 		}
 		err = decode(r, keyVal)
 		if err != nil {
@@ -262,45 +254,20 @@ func (r benReader) readBenDictMap(v reflect.Value) error {
 
 //v can be only of type reflect.Struct.
 func (r benReader) readBenDictStruct(v reflect.Value) error {
-	b, err := r.b.ReadByte()
+	err := r.AssertDictStart()
 	if err != nil {
 		return err
 	}
-	if b != 'd' {
-		return errors.New("Bencoded has dict whereas data structure doesn't.")
-	}
-	t := v.Type()
-	var benKey []byte
-	nonOmit := map[string]struct{}{}
-	fnames := map[string]string{}
-	//Store which struct fields must always be present in the bencoded buffer as keys (nonOmit)
-	//and what names the struct fields should have (fnames).
-	for i := 0; i < v.NumField(); i++ {
-		sf := t.Field(i)
-		key := sf.Tag.Get("bencode")
-		if key == "-" {
-			continue
-		}
-		if ekey := sf.Tag.Get("empty"); ekey != "omit" {
-			nonOmit[sf.Name] = struct{}{}
-		}
-		if key != "" {
-			fnames[key] = sf.Name
-		} else {
-			fnames[sf.Name] = sf.Name
-		}
-	}
+	nonOmit, fnames := structInfo(v)
 	//decode loop
+	var benKey []byte
 	for {
-		if b, err = r.b.ReadByte(); err != nil {
-			return err
-		}
-		if b == 'e' {
-			break
-		}
-		err = r.b.UnreadByte()
+		ok, err := r.CheckEnd()
 		if err != nil {
 			return err
+		}
+		if ok {
+			break
 		}
 		benKey, err = r.readBenString()
 		if err != nil {
@@ -308,20 +275,48 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 		}
 		sbenKey := string(benKey)
 		//if there is a struct field with the same name as bencoded key,
-		//decode the field value and delete the key from the nonOmit dict
-		//if the key has not tag empty:"omit"
+		//decode the field value .If there are multiple struct keys
+		//corresponding to the benKey, then find whats the appropriate one
+		// and decode it. If the key is mandatory then delete the key from the
+		//nonOmit dict.
 		if fname, ok := fnames[sbenKey]; ok {
-			_, ok = nonOmit[fname]
-			if ok {
-				delete(nonOmit, fname)
-			}
-			fv := v.FieldByName(fname)
-			if !fv.IsValid() {
-				panic("Developer mistake.Decode struct: Got field value zero with fname: " + fname)
-			}
-			err = decode(r, fv)
-			if err != nil {
-				return err
+			names := strings.Split(fname, "?")
+			switch len(names) {
+			default:
+				for _, fname := range names {
+					//error if at least one of them hasn't empty:'omit'
+					if _, ok = nonOmit[fname]; ok {
+						return errors.New("Multiple fields with the same benTag and at least one of them is mandatory.")
+					}
+					fv := v.FieldByName(fname)
+					if !fv.IsValid() {
+						panic("Developer mistake.Decode struct: field with name " + fname + " doesnt exist in struct")
+					}
+					lenBefore := r.b.Len()
+					err = decode(r, fv)
+					if err == nil {
+						break
+					}
+					for j := r.b.Len(); j < lenBefore; j++ {
+						err = r.b.UnreadByte()
+						if err != nil {
+							return err
+						}
+					}
+				}
+			case 1:
+				_, ok = nonOmit[fname]
+				if ok {
+					delete(nonOmit, fname)
+				}
+				fv := v.FieldByName(fname)
+				if !fv.IsValid() {
+					panic("Developer mistake.Decode struct: Got field value zero with fname: " + fname)
+				}
+				err = decode(r, fv)
+				if err != nil {
+					return err
+				}
 			}
 		} else {
 			return errors.New("No struct field with name: " + sbenKey)
@@ -336,6 +331,64 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 		return errors.New("Some filled of the struct were not filled and they were not to be ommited: " + s)
 	}
 	return nil
+}
+
+func structInfo(v reflect.Value) (map[string]struct{}, map[string]string) {
+	t := v.Type()
+	nonOmit := map[string]struct{}{}
+	fnames := map[string]string{}
+	//Store which struct fields must always be present in the bencoded buffer as keys (nonOmit)
+	//and what names the struct fields should have (fnames).
+	for i := 0; i < v.NumField(); i++ {
+		sf := t.Field(i)
+		key := sf.Tag.Get("bencode")
+		if key == "-" {
+			continue
+		}
+		if ekey := sf.Tag.Get("empty"); ekey != "omit" {
+			nonOmit[sf.Name] = struct{}{}
+		}
+		//if key already exists, concatenate it
+		//with the previous ones with delimeter '?'
+		if key == "" {
+			key = sf.Name
+		}
+		v, ok := fnames[key]
+		if ok {
+			fnames[key] = v + "?" + sf.Name
+		} else {
+			fnames[key] = sf.Name
+		}
+	}
+	return nonOmit, fnames
+}
+
+func (r benReader) CheckEnd() (bool, error) {
+	var b byte
+	var err error
+	if b, err = r.b.ReadByte(); err != nil {
+		return false, err
+	}
+	if b == 'e' {
+		return true, nil
+	}
+	err = r.b.UnreadByte()
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (r benReader) AssertDictStart() error {
+	b, err := r.b.ReadByte()
+	if err != nil {
+		return err
+	}
+	if b != 'd' {
+		return errors.New("Bencoded has dict whereas data structure doesn't.")
+	}
+	return nil
+
 }
 
 //if we have a nil interface, then we dont
