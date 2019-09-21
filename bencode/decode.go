@@ -1,13 +1,40 @@
+//TODO: Add better error handling
+//e.g struct benError {
+//	got  string
+//	expected string
+//}
 package bencode
 
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"strconv"
 	"strings"
 )
+
+const benStringStart string = "0123456789"
+
+var benElems = map[string]string{
+	"l": "list ",
+	"d": "dictionary",
+	"i": "integer",
+	"s": "string",
+}
+
+//DecodeError is generated when there is a type
+//incompatibility between the data structures provided
+//and the bencoded data.
+type DecodeError struct {
+	bencType string
+	dataType string
+}
+
+func (d DecodeError) Error() string {
+	return fmt.Sprintf("bencType has %s type while dataType is %s", d.bencType, d.dataType)
+}
 
 //Decode the bencoded string based on v.
 //That means that we will expect each bencoded value
@@ -15,20 +42,20 @@ import (
 func Decode(data []byte, v interface{}) error {
 	e := reflect.ValueOf(v)
 	if e.Type().Kind() != reflect.Ptr {
-		return errors.New("v should have a pointer type")
+		return errors.New("bencode: v should have a pointer type")
 	}
 	val := reflect.ValueOf(v)
 	if !val.IsValid() {
-		return errors.New("Provided pointers is nil.")
+		return errors.New("bencode: provided pointers is nil")
 	}
 	r := benReader{bytes.NewBuffer(data)}
 	err := decode(r, val.Elem())
 	if err != nil {
-		return err
+		return fmt.Errorf("bencode: %w", err)
 	}
 	_, err = r.b.ReadByte()
 	if err == nil || err != io.EOF {
-		return errors.New("data structure provided was filled but bencoded buffer wasn't consumed")
+		return fmt.Errorf("bencode: data structure provided was filled but bencoded buffer wasn't consumed or readByte error happened: %w", err)
 	}
 	return nil
 }
@@ -53,7 +80,7 @@ func decode(r benReader, v reflect.Value) error {
 				return err
 			}
 		} else {
-			return errors.New("Cant handle non empty interfaces right now...")
+			return errors.New("cant handle non empty interfaces right now")
 		}
 	case reflect.Ptr:
 		//if pointer is nil,create a new zeroed (but not nil) value of type v.Elem()
@@ -64,7 +91,6 @@ func decode(r benReader, v reflect.Value) error {
 				return err
 			}
 			v.Elem().Set(e)
-			//or v.Set(e.Addr)
 		} else if err := decode(r, v.Elem()); err != nil {
 			return err
 		}
@@ -124,30 +150,39 @@ type benReader struct {
 }
 
 func (r benReader) readBenString() ([]byte, error) {
+	err := r.assertBenElem('s')
+	if err != nil {
+		return nil, err
+	}
+	err = r.b.UnreadByte()
+	if err != nil {
+		return nil, err
+	}
 	lenbytes, err := r.b.ReadString(byte(':'))
 	if err != nil {
 		return nil, err
 	}
-	str_len, err := strconv.ParseInt(lenbytes[:len(lenbytes)-1], 10, 64)
+	strLen, err := strconv.ParseInt(lenbytes[:len(lenbytes)-1], 10, 64)
 	if err != nil {
 		return nil, err
 	}
-	str := r.b.Next(int(str_len))
-	if len(str) != int(str_len) {
-		return nil, errors.New("length of string does not correspond to his actual length")
+	str := r.b.Next(int(strLen))
+	if len(str) != int(strLen) {
+		return nil, errors.New("length of bencoded string does not correspond to his actual length")
 	}
 	return str, nil
 }
 
 func (r benReader) readBenInt() (int64, error) {
+	err := r.assertBenElem('i')
+	if err != nil {
+		return -1, err
+	}
 	benInt, err := r.b.ReadString(byte('e'))
 	if err != nil {
 		return -1, err
 	}
-	if benInt[0] != 'i' {
-		return -1, errors.New("Wanted integer but bencoded hasn't. benInt :" + string(benInt))
-	}
-	num, err := strconv.ParseInt(benInt[1:len(benInt)-1], 10, 64)
+	num, err := strconv.ParseInt(benInt[:len(benInt)-1], 10, 64)
 	if err != nil {
 		return -1, err
 	}
@@ -156,38 +191,37 @@ func (r benReader) readBenInt() (int64, error) {
 }
 
 func (r benReader) readBenUint() (uint64, error) {
+	err := r.assertBenElem('i')
+	if err != nil {
+		return 0, err
+	}
 	benInt, err := r.b.ReadString(byte('e'))
 	if err != nil {
 		return 0, err
 	}
-	if benInt[0] != 'i' {
-		return 0, errors.New("Wanted integer but bencoded hasn't")
-	}
-	return strconv.ParseUint(benInt[1:len(benInt)-1], 10, 64)
+	return strconv.ParseUint(benInt[:len(benInt)-1], 10, 64)
 }
 
 func (r benReader) readBenBool() (bool, error) {
+	err := r.assertBenElem('i')
+	if err != nil {
+		return false, err
+	}
 	benInt, err := r.b.ReadString(byte('e'))
 	if err != nil {
 		return false, err
 	}
-	if len(benInt) != 2 {
-		return false, errors.New("Tried to read a Bool but bencoded value wasn't a Bool.")
+	if len(benInt) != 1 {
+		return false, errors.New("bool value with length > 1")
 	}
-	if benInt[0] != 'i' {
-		return false, errors.New("Wanted integer but bencoded hasn't")
-	}
-	return strconv.ParseBool(string(benInt[1]))
+	return strconv.ParseBool(string(benInt[0]))
 }
 
 //v can be only of type reflect.Slice.
 func (r benReader) readBenList(v reflect.Value) error {
-	b, err := r.b.ReadByte()
+	err := r.assertBenElem('l')
 	if err != nil {
 		return err
-	}
-	if b != 'l' {
-		return errors.New("Bencoded has list whereas data structure doesn't.")
 	}
 	//create a new value whos type is the type of the elements of the slice(v).
 	//this is the type that we will expect to be contained in the bencoded string.
@@ -196,7 +230,7 @@ func (r benReader) readBenList(v reflect.Value) error {
 	//until you traverse an 'e' who is the first byte of a bencoded value.
 	//after decoding, append the decoded value to the slice (v).
 	for {
-		ok, err := r.CheckEnd()
+		ok, err := r.checkEnd()
 		if err != nil {
 			return err
 		}
@@ -214,7 +248,7 @@ func (r benReader) readBenList(v reflect.Value) error {
 
 //v can be only of type reflect.Map.
 func (r benReader) readBenDictMap(v reflect.Value) error {
-	err := r.AssertDictStart()
+	err := r.assertBenElem('d')
 	if err != nil {
 		return err
 	}
@@ -232,7 +266,7 @@ func (r benReader) readBenDictMap(v reflect.Value) error {
 	//Iterate and start decoding values until you see an 'e' as the
 	//first byte of a bencoded value.
 	for {
-		ok, err := r.CheckEnd()
+		ok, err := r.checkEnd()
 		if err != nil {
 			return err
 		}
@@ -254,15 +288,16 @@ func (r benReader) readBenDictMap(v reflect.Value) error {
 
 //v can be only of type reflect.Struct.
 func (r benReader) readBenDictStruct(v reflect.Value) error {
-	err := r.AssertDictStart()
+	err := r.assertBenElem('d')
 	if err != nil {
 		return err
+		//return fmt.Errorf("expecting struct: %w", err)
 	}
 	nonOmit, fnames := structInfo(v)
 	//decode loop
 	var benKey []byte
 	for {
-		ok, err := r.CheckEnd()
+		ok, err := r.checkEnd()
 		if err != nil {
 			return err
 		}
@@ -286,7 +321,7 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 				for _, fname := range names {
 					//error if at least one of them hasn't empty:'omit'
 					if _, ok = nonOmit[fname]; ok {
-						return errors.New("Multiple fields with the same benTag and at least one of them is mandatory.")
+						return errors.New("multiple fields with the same benTag and at least one of them is mandatory")
 					}
 					fv := v.FieldByName(fname)
 					if !fv.IsValid() {
@@ -328,7 +363,7 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 		for k := range nonOmit {
 			s = s + "," + k
 		}
-		return errors.New("Some filled of the struct were not filled and they were not to be ommited: " + s)
+		return errors.New("some fields of the struct were not filled and they were not to be ommited: " + s)
 	}
 	return nil
 }
@@ -363,7 +398,7 @@ func structInfo(v reflect.Value) (map[string]struct{}, map[string]string) {
 	return nonOmit, fnames
 }
 
-func (r benReader) CheckEnd() (bool, error) {
+func (r benReader) checkEnd() (bool, error) {
 	var b byte
 	var err error
 	if b, err = r.b.ReadByte(); err != nil {
@@ -379,16 +414,40 @@ func (r benReader) CheckEnd() (bool, error) {
 	return false, nil
 }
 
-func (r benReader) AssertDictStart() error {
+//what is always one of {l,d,i,0123456789}.
+//b can be any of {l,d,i,0,1,2,3,4,5,6,7,8,9} in order to be valid.
+func (r benReader) assertBenElem(what byte) error {
 	b, err := r.b.ReadByte()
 	if err != nil {
 		return err
 	}
-	if b != 'd' {
-		return errors.New("Bencoded has dict whereas data structure doesn't.")
+	switch what {
+	case 'i', 'd', 'l':
+		if b != what {
+			s := benElemBasedOnFirstByte(b)
+			return &DecodeError{s, benElems[string(what)]}
+		}
+	case 's':
+		if !strings.Contains(benStringStart, string(b)) {
+			s := benElemBasedOnFirstByte(b)
+			return &DecodeError{s, benElems[string(what)]}
+		}
+	//debug
+	default:
+		panic("assertBenElem: argument wasn't any of {l,i,d,s}. Developers mistake")
 	}
 	return nil
+}
 
+func benElemBasedOnFirstByte(b byte) string {
+	switch {
+	case b == 'i', b == 'l', b == 'd':
+		return benElems[string(b)]
+	case b >= '0' && b <= '9':
+		return "string"
+	default:
+		return "unknown (" + string(b) + ")"
+	}
 }
 
 //if we have a nil interface, then we dont
@@ -412,7 +471,7 @@ func handleNilInterface(r benReader, v reflect.Value) error {
 	case b == 'd':
 		err = setNilInterface(r, v, reflect.ValueOf(&map[string]interface{}{}).Elem())
 	default:
-		return errors.New("No case was satisfied in handleNilInterface. byte is: " + string(b))
+		return errors.New("unkonwn bencode element starting with " + string(b))
 	}
 	if err != nil {
 		return err

@@ -49,8 +49,17 @@ func TestRandomDecode(t *testing.T) {
 		}
 		assert.EqualValues(t, test.expected, value)
 		fmt.Println(value, value)
-
 	}
+}
+
+func TestDecodeError(t *testing.T) {
+	var s string
+	err := Decode([]byte("i328472e"), &s)
+	fmt.Println(err)
+	var i interface{}
+	err = Decode([]byte("r328472e"), &i)
+	fmt.Println(err)
+
 }
 
 func TestStructWithDuplicateTags(t *testing.T) {
