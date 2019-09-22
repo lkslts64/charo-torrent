@@ -1,8 +1,3 @@
-//TODO: Add better error handling
-//e.g struct benError {
-//	got  string
-//	expected string
-//}
 package bencode
 
 import (
@@ -24,6 +19,10 @@ var benElems = map[string]string{
 	"s": "string",
 }
 
+//TODO: I should have better error handling.Specifically,
+//more error types and particularly an offset variable to
+//know where the error occured.
+
 //DecodeError is generated when there is a type
 //incompatibility between the data structures provided
 //and the bencoded data.
@@ -36,9 +35,16 @@ func (d DecodeError) Error() string {
 	return fmt.Sprintf("bencType has %s type while dataType is %s", d.bencType, d.dataType)
 }
 
-//Decode the bencoded string based on v.
-//That means that we will expect each bencoded value
-//to have type compatible with v (and not the opposite).
+//UnknownValueError  is generated when a bencoded
+//value starts with a byte not included in {l,d,i,0,1,2,3,4,5,6,7,8,9}
+type UnknownValueError struct {
+	symbol string
+}
+
+func (u UnknownValueError) Error() string {
+	return fmt.Sprintf("unknown bencoded element starting with %s", u.symbol)
+}
+
 func Decode(data []byte, v interface{}) error {
 	e := reflect.ValueOf(v)
 	if e.Type().Kind() != reflect.Ptr {
@@ -291,7 +297,6 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 	err := r.assertBenElem('d')
 	if err != nil {
 		return err
-		//return fmt.Errorf("expecting struct: %w", err)
 	}
 	nonOmit, fnames := structInfo(v)
 	//decode loop
@@ -354,7 +359,9 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 				}
 			}
 		} else {
-			return errors.New("No struct field with name: " + sbenKey)
+			//TODO:maybe just continue and not error.
+			//return errors.New("No struct field with name: " + sbenKey)
+			continue
 		}
 	}
 	//check if all mandatory fields were present in bencoded buffer.
@@ -425,11 +432,17 @@ func (r benReader) assertBenElem(what byte) error {
 	case 'i', 'd', 'l':
 		if b != what {
 			s := benElemBasedOnFirstByte(b)
+			if strings.Contains(s, "unknown") {
+				return &UnknownValueError{s}
+			}
 			return &DecodeError{s, benElems[string(what)]}
 		}
 	case 's':
 		if !strings.Contains(benStringStart, string(b)) {
 			s := benElemBasedOnFirstByte(b)
+			if strings.Contains(s, "unknown") {
+				return &UnknownValueError{s}
+			}
 			return &DecodeError{s, benElems[string(what)]}
 		}
 	//debug
@@ -446,7 +459,7 @@ func benElemBasedOnFirstByte(b byte) string {
 	case b >= '0' && b <= '9':
 		return "string"
 	default:
-		return "unknown (" + string(b) + ")"
+		return string(b)
 	}
 }
 
@@ -471,7 +484,7 @@ func handleNilInterface(r benReader, v reflect.Value) error {
 	case b == 'd':
 		err = setNilInterface(r, v, reflect.ValueOf(&map[string]interface{}{}).Elem())
 	default:
-		return errors.New("unkonwn bencode element starting with " + string(b))
+		return &UnknownValueError{string(b)}
 	}
 	if err != nil {
 		return err
