@@ -34,7 +34,7 @@ var random_encode_tests = []random_encode_test{
 	{uint16(16), "i16e"},
 	{uint32(32), "i32e"},
 	{uint64(64), "i64e"},
-	//{random_struct{123, "nono", "hello"}, "d3:CDE5:hello3:abci123ee"},
+	{random_struct{123, "nono", "hello"}, "d3:CDE5:hello3:abci123ee"},
 	{map[string]string{"a": "b", "c": "d"}, "d1:a1:b1:c1:de"},
 	{[]byte{1, 2, 3, 4}, "4:\x01\x02\x03\x04"},
 	//{[4]byte{1, 2, 3, 4}, "li1ei2ei3ei4ee"},
@@ -60,10 +60,10 @@ var random_encode_tests = []random_encode_test{
 	{struct {
 		A *string `bencode:"-"`
 	}{new(string)}, "de"},
-	/*{struct {
-		A *string `bencode:",omitempty"`
-	}{new(string)}, "d1:A0:e"},
-	{bigIntFromString("62208002200000000000"), "i62208002200000000000e"},
+	{struct {
+		A string `empty:"omit"`
+	}{A: ""}, "de"},
+	/*{bigIntFromString("62208002200000000000"), "i62208002200000000000e"},
 	{*bigIntFromString("62208002200000000000"), "i62208002200000000000e"},*/
 }
 
