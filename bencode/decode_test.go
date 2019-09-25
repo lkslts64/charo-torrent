@@ -58,8 +58,6 @@ func TestDecodeError(t *testing.T) {
 	fmt.Println(err)
 	var i interface{}
 	err = Decode([]byte("r328472e"), &i)
-	fmt.Println(err)
-
 }
 
 func TestStructWithDuplicateTags(t *testing.T) {

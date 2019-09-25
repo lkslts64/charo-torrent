@@ -23,15 +23,15 @@ var benElems = map[string]string{
 //more error types and particularly an offset variable to
 //know where the error occured.
 
-//DecodeError is generated when there is a type
+//IncompatibleTypesError is generated when there is a type
 //incompatibility between the data structures provided
 //and the bencoded data.
-type DecodeError struct {
+type IncompatibleTypesError struct {
 	bencType string
 	dataType string
 }
 
-func (d DecodeError) Error() string {
+func (d IncompatibleTypesError) Error() string {
 	return fmt.Sprintf("bencType has %s type while dataType is %s", d.bencType, d.dataType)
 }
 
@@ -60,8 +60,11 @@ func Decode(data []byte, v interface{}) error {
 		return fmt.Errorf("bencode: %w", err)
 	}
 	_, err = r.b.ReadByte()
-	if err == nil || err != io.EOF {
-		return fmt.Errorf("bencode: data structure provided was filled but bencoded buffer wasn't consumed or readByte error happened: %w", err)
+	if err == nil {
+		return errors.New("bencode: data structure provided was filled but bencoded buffer wasn't consumed")
+	}
+	if err != io.EOF {
+		return fmt.Errorf("bencode: read last byte error other than EOF: %w", err)
 	}
 	return nil
 }
@@ -320,6 +323,7 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 		// and decode it. If the key is mandatory then delete the key from the
 		//nonOmit dict.
 		if fname, ok := fnames[sbenKey]; ok {
+			var flag bool
 			names := strings.Split(fname, "?")
 			switch len(names) {
 			default:
@@ -335,6 +339,7 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 					lenBefore := r.b.Len()
 					err = decode(r, fv)
 					if err == nil {
+						flag = true
 						break
 					}
 					for j := r.b.Len(); j < lenBefore; j++ {
@@ -343,6 +348,9 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 							return err
 						}
 					}
+				}
+				if flag == false {
+					return errors.New("struct: duplicate tag names: all incompatible with bendata")
 				}
 			case 1:
 				_, ok = nonOmit[fname]
@@ -355,12 +363,17 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 				}
 				err = decode(r, fv)
 				if err != nil {
-					return err
+					return fmt.Errorf("struct field %s: %w", fv.Type().Name(), err)
 				}
 			}
 		} else {
-			//TODO:maybe just continue and not error.
-			//return errors.New("No struct field with name: " + sbenKey)
+			//TODO:maybe just continue and not error - we should read and discard benElem.
+			var i interface{}
+			v := reflect.New(reflect.ValueOf(&i).Type().Elem()).Elem()
+			err := handleNilInterface(r, v)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 	}
@@ -371,6 +384,53 @@ func (r benReader) readBenDictStruct(v reflect.Value) error {
 			s = s + "," + k
 		}
 		return errors.New("some fields of the struct were not filled and they were not to be ommited: " + s)
+	}
+	return nil
+}
+
+func (r benReader) checkEnd() (bool, error) {
+	var b byte
+	var err error
+	if b, err = r.b.ReadByte(); err != nil {
+		return false, err
+	}
+	if b == 'e' {
+		return true, nil
+	}
+	err = r.b.UnreadByte()
+	if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+//what is always one of {l,d,i,0123456789}.
+//b can be any of {l,d,i,0,1,2,3,4,5,6,7,8,9} in order to be valid.
+func (r benReader) assertBenElem(what byte) error {
+	b, err := r.b.ReadByte()
+	if err != nil {
+		return err
+	}
+	switch what {
+	case 'i', 'd', 'l':
+		if b != what {
+			s, err := benElemBasedOnFirstByte(b)
+			if err != nil {
+				return err
+			}
+			return &IncompatibleTypesError{s, benElems[string(what)]}
+		}
+	case 's':
+		if !strings.Contains(benStringStart, string(b)) {
+			s, err := benElemBasedOnFirstByte(b)
+			if err != nil {
+				return err
+			}
+			return &IncompatibleTypesError{s, benElems[string(what)]}
+		}
+	//debug
+	default:
+		panic("assertBenElem: argument wasn't any of {l,i,d,s}. Developers mistake")
 	}
 	return nil
 }
@@ -405,61 +465,14 @@ func structInfo(v reflect.Value) (map[string]struct{}, map[string]string) {
 	return nonOmit, fnames
 }
 
-func (r benReader) checkEnd() (bool, error) {
-	var b byte
-	var err error
-	if b, err = r.b.ReadByte(); err != nil {
-		return false, err
-	}
-	if b == 'e' {
-		return true, nil
-	}
-	err = r.b.UnreadByte()
-	if err != nil {
-		return false, err
-	}
-	return false, nil
-}
-
-//what is always one of {l,d,i,0123456789}.
-//b can be any of {l,d,i,0,1,2,3,4,5,6,7,8,9} in order to be valid.
-func (r benReader) assertBenElem(what byte) error {
-	b, err := r.b.ReadByte()
-	if err != nil {
-		return err
-	}
-	switch what {
-	case 'i', 'd', 'l':
-		if b != what {
-			s := benElemBasedOnFirstByte(b)
-			if strings.Contains(s, "unknown") {
-				return &UnknownValueError{s}
-			}
-			return &DecodeError{s, benElems[string(what)]}
-		}
-	case 's':
-		if !strings.Contains(benStringStart, string(b)) {
-			s := benElemBasedOnFirstByte(b)
-			if strings.Contains(s, "unknown") {
-				return &UnknownValueError{s}
-			}
-			return &DecodeError{s, benElems[string(what)]}
-		}
-	//debug
-	default:
-		panic("assertBenElem: argument wasn't any of {l,i,d,s}. Developers mistake")
-	}
-	return nil
-}
-
-func benElemBasedOnFirstByte(b byte) string {
+func benElemBasedOnFirstByte(b byte) (string, error) {
 	switch {
 	case b == 'i', b == 'l', b == 'd':
-		return benElems[string(b)]
+		return benElems[string(b)], nil
 	case b >= '0' && b <= '9':
-		return "string"
+		return "string", nil
 	default:
-		return string(b)
+		return "", &UnknownValueError{string(b)}
 	}
 }
 
@@ -487,7 +500,7 @@ func handleNilInterface(r benReader, v reflect.Value) error {
 		return &UnknownValueError{string(b)}
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("eface decode: %w", err)
 	}
 	return nil
 }
