@@ -29,8 +29,7 @@ func Get(data []byte, targetKey string) (val []byte, ok bool, err error) {
 }
 
 func get(data []byte, targetKey string) ([]byte, bool) {
-	if data[0] != 'd' {
-		//return nil, false, errors.New("get: data is not a bencoded dictionary")
+	if data[0] != 'd' || data[len(data)-1] != 'e' {
 		panic(ErrNoDict)
 	}
 	_data := data[1 : len(data)-1]
