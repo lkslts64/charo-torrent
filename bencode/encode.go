@@ -124,8 +124,7 @@ func encode(v reflect.Value, b *bytes.Buffer) error {
 		for i := 0; i < v.NumField(); i++ {
 			fvalue := v.FieldByName(sf[i].Name)
 			//if bencode tag == "-" OR field is a nil pointer and struct tag == omitempty , then ignore this field.
-			//TODO:fix this. we will omit fields with empty:omit if they have the zero value for their type. (e.g if an integer i == 0 then we omit.)
-			if sf[i].Tag.Get("bencode") == "-" || (sf[i].Tag.Get("empty") == "omit" && isZero(v)) {
+			if sf[i].Tag.Get("bencode") == "-" || (sf[i].Tag.Get("empty") == "omit" && isZero(fvalue)) {
 				continue
 			}
 			//encode string and field
@@ -163,7 +162,8 @@ func handleNilPtr(t reflect.Type, b *bytes.Buffer) {
 
 //isZero checks if v is a zero valued type
 //e.g if i is integer and i has value 0 then
-//isZero returns true.
+//isZero returns true. This function was copied
+//verbatim from stack-overflow.
 func isZero(v reflect.Value) bool {
 	switch v.Kind() {
 	case reflect.Func, reflect.Map, reflect.Slice:
