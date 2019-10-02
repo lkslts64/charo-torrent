@@ -290,6 +290,11 @@ func (r benReader) readBenDictMap(v reflect.Value) error {
 		if err != nil {
 			return err
 		}
+		if v.IsNil() {
+			m := reflect.MapOf(keyType, elemType)
+			_v := reflect.MakeMap(m)
+			v.Set(_v)
+		}
 		v.SetMapIndex(keyVal, elemVal)
 	}
 	return nil
