@@ -13,13 +13,13 @@ import (
 )
 
 var events = map[event]string{
-	Completed: "completed",
-	Started:   "started",
-	Stopped:   "stopped",
+	completed: "completed",
+	started:   "started",
+	stopped:   "stopped",
 }
 
 func (t *HTTPTracker) Announce(r AnnounceReq) (*AnnounceResp, error) {
-	HTTPresp, err := t.do(r)
+	HTTPresp, err := t.announce(r)
 	if err != nil {
 		return nil, fmt.Errorf("http announce: %w", err)
 	}
@@ -31,7 +31,7 @@ func (t *HTTPTracker) Announce(r AnnounceReq) (*AnnounceResp, error) {
 	return HTTPresp.announceResp(), nil
 }
 
-func (t *HTTPTracker) do(r AnnounceReq) (*httpAnnounceResponse, error) {
+func (t *HTTPTracker) announce(r AnnounceReq) (*httpAnnounceResponse, error) {
 	//maybe I can make a simple http.Get but leave this here for now.
 	//--------------------------------
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

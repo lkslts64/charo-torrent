@@ -11,23 +11,23 @@ import (
 )
 
 //Same as ScrapeResp but with the addition of Fail.
-type HTTPScrapeResp struct {
+type httpScrapeResp struct {
 	//TODO:string -> [20]byte (must support byte arrays in bencode)
 	Files map[string]TorrentInfo `bencode:"files"`
 	Fail  string                 `bencode:"failure_reason" empty:"omit"`
 }
 
 func (t *HTTPTracker) Scrape(infos ...[]byte) (*ScrapeResp, error) {
-	HTTPresp, err := httpScrape(t.URL, infos...)
+	HTTPresp, err := t.scrape(infos...)
 	if err != nil {
 		return nil, fmt.Errorf("http scrape: %w", err)
 	}
 	return HTTPresp.scrapeResponse(), nil
 }
 
-func httpScrape(trackerURL TrackerURL, infoHashes ...[]byte) (*HTTPScrapeResp, error) {
+func (t *HTTPTracker) scrape(infoHashes ...[]byte) (*httpScrapeResp, error) {
 	var s string
-	if s = trackerURL.Scrape(); s == "" {
+	if s = t.URL.Scrape(); s == "" {
 		//return
 	}
 	u, err := url.Parse(string(s))
@@ -48,7 +48,7 @@ func httpScrape(trackerURL TrackerURL, infoHashes ...[]byte) (*HTTPScrapeResp, e
 	if err != nil {
 		return nil, err
 	}
-	var sr HTTPScrapeResp
+	var sr httpScrapeResp
 	err = bencode.Decode(benData, &sr)
 	if err != nil {
 		return nil, err
@@ -59,7 +59,7 @@ func httpScrape(trackerURL TrackerURL, infoHashes ...[]byte) (*HTTPScrapeResp, e
 	return &sr, nil
 }
 
-func (sr *HTTPScrapeResp) parse() error {
+func (sr *httpScrapeResp) parse() error {
 	if sr.Fail != "" {
 		return errors.New("tracker responsed with failure reason: " + sr.Fail)
 	}
@@ -71,6 +71,6 @@ func (sr *HTTPScrapeResp) parse() error {
 	return nil
 }
 
-func (sr *HTTPScrapeResp) scrapeResponse() *ScrapeResp {
+func (sr *httpScrapeResp) scrapeResponse() *ScrapeResp {
 	return &ScrapeResp{sr.Files}
 }
