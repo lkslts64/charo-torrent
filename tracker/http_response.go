@@ -62,7 +62,7 @@ func (r *httpAnnounceResponse) parse() error {
 		for i := 0; i < numPeers; i += 6 {
 			j = i / 6
 			if ip = net.IP([]byte(r.CheapPeers[i : i+4])).To16(); ip == nil {
-				return fmt.Errorf("cheapPeers ip parse: %w", err)
+				return errors.New("cheapPeers ip parse")
 			}
 			r.Peers[j].IP = ip
 			port, err := strconv.Atoi(r.CheapPeers[i+4 : i+6])
