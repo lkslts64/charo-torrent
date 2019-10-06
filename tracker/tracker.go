@@ -2,8 +2,11 @@ package tracker
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,7 +32,7 @@ type AnnounceReq struct {
 	IP         int32
 	Key        int32
 	Numwant    int32
-	Port       int
+	Port       int16
 }
 
 type AnnounceResp struct {
@@ -59,6 +62,31 @@ type Peer struct {
 	Port int    `bencode:"port"`
 }
 
+type cheapPeers []byte
+
+func (cheap cheapPeers) peers() ([]Peer, error) {
+	var numPeers int
+	var ip net.IP
+	if numPeers = len(cheap); numPeers%6 != 0 {
+		return nil, errors.New(fmt.Sprintf("cheapPeers length is not divided exactly by 6.Instead it has length %d", numPeers))
+	}
+	peers := make([]Peer, numPeers/6)
+	j := 0
+	for i := 0; i < numPeers; i += 6 {
+		j = i / 6
+		if ip = net.IP([]byte(cheap[i : i+4])).To16(); ip == nil {
+			return nil, errors.New("cheapPeers ip parse")
+		}
+		port, err := strconv.Atoi(string(cheap[i+4 : i+6]))
+		if err != nil {
+			return nil, fmt.Errorf("cheapPeers port parse: %w", err)
+		}
+		peers[j].IP = ip
+		peers[j].Port = port
+	}
+	return peers, nil
+}
+
 type TrackerURL string
 
 func (u TrackerURL) Scrape() string {
@@ -77,17 +105,28 @@ func (u TrackerURL) Scrape() string {
 }
 
 type Tracker interface {
-	Announce(AnnounceReq) (*AnnounceResp, error)
-	Scrape(...[20]byte) (*ScrapeResp, error)
+	Announce(context.Context, AnnounceReq) (*AnnounceResp, error)
+	Scrape(context.Context, ...[20]byte) (*ScrapeResp, error)
+}
+
+func NewTracker(trackerURL string) (Tracker, error) {
+	u, err := url.Parse(trackerURL)
+	if err != nil {
+		return nil, err
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return &HTTPTracker{URL: TrackerURL(trackerURL)}, nil
+	case "udp":
+		return &UDPTracker{URL: TrackerURL(trackerURL), host: addPortMaybe(u.Host)}, nil
+	default:
+		return nil, errors.New("err bad scheme")
+	}
 }
 
 type HTTPTracker struct {
 	URL TrackerURL
 	ID  []byte
-}
-
-func NewHTTPTracker(trackerURL string) *HTTPTracker {
-	return &HTTPTracker{URL: TrackerURL(trackerURL)}
 }
 
 type UDPTracker struct {
@@ -96,19 +135,15 @@ type UDPTracker struct {
 	conn         net.Conn
 	connID       int64
 	lastConncted time.Time
-	ctx          context.Context
-	interval     time.Duration
-	lastReq      []byte
+	//ctx                 context.Context
+	//interval            time.Duration
+	consecutiveTimeouts int
 }
 
-func NewUDPTracker(ctx context.Context, trackerURL string) (*UDPTracker, error) {
-	u, err := url.Parse(trackerURL)
-	if err != nil {
-		return nil, err
-	}
-	host := u.Host
-	if !strings.Contains(u.Host, ":") {
+func addPortMaybe(host string) string {
+	if !strings.Contains(host, ":") {
 		host += ":80"
 	}
-	return &UDPTracker{URL: TrackerURL(trackerURL), host: host, ctx: ctx}, nil
+	return host
+
 }
