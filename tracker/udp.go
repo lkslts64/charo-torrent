@@ -10,13 +10,12 @@ import (
 	"math"
 	"math/rand"
 	"net"
-	"reflect"
-	"strconv"
 	"time"
 )
 
 //TODO: support IPv6
-var connectionIdExpiredErr = errors.New("connectionID expired")
+//var connectionIdExpiredErr = errors.New("connectionID expired")
+var requestTimeoutErr = errors.New("request timeout out")
 
 const (
 	actionConnect int32 = iota
@@ -56,32 +55,27 @@ type errResp struct {
 	msg    string
 }
 
-func (t *UDPTracker) Announce(r AnnounceReq) (*AnnounceResp, error) {
-	resp, err := t.announce(r)
-	for errors.Is(err, connectionIdExpiredErr) {
-		//connect again
-		resp, err = t.announce(r)
-	}
+func (t *UDPTracker) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
+	resp, err := t.announce(ctx, r)
 	if err != nil {
 		return nil, fmt.Errorf("udp announce: %w", err)
 	}
 	return resp, nil
 }
 
-func (t *UDPTracker) Scrape(ihashes ...[20]byte) (*ScrapeResp, error) {
-	resp, err := t.scrape(ihashes...)
-	for errors.Is(err, connectionIdExpiredErr) {
-		//connect again
-		resp, err = t.scrape(ihashes...)
+func (t *UDPTracker) Scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeResp, error) {
+	var scrapeURL string
+	if scrapeURL = t.URL.Scrape(); scrapeURL == "" {
+		return nil, errors.New("tracker doesn't support scrape")
 	}
+	resp, err := t.scrape(ctx, ihashes...)
 	if err != nil {
 		return nil, fmt.Errorf("udp scrape: %w", err)
 	}
 	return resp, nil
-
 }
 
-func (t *UDPTracker) connect() error {
+func (t *UDPTracker) connect(ctx context.Context) error {
 	var err error
 	if t.isConnected() {
 		return nil
@@ -91,11 +85,7 @@ func (t *UDPTracker) connect() error {
 		return errors.New("fail to dial connection with tracker")
 	}
 	txID := rand.Int31()
-	err = t.writeRequest(connectReq{protoID, actionConnect, txID})
-	if err != nil {
-		return err
-	}
-	buf, err := t.readResponse(respHeader{actionConnect, txID})
+	buf, err := t.request(ctx, respHeader{actionConnect, txID}, connectReq{protoID, actionConnect, txID})
 	if err != nil {
 		return err
 	}
@@ -109,13 +99,13 @@ func (t *UDPTracker) connect() error {
 	return nil
 }
 
-func (t *UDPTracker) announce(req AnnounceReq) (*AnnounceResp, error) {
-	err := t.connect()
+func (t *UDPTracker) announce(ctx context.Context, req AnnounceReq) (*AnnounceResp, error) {
+	err := t.connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	txID := rand.Int31()
-	err = t.writeRequest(struct {
+	buf, err := t.request(ctx, respHeader{actionAnnounce, txID}, struct {
 		req  reqHeader
 		data AnnounceReq
 	}{
@@ -125,54 +115,41 @@ func (t *UDPTracker) announce(req AnnounceReq) (*AnnounceResp, error) {
 	if err != nil {
 		return nil, err
 	}
-	buf, err := t.readResponse(respHeader{actionAnnounce, txID})
-	if err != nil {
-		return nil, err
-	}
 	fixedData := struct {
 		Interval int32
 		Leechers int32
 		Seeders  int32
 	}{}
-	var cheapPeers [][6]byte
-	err = readFromBinary(buf, &fixedData, &cheapPeers)
+	//var cheapPeers [][6]byte
+	err = readFromBinary(buf, &fixedData)
 	if err != nil {
 		return nil, err
 	}
-	//transform fixed and cheapPeers to announceResp
-	var ip net.IP
-	peers := make([]Peer, len(cheapPeers))
-	for i, pair := range cheapPeers {
-		if ip = net.IP([]byte(pair[:4])).To16(); ip == nil {
-			return nil, errors.New("cheapPeers ip parse")
-		}
-		port, err := strconv.Atoi(string(pair[4:]))
-		if err != nil {
-			return nil, fmt.Errorf("cheapPeers port parse: %w", err)
-		}
-		peers[i].IP = ip
-		peers[i].Port = port
+	var cheap cheapPeers = buf.Bytes()
+	peers, err := cheap.peers()
+	if err != nil {
+		return nil, err
 	}
 	return &AnnounceResp{fixedData.Interval, fixedData.Leechers, fixedData.Seeders, peers, 0}, nil
 }
 
-func (t *UDPTracker) scrape(ihashes ...[20]byte) (*ScrapeResp, error) {
-	err := t.connect()
+func (t *UDPTracker) scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeResp, error) {
+	err := t.connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	txID := rand.Int31()
-	err = t.writeRequest(reqHeader{t.connID, actionScrape, txID}, ihashes)
+	buf, err := t.request(ctx, respHeader{actionScrape, txID}, reqHeader{t.connID, actionScrape, txID}, ihashes)
 	if err != nil {
 		return nil, err
 	}
-	buf, err := t.readResponse(respHeader{actionScrape, txID})
-	if err != nil {
-		return nil, err
-	}
-	var scrapeInfos []udpScrapeInfo
+	//var scrapeInfos []udpScrapeInfo
+	scrapeInfos := make([]udpScrapeInfo, len(ihashes))
 	err = readFromBinary(buf, &scrapeInfos)
 	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) && errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("probably not all infohashes are available: %w", err)
+		}
 		return nil, err
 	}
 	if len(scrapeInfos) != len(ihashes) {
@@ -185,58 +162,75 @@ func (t *UDPTracker) scrape(ihashes ...[20]byte) (*ScrapeResp, error) {
 	return &ScrapeResp{torrents}, nil
 }
 
-func (t *UDPTracker) readResponse(header respHeader) (*bytes.Buffer, error) {
+func (t *UDPTracker) request(ctx context.Context, respHead respHeader, req ...interface{}) (buf *bytes.Buffer, err error) {
+	b := make([]byte, 0x100) //4KB
+	for {
+		//ensure we are conncted in case of a timeout
+		if respHead.Action != actionConnect {
+			err = t.connect(ctx)
+			if err != nil {
+				break
+			}
+		}
+		err = t.writeRequest(req...)
+		if err != nil {
+			break
+		}
+		buf, err = t.readResponse(ctx, respHead, b)
+		if err != nil {
+			if errors.Is(err, requestTimeoutErr) {
+				continue
+			}
+			break
+		}
+	}
+	return
+}
+
+func (t *UDPTracker) readResponse(ctx context.Context, header respHeader, buf []byte) (*bytes.Buffer, error) {
 	var readErr, err error
 	var n int
-	buf := make([]byte, 0x100) //4KB
-	consecutiveTimeouts := 0
-	for {
-		dur := time.Duration(timeoutTime(consecutiveTimeouts))
-		if dur < 0 {
-			return nil, errors.New("waited tracker to much time for response (3840 secs)")
+	dur := t.timeoutTime()
+	if dur < 0 {
+		return nil, errors.New("waited tracker to much time for response (3840 secs)")
+	}
+	err = t.conn.SetReadDeadline(time.Now().Add(dur))
+	if err != nil {
+		return nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		//read a whole packet. all data should fit in
+		//acording to BEP 15
+		//maybe conn.Read reads a whole packet too.
+		udpConn := t.conn.(*net.UDPConn)
+		n, _, readErr = udpConn.ReadFrom(buf)
+	}()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-ch:
+		switch tp := readErr.(type) {
+		case *net.OpError:
+			if readErr.(*net.OpError).Timeout() {
+				t.consecutiveTimeouts++
+				return nil, requestTimeoutErr
+			}
+			return nil, fmt.Errorf("udp tracker read conn net.OpError with no timeout: %w", readErr)
+		case nil:
+		default:
+			return nil, fmt.Errorf("udp tracker read conn err of type %T : %w", tp, readErr)
 		}
-		err = t.conn.SetReadDeadline(time.Now().Add(time.Second * dur))
+		b := bytes.NewBuffer(buf[:n])
+		err = checkRespHeader(b, header)
 		if err != nil {
-			return nil, fmt.Errorf("set read deadline: %w", err)
+			return nil, err
 		}
-		ch := make(chan struct{})
-		go func() {
-			defer close(ch)
-			//read a packet
-			udpConn := t.conn.(*net.UDPConn)
-			n, _, readErr = udpConn.ReadFrom(buf)
-		}()
-		if t.ctx == nil {
-			t.ctx = context.Background()
-		}
-		select {
-		case <-t.ctx.Done():
-			return nil, t.ctx.Err()
-		case <-ch:
-			switch tp := readErr.(type) {
-			case *net.OpError:
-				if readErr.(*net.OpError).Timeout() {
-					consecutiveTimeouts++
-					//periodically check if we are still connected
-					//before we retransmit
-					if header.Action != actionConnect && !t.isConnected() {
-						return nil, connectionIdExpiredErr
-					}
-					t.rewriteLastRequest()
-					continue
-				}
-				return nil, fmt.Errorf("udp tracker read conn net.OpError with no timeout: %w", readErr)
-			case nil:
-			default:
-				return nil, fmt.Errorf("udp tracker read conn of type %T : %w", tp, readErr)
-			}
-			b := bytes.NewBuffer(buf[:n])
-			err = checkRespHeader(b, header)
-			if err != nil {
-				return nil, err
-			}
-			return b, nil
-		}
+		return b, nil
 	}
 }
 
@@ -258,20 +252,6 @@ func (t *UDPTracker) writeRequest(data ...interface{}) error {
 	if len != n {
 		return errors.New("didnt wrote all bytes to socket")
 
-	}
-	t.lastReq = b.Bytes()
-	return nil
-
-}
-
-func (t *UDPTracker) rewriteLastRequest() error {
-	len := len(t.lastReq)
-	n, err := t.conn.Write(t.lastReq)
-	if err != nil {
-		return fmt.Errorf("conn write: %w", err)
-	}
-	if len != n {
-		return errors.New("didnt wrote all bytes to socket")
 	}
 	return nil
 }
@@ -316,32 +296,19 @@ func checkRespHeader(buf *bytes.Buffer, expectedHeader respHeader) error {
 	return nil
 }
 
-func timeoutTime(consecutiveTimeouts int) int {
-	if consecutiveTimeouts >= 8 {
+func (t *UDPTracker) timeoutTime() time.Duration {
+	if t.consecutiveTimeouts >= 8 {
 		return -1
 	}
-	return int(math.Pow(2.0, float64(consecutiveTimeouts))) * 15
+	return time.Duration(int(math.Pow(2.0, float64(t.consecutiveTimeouts)))) * 15 * time.Second
 }
 
 func readFromBinary(r io.Reader, data ...interface{}) error {
 	var err error
 	for _, d := range data {
-		v := reflect.ValueOf(d)
-		switch t := v.Type(); v.Kind() {
-		case reflect.Slice:
-			e := reflect.New(t.Elem()).Elem()
-			for i := 0; i < v.Len(); i++ {
-				err = binary.Read(r, binary.BigEndian, e.Interface())
-				if err != nil {
-					break
-				}
-				v = reflect.Append(v, e)
-			}
-		default:
-			err = binary.Read(r, binary.BigEndian, d)
-			if err != nil {
-				return fmt.Errorf("read binary: %w", err)
-			}
+		err = binary.Read(r, binary.BigEndian, d)
+		if err != nil {
+			return fmt.Errorf("read binary: %w", err)
 		}
 	}
 	return nil
@@ -351,20 +318,9 @@ func readFromBinary(r io.Reader, data ...interface{}) error {
 func writeBinary(w io.Writer, data ...interface{}) error {
 	var err error
 	for _, d := range data {
-		v := reflect.ValueOf(d)
-		switch v.Type().Kind() {
-		case reflect.Slice:
-			for i := 0; i < v.Len(); i++ {
-				err = binary.Write(w, binary.BigEndian, v.Index(i).Interface())
-				if err != nil {
-					return err
-				}
-			}
-		default:
-			err := binary.Write(w, binary.BigEndian, d)
-			if err != nil {
-				return fmt.Errorf("write binary: %w", err)
-			}
+		err = binary.Write(w, binary.BigEndian, d)
+		if err != nil {
+			return fmt.Errorf("write binary: %w", err)
 		}
 	}
 	return nil
