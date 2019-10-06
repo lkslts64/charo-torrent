@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"time"
 
 	"github.com/lkslts64/charo-torrent/bencode"
 )
@@ -18,8 +17,8 @@ var events = map[event]string{
 	stopped:   "stopped",
 }
 
-func (t *HTTPTracker) Announce(r AnnounceReq) (*AnnounceResp, error) {
-	HTTPresp, err := t.announce(r)
+func (t *HTTPTracker) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
+	HTTPresp, err := t.announce(ctx, r)
 	if err != nil {
 		return nil, fmt.Errorf("http announce: %w", err)
 	}
@@ -31,11 +30,12 @@ func (t *HTTPTracker) Announce(r AnnounceReq) (*AnnounceResp, error) {
 	return HTTPresp.announceResp(), nil
 }
 
-func (t *HTTPTracker) announce(r AnnounceReq) (*httpAnnounceResponse, error) {
+func (t *HTTPTracker) announce(ctx context.Context, r AnnounceReq) (*httpAnnounceResponse, error) {
 	//maybe I can make a simple http.Get but leave this here for now.
 	//--------------------------------
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	u, err := r.buildURL(t.URL)
 	if err != nil {
 		return nil, err

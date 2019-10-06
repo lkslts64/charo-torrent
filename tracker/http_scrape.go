@@ -1,6 +1,7 @@
 package tracker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -17,15 +18,15 @@ type httpScrapeResp struct {
 	Fail  string                 `bencode:"failure_reason" empty:"omit"`
 }
 
-func (t *HTTPTracker) Scrape(infos ...[20]byte) (*ScrapeResp, error) {
-	HTTPresp, err := t.scrape(infos...)
+func (t *HTTPTracker) Scrape(ctx context.Context, infos ...[20]byte) (*ScrapeResp, error) {
+	HTTPresp, err := t.scrape(ctx, infos...)
 	if err != nil {
 		return nil, fmt.Errorf("http scrape: %w", err)
 	}
 	return HTTPresp.scrapeResponse(), nil
 }
 
-func (t *HTTPTracker) scrape(infoHashes ...[20]byte) (*httpScrapeResp, error) {
+func (t *HTTPTracker) scrape(ctx context.Context, infoHashes ...[20]byte) (*httpScrapeResp, error) {
 	var s string
 	if s = t.URL.Scrape(); s == "" {
 		//return
@@ -39,7 +40,15 @@ func (t *HTTPTracker) scrape(infoHashes ...[20]byte) (*httpScrapeResp, error) {
 		v.Set("info_hash", string(info[:]))
 	}
 	u.RawQuery = v.Encode()
-	resp, err := http.Get(u.String())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	client := http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
