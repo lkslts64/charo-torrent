@@ -97,26 +97,26 @@ var events = map[event]string{
 	stopped:   "stopped",
 }
 
-func (t *HTTPTracker) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
+func (t *HTTPTrackerURL) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
 	HTTPresp, err := t.announce(ctx, r)
 	if err != nil {
 		return nil, fmt.Errorf("http announce: %w", err)
 	}
 	//assign trackerID if its the first time we get it - it was nil before,
 	//OR if we already have it and we got a different one from HTTPresponse.
-	if id := HTTPresp.TrackerID; id != nil && (t.ID == nil || t.ID != nil && string(id) != string(t.ID)) {
-		t.ID = id
+	if id := HTTPresp.TrackerID; id != nil && (t.id == nil || t.id != nil && string(id) != string(t.id)) {
+		t.id = id
 	}
 	return HTTPresp.announceResp(), nil
 }
 
-func (t *HTTPTracker) announce(ctx context.Context, r AnnounceReq) (*httpAnnounceResponse, error) {
+func (t *HTTPTrackerURL) announce(ctx context.Context, r AnnounceReq) (*httpAnnounceResponse, error) {
 	//maybe I can make a simple http.Get but leave this here for now.
 	//--------------------------------
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	u, err := r.buildURL(t.URL)
+	u, err := r.buildURL(t.url)
 	if err != nil {
 		return nil, err
 	}
@@ -148,8 +148,8 @@ func (t *HTTPTracker) announce(ctx context.Context, r AnnounceReq) (*httpAnnounc
 	return &res, nil
 }
 
-func (r AnnounceReq) buildURL(trackerURL TrackerURL) (*url.URL, error) {
-	u, err := url.Parse(string(trackerURL))
+func (r AnnounceReq) buildURL(turl trackerURL) (*url.URL, error) {
+	u, err := url.Parse(string(turl))
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ type httpScrapeResp struct {
 	Fail  string                 `bencode:"failure_reason" empty:"omit"`
 }
 
-func (t *HTTPTracker) Scrape(ctx context.Context, infos ...[20]byte) (*ScrapeResp, error) {
+func (t *HTTPTrackerURL) Scrape(ctx context.Context, infos ...[20]byte) (*ScrapeResp, error) {
 	HTTPresp, err := t.scrape(ctx, infos...)
 	if err != nil {
 		return nil, fmt.Errorf("http scrape: %w", err)
@@ -194,9 +194,9 @@ func (t *HTTPTracker) Scrape(ctx context.Context, infos ...[20]byte) (*ScrapeRes
 	return HTTPresp.scrapeResponse(), nil
 }
 
-func (t *HTTPTracker) scrape(ctx context.Context, infoHashes ...[20]byte) (*httpScrapeResp, error) {
+func (t *HTTPTrackerURL) scrape(ctx context.Context, infoHashes ...[20]byte) (*httpScrapeResp, error) {
 	var s string
-	if s = t.URL.Scrape(); s == "" {
+	if s = t.url.ScrapeURL(); s == "" {
 		//return
 	}
 	u, err := url.Parse(string(s))

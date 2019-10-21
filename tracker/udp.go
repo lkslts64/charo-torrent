@@ -37,10 +37,10 @@ type reqHeader struct {
 	TxID   int32
 }
 
-type connectReq struct {
-	ProtoID int64
-	Action  int32
-	TxID    int32
+type announceFixed struct {
+	Interval int32
+	Leechers int32
+	Seeders  int32
 }
 
 type udpScrapeInfo struct {
@@ -55,7 +55,7 @@ type errResp struct {
 	msg    string
 }
 
-func (t *UDPTracker) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
+func (t *UDPTrackerURL) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
 	resp, err := t.announce(ctx, r)
 	if err != nil {
 		return nil, fmt.Errorf("udp announce: %w", err)
@@ -63,9 +63,9 @@ func (t *UDPTracker) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp
 	return resp, nil
 }
 
-func (t *UDPTracker) Scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeResp, error) {
+func (t *UDPTrackerURL) Scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeResp, error) {
 	var scrapeURL string
-	if scrapeURL = t.URL.Scrape(); scrapeURL == "" {
+	if scrapeURL = t.url.ScrapeURL(); scrapeURL == "" {
 		return nil, errors.New("tracker doesn't support scrape")
 	}
 	resp, err := t.scrape(ctx, ihashes...)
@@ -75,7 +75,7 @@ func (t *UDPTracker) Scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeRe
 	return resp, nil
 }
 
-func (t *UDPTracker) connect(ctx context.Context) error {
+func (t *UDPTrackerURL) connect(ctx context.Context) error {
 	var err error
 	if t.isConnected() {
 		return nil
@@ -85,7 +85,7 @@ func (t *UDPTracker) connect(ctx context.Context) error {
 		return errors.New("fail to dial connection with tracker")
 	}
 	txID := rand.Int31()
-	buf, err := t.request(ctx, respHeader{actionConnect, txID}, connectReq{protoID, actionConnect, txID})
+	buf, err := t.request(ctx, respHeader{actionConnect, txID}, reqHeader{protoID, actionConnect, txID})
 	if err != nil {
 		return err
 	}
@@ -99,7 +99,7 @@ func (t *UDPTracker) connect(ctx context.Context) error {
 	return nil
 }
 
-func (t *UDPTracker) announce(ctx context.Context, req AnnounceReq) (*AnnounceResp, error) {
+func (t *UDPTrackerURL) announce(ctx context.Context, req AnnounceReq) (*AnnounceResp, error) {
 	err := t.connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
@@ -115,13 +115,8 @@ func (t *UDPTracker) announce(ctx context.Context, req AnnounceReq) (*AnnounceRe
 	if err != nil {
 		return nil, err
 	}
-	fixedData := struct {
-		Interval int32
-		Leechers int32
-		Seeders  int32
-	}{}
-	//var cheapPeers [][6]byte
-	err = readFromBinary(buf, &fixedData)
+	var fixed announceFixed
+	err = readFromBinary(buf, &fixed)
 	if err != nil {
 		return nil, err
 	}
@@ -130,10 +125,10 @@ func (t *UDPTracker) announce(ctx context.Context, req AnnounceReq) (*AnnounceRe
 	if err != nil {
 		return nil, err
 	}
-	return &AnnounceResp{fixedData.Interval, fixedData.Leechers, fixedData.Seeders, peers, 0}, nil
+	return &AnnounceResp{fixed.Interval, fixed.Leechers, fixed.Seeders, peers, 0}, nil
 }
 
-func (t *UDPTracker) scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeResp, error) {
+func (t *UDPTrackerURL) scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeResp, error) {
 	err := t.connect(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
@@ -152,9 +147,6 @@ func (t *UDPTracker) scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeRe
 		}
 		return nil, err
 	}
-	if len(scrapeInfos) != len(ihashes) {
-		errors.New("number of info hashes requested is different from the ones in response")
-	}
 	torrents := make(map[string]TorrentInfo)
 	for i, ihash := range ihashes {
 		torrents[string(ihash[:])] = TorrentInfo{scrapeInfos[i].Seeders, scrapeInfos[i].Completed, scrapeInfos[i].Leechers, ""}
@@ -162,32 +154,29 @@ func (t *UDPTracker) scrape(ctx context.Context, ihashes ...[20]byte) (*ScrapeRe
 	return &ScrapeResp{torrents}, nil
 }
 
-func (t *UDPTracker) request(ctx context.Context, respHead respHeader, req ...interface{}) (buf *bytes.Buffer, err error) {
+func (t *UDPTrackerURL) request(ctx context.Context, respHead respHeader, req ...interface{}) (buf *bytes.Buffer, err error) {
 	b := make([]byte, 0x100) //4KB
 	for {
 		//ensure we are conncted in case of a timeout
 		if respHead.Action != actionConnect {
 			err = t.connect(ctx)
 			if err != nil {
-				break
+				return
 			}
 		}
 		err = t.writeRequest(req...)
 		if err != nil {
-			break
+			return
 		}
 		buf, err = t.readResponse(ctx, respHead, b)
-		if err != nil {
-			if errors.Is(err, requestTimeoutErr) {
-				continue
-			}
-			break
+		if err != nil && errors.Is(err, requestTimeoutErr) {
+			continue
 		}
+		return
 	}
-	return
 }
 
-func (t *UDPTracker) readResponse(ctx context.Context, header respHeader, buf []byte) (*bytes.Buffer, error) {
+func (t *UDPTrackerURL) readResponse(ctx context.Context, header respHeader, buf []byte) (*bytes.Buffer, error) {
 	var readErr, err error
 	var n int
 	dur := t.timeoutTime()
@@ -234,7 +223,7 @@ func (t *UDPTracker) readResponse(ctx context.Context, header respHeader, buf []
 	}
 }
 
-func (t *UDPTracker) writeRequest(data ...interface{}) error {
+func (t *UDPTrackerURL) writeRequest(data ...interface{}) error {
 	//serialize
 	var b bytes.Buffer
 	var err error
@@ -256,7 +245,7 @@ func (t *UDPTracker) writeRequest(data ...interface{}) error {
 	return nil
 }
 
-func (t *UDPTracker) isConnected() bool {
+func (t *UDPTrackerURL) isConnected() bool {
 	return !t.lastConncted.IsZero() && time.Now().Sub(t.lastConncted) < time.Minute
 }
 
@@ -266,11 +255,11 @@ func checkRespHeader(buf *bytes.Buffer, expectedHeader respHeader) error {
 	err := errors.New("response is too small")
 	switch expectedHeader.Action {
 	case actionAnnounce:
-		if buf.Len() < 16 {
+		if buf.Len() < 20 {
 			return err
 		}
 	case actionConnect:
-		if buf.Len() < 20 {
+		if buf.Len() < 16 {
 			return err
 		}
 	case actionScrape, actionError:
@@ -296,7 +285,7 @@ func checkRespHeader(buf *bytes.Buffer, expectedHeader respHeader) error {
 	return nil
 }
 
-func (t *UDPTracker) timeoutTime() time.Duration {
+func (t *UDPTrackerURL) timeoutTime() time.Duration {
 	if t.consecutiveTimeouts >= 8 {
 		return -1
 	}
