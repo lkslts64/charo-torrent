@@ -3,6 +3,7 @@ package torrent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -34,6 +35,11 @@ type Event int
 
 var maxConns = 55
 
+var blockSz = uint32(1 << 14)           //16KiB
+var maxRequestBlockSz = uint32(1 << 15) //32KiB
+//spec doesn't say anything about this by we enfore it
+var minRequestBlockSz = uint32(1 << 13) //16KiB
+
 //Torrent
 type Torrent struct {
 	tm *TorrentMeta
@@ -53,7 +59,7 @@ type Torrent struct {
 	//bit map of peer's owned pieces
 	bitFields []BitField
 
-	actCh chan action
+	eventCh chan event
 
 	//surely we 'll need this
 	done chan struct{}
@@ -79,108 +85,208 @@ case bitfield:
 case request, cancel:
 */
 
+type readResult struct {
+	msg *peer_wire.Msg
+	err error
+}
+
 //should close conn on exit - avoids leaks
 func (t *Torrent) peerMain(i int) error {
 	peer := t.peers[i]
 	const readChanSz = 10
-	type readResult struct {
-		msg *peer_wire.Msg
-		err error
-	}
+	const requestQueueSz = 10
+	//reading goroutine sends results with this chan
 	readCh := make(chan readResult, readChanSz)
+	//in order to terminate reading goroutine
 	quit := make(chan struct{})
-	defer close(quit)
+	//queuing of requests
+	requestCh := make(chan struct{}, requestQueueSz)
+	//first error we catch we abandon and we
+	//broadcast with quit so rest of goroutines exit
+	errCh := make(chan error, 1)
+	defer close(quit) //notify reader goroutine and writers
+	//defer close(peer.actCh) //notify master
 	defer peer.conn.Close()
-	/*go func() {
-		var err error
-		var msg *peer_wire.Msg
-		readDone := make(chan struct{})
-		for {
-			go func() {
-				msg, err = peer_wire.Read(peer.conn)
-				readDone <- struct{}{}
-			}()
-			select {
-			case <-readDone:
-				if err != nil {
-					readErr <- err
-				}
-				//process msg
-			}
-		}
-	}()*/
-	go func() {
-		for {
-			//we won't block on read forever cause conn will close
-			//if main goroutine exits
-			msg, err := peer_wire.Read(peer.conn)
-			//we pass error and main goroutine exits so quit
-			//chan closes and then we break we enter the 2nd case
-			//(eventually)
-			select {
-			case readCh <- readResult{msg, err}:
-			case <-quit:
-				break
-			}
-		}
-	}()
-	keepAliveInterval := 2 * time.Minute
-	ticker := time.NewTicker(keepAliveInterval)
+	//read msgs until err happens
+	go peer.readMsgs(readCh, quit)
+	ticker := time.NewTicker(peer.keepAliveInterval)
 	defer ticker.Stop()
 	lastRead := time.Now()
+	checkEOF := func(err error) error {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil
+		}
+		return err
+	}
 	for {
 		select {
-		case act := <-t.actCh:
-			err := t.proccessAction(act, peer)
-			if err != nil {
-				if !errors.Is(err, io.EOF) &&
-					!errors.Is(err, io.ErrUnexpectedEOF) {
-					return err
-				}
-				return nil
-			}
+		case act := <-peer.actCh:
+			go t.proccessAction(act, peer, errCh, requestCh, quit)
+		case err := <-errCh:
+			return checkEOF(err)
 		case <-t.done:
 			return nil
 		case res := <-readCh:
 			if res.err != nil {
-				if !errors.Is(res.err, io.EOF) &&
-					!errors.Is(res.err, io.ErrUnexpectedEOF) {
-					return res.err
-				}
-				return nil
+				return checkEOF(res.err)
 			}
 			lastRead = time.Now()
+			//shouldn't block
+			//<-requestCh
 			//process msg
+			//if msg type == data
 		case t := <-ticker.C:
 			(&peer_wire.Msg{
 				Kind: peer_wire.KeepAlive,
 			}).Write(peer.conn)
-			if t.Sub(lastRead) >= keepAliveInterval {
+			if t.Sub(lastRead) >= peer.keepAliveInterval &&
+				t.Sub(peer.lastKeepAlive) >= peer.keepAliveInterval {
 				return nil //drop conn
 			}
 		}
 	}
 }
 
-func (t *Torrent) proccessAction(a action, p Peer) (err error) {
+func (t *Torrent) proccessAction(a action, p Peer, errCh chan error,
+	reqCh, quit chan struct{}) {
+	var err error
 	msg := a.val.(peer_wire.Msg)
 	switch a.id {
-	case choke, unchoke, interested, notInterested, have,
+	case amChoking, amUnchoking, amInterested, amNotInterested, have,
 		bitfield, cancel, metadataExt:
 		err = msg.Write(p.conn)
 	case request:
-		if int(msg.Len) == t.tm.meta.Info.PieceLen {
-			//download whole block
+		if v, ok := p.pieces[msg.Index]; ok {
+			panic(v)
 		}
-		err = msg.Write(p.conn)
-		//send only req
-
+		p.pieces[msg.Index] = NewPiece(msg.Index)
+		//whole block case - usual case
+		if int(msg.Len) == t.tm.meta.Info.PieceLen && msg.Begin == 0 {
+			//add all blocks at pending state
+			p.pieces[msg.Index].addAllBlocks(uint32(t.tm.meta.Info.PieceLen))
+			err = t.reqPiece(&msg, p, reqCh, quit, errCh)
+		} else {
+			//send only one block req - typically at eng game
+			if msg.Begin%blockSz != 0 {
+				panic(msg)
+			}
+			p.pieces[msg.Index].addBlock(msg.Begin)
+			err = msg.Write(p.conn)
+		}
 	}
-	return
+	if err != nil {
+		//err may be already sent by another goroutine so if has been
+		//sent, then we just exit
+		trySendErr(err, errCh)
+	}
 }
 
-func (t *Torrent) proccessMsg(p Peer) {
+func (t *Torrent) reqPiece(msg *peer_wire.Msg, p Peer, reqCh, quit chan struct{},
+	errCh chan<- error) error {
+	lastBlockSz := blockSz % t.tm.meta.Info.PieceLen
+	numBlocksWithoutLast := t.tm.meta.Info.PieceLen / blockSz
 
+	req := func(begin, len uint32) error {
+		//try push to request queue or quit if err from another
+		//goroutine happend
+		select {
+		case reqCh <- struct{}{}:
+			err := (&peer_wire.Msg{
+				Kind:  peer_wire.Request,
+				Index: msg.Index,
+				Begin: uint32(begin),
+				Len:   uint32(len),
+			}).Write(p.conn)
+			if err != nil {
+				return err
+			}
+			p.pieces
+		case <-quit:
+		}
+		return nil
+	}
+
+	for i := 0; i < uint32(t.tm.meta.Info.PieceLen)/blockSz; i++ {
+		err := req(uint32(i)*blockSz, uint32(blockSz))
+		if err != nil {
+			return err
+		}
+	}
+	if lastBlockSz != 0 {
+		err := req(uint32(numBlocksWithoutLast*blockSz), uint32(lastBlockSz))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+
+}
+
+func trySendErr(err error, errCh chan error) {
+	select {
+	case errCh <- err:
+	default:
+	}
+}
+
+func (t *Torrent) proccessPeerMsg(p *Peer, msg peer_wire.Msg, errCh chan error) {
+	switch msg.Kind {
+	case peer_wire.KeepAlive:
+		p.lastKeepAlive = time.Now()
+	case peer_wire.Interested:
+		//update our local copy and main goroutine's
+		if p.info.isInterested {
+			trySendErr(fmt.Errorf("peer msg useless resent: %b", isInterested), errCh)
+		}
+		p.info.isInterested = true
+		p.eventCh <- event{isInterested, msg}
+	case peer_wire.NotInterested:
+		if !p.info.isInterested {
+			trySendErr(fmt.Errorf("peer msg useless resent: isInterested: %b", isInterested), errCh)
+		}
+		p.info.isInterested = false
+		p.eventCh <- event{isNotInterested, msg}
+	case peer_wire.Choke:
+		if p.info.isChoking {
+			trySendErr(fmt.Errorf("peer msg useless resent: isChoking: %b", isChoking), errCh)
+		}
+		p.info.isChoking = true
+		p.eventCh <- event{isChoking, msg}
+	case peer_wire.Unchoke:
+		if !p.info.isChoking {
+			trySendErr(fmt.Errorf("peer msg useless resent: isChoking: %b", isChoking), errCh)
+		}
+		p.info.isChoking = false
+		p.eventCh <- event{isUnchoking, msg}
+	case peer_wire.Piece:
+
+		//store at db
+		//TODO: check when a piece is complete? we need some infrastructure for this
+
+		p.lastPieceMsg = time.Now()
+	case peer_wire.Request:
+		if p.info.amChoking || !p.info.isInterested {
+			trySendErr(errors.New("peer requested data without being interested or unchoked"), errCh)
+		}
+		if msg.Len > maxRequestBlockSz {
+			trySendErr(errors.New("request exceeded maximum requested block size"), errCh)
+		}
+		if msg.Len < minRequestBlockSz {
+			trySendErr(errors.New("request exceeded minimum requested block size"), errCh)
+		}
+		//check that we have the specified pice
+		t.tm.ownMu.RLock()
+		if !t.tm.ownedPieces.hasPiece(msg.Index) {
+			trySendErr(errors.New("peer requested piece we do not have"), errCh)
+		}
+		t.tm.ownMu.RUnlock()
+		//ensure the we dont exceed the end of the piece
+		if msg.Begin+msg.Len > uint32(t.tm.meta.Info.PieceLen) {
+			trySendErr(errors.New("peer request exceeded length of piece"), errCh)
+		}
+		//read from db
+		//and write to conn
+	}
 }
 
 func NewTorrent(filename string) (*Torrent, error) {
@@ -251,7 +357,10 @@ type TorrentMeta struct {
 	//TODO:different mutex for upload?
 	uploaded int64
 	//TODO:make []bool and move marshaling into peer_wire?
-	pieceBitfield BitField
+	//access by peer conns and main goroutine concurently
+	//cache of downloaded pieces - dont ask db every time
+	ownMu       sync.RWMutex
+	ownedPieces BitField
 }
 
 func NewTorrentMeta(filename string) (*TorrentMeta, error) {
@@ -265,11 +374,11 @@ func NewTorrentMeta(filename string) (*TorrentMeta, error) {
 	}
 	total := int64(meta.Info.TotalLength())
 	return &TorrentMeta{
-		meta:          meta,
-		trackerURL:    tURL,
-		length:        total,
-		left:          total,
-		pieceBitfield: make([]byte, int(math.Ceil(float64(meta.Info.NumPieces())/8.0))),
+		meta:        meta,
+		trackerURL:  tURL,
+		length:      total,
+		left:        total,
+		ownedPieces: make([]byte, int(math.Ceil(float64(meta.Info.NumPieces())/8.0))),
 	}, nil
 
 }
@@ -283,7 +392,7 @@ func (t *TorrentMeta) addDownloaded(i int) {
 	t.left -= pieceLen
 	//index holds the byte of pieceBitfield we are interested.
 	//mask holds the bit of the byte we want to set
-	t.pieceBitfield.setPiece(i)
+	t.ownedPieces.setPiece(i)
 }
 
 func (t *TorrentMeta) addUploaded(i int) {
