@@ -11,13 +11,13 @@ import (
 	"time"
 )
 
-type event int32
+type Event int32
 
 const (
-	none event = iota
-	completed
-	started
-	stopped
+	None Event = iota
+	Completed
+	Started
+	Stopped
 )
 
 //Omit IP field
@@ -28,7 +28,7 @@ type AnnounceReq struct {
 	Downloaded int64
 	Left       int64
 	Uploaded   int64
-	Event      event
+	Event      Event
 	IP         int32
 	Key        int32
 	Numwant    int32

@@ -12,10 +12,10 @@ import (
 )
 
 func testFile(t *testing.T, fileName string) {
-	meta, err := LoadTorrentFile(fileName)
+	meta, err := LoadMetainfoFile(fileName)
 	require.NoError(t, err)
 	info := meta.Info
-	hp, err := info.PiecesHash()
+	hp := info.PiecesHash()
 	require.NoError(t, err)
 	t.Log("Piece hashes:")
 	for i, hash := range hp {
@@ -34,7 +34,7 @@ func testFile(t *testing.T, fileName string) {
 			t.Logf("Tracker: %s\n", tracker)
 		}
 	}
-	fmt.Printf("trackers scrape URL: %s\n", meta.Announce.Scrape())
+	//fmt.Printf("trackers scrape URL: %s\n", meta.Announce.Scrape())
 	fmt.Printf("info hash: %x\n", info.Hash)
 	_infoBenc, err := bencode.Encode(info)
 	require.NoError(t, err)
@@ -84,13 +84,4 @@ func TestUnmarshal(t *testing.T) {
 				Pieces:   []byte("omg"),
 			},
 		})
-}
-
-func TestScrape(t *testing.T) {
-	var a1 AnnounceURL = "omg://gfhjds231/dfs42342/1312321/announce/fsdfds"
-	var a2 AnnounceURL = "omg://fdsfsd/487234/1312321/announce.php"
-	s1 := a1.Scrape()
-	assert.EqualValues(t, s1, "")
-	s2 := a2.Scrape()
-	assert.EqualValues(t, s2, "omg://fdsfsd/487234/1312321/scrape.php")
 }

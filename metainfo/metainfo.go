@@ -4,7 +4,6 @@ import (
 	"fmt"
 	_ "fmt"
 	"io/ioutil"
-	"strings"
 
 	"github.com/lkslts64/charo-torrent/bencode"
 )
@@ -12,33 +11,33 @@ import (
 type AnnounceURL string
 
 type MetaInfo struct {
-	Announce     AnnounceURL `bencode:"announce"`
-	AnnounceList [][]string  `bencode:"announce-list" empty:"omit"`
-	Comment      string      `bencode:"comment" empty:"omit"`
-	Created      string      `bencode:"created by" empty:"omit"`
-	CreationDate int         `bencode:"creation date" empty:"omit"`
-	Encoding     string      `bencode:"encoding" empty:"omit"`
-	Info         InfoDict    `bencode:"info"`
+	Announce     string     `bencode:"announce"`
+	AnnounceList [][]string `bencode:"announce-list" empty:"omit"`
+	Comment      string     `bencode:"comment" empty:"omit"`
+	Created      string     `bencode:"created by" empty:"omit"`
+	CreationDate int        `bencode:"creation date" empty:"omit"`
+	Encoding     string     `bencode:"encoding" empty:"omit"`
+	Info         InfoDict   `bencode:"info"`
 	//URLList      []string    `bencode:"url-list" empty:"omit"`
 }
 
-func LoadTorrentFile(fileName string) (*MetaInfo, error) {
+func LoadMetainfoFile(fileName string) (*MetaInfo, error) {
 	data, err := ioutil.ReadFile(fileName)
 	if err != nil {
-		return nil, fmt.Errorf("load torrent:cant read .torrent file with err: %w", err)
+		return nil, fmt.Errorf("load metainfo:cant read .torrent file with err: %w", err)
 	}
 	var meta MetaInfo
 	err = bencode.Decode(data, &meta)
 	if err != nil {
-		return nil, fmt.Errorf("load torrent:: %w", err)
+		return nil, fmt.Errorf("load metainfo:: %w", err)
 	}
 	err = meta.Parse()
 	if err != nil {
-		return nil, fmt.Errorf("load torrent: %w", err)
+		return nil, fmt.Errorf("load metainfo: %w", err)
 	}
-	err = meta.Info.SetInfoHash(data)
+	err = meta.Info.setInfoHash(data)
 	if err != nil {
-		return nil, fmt.Errorf("load torrent: %w", err)
+		return nil, fmt.Errorf("load metainfo: %w", err)
 	}
 	return &meta, nil
 }
@@ -61,26 +60,11 @@ func (m *MetaInfo) Parse() error {
 func (m *MetaInfo) CreateTorrentFile(fileName string) error {
 	data, err := bencode.Encode(m)
 	if err != nil {
-		fmt.Errorf("create torrent: %w", err)
+		return fmt.Errorf("create torrent: %w", err)
 	}
 	err = ioutil.WriteFile(fileName, data, 0777)
 	if err != nil {
 		return fmt.Errorf("create torrent: %w", err)
 	}
 	return nil
-}
-
-func (a AnnounceURL) Scrape() string {
-	const s = "announce"
-	var i int
-	if i = strings.LastIndexByte(string(a), '/'); i < 0 {
-		return ""
-	}
-	if len(a) < i+1+len(s) {
-		return ""
-	}
-	if a[i+1:i+len(s)+1] != s {
-		return ""
-	}
-	return string(a[:i+1]) + "scrape" + string(a[i+len(s)+1:])
 }

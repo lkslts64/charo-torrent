@@ -3,6 +3,7 @@ package tracker
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand"
@@ -15,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var trackers = []string{
+var udpTrackers = []string{
 	"udp://tracker.coppersurfer.tk:6969",
 	"udp://tracker.leechers-paradise.org:6969",
 }
@@ -28,7 +29,7 @@ func TestWriteBinary(t *testing.T) {
 	var i int32 = 5
 	err := writeBinary(&buf, req, i)
 	require.NoError(t, err)
-	assert.EqualValues(t, buf.Len(), 2*20+3*8+4*4+2+4) //size of struct Announcereq
+	assert.EqualValues(t, buf.Len(), binary.Size(req)+4)
 	ihashBytes := make([]byte, 20)
 	buf.Read(ihashBytes)
 	assert.EqualValues(t, ihashBytes, ihash[:])
@@ -104,7 +105,7 @@ func TestAnnounceLocalhost(t *testing.T) {
 	}()
 	req := AnnounceReq{
 		Numwant: -1,
-		Event:   started,
+		Event:   Started,
 	}
 	rand.Read(req.PeerID[:])
 	copy(req.InfoHash[:], []byte{0xa3, 0x56, 0x41, 0x43, 0x74, 0x23, 0xe6, 0x26, 0xd9, 0x38, 0x25, 0x4a, 0x6b, 0x80, 0x49, 0x10, 0xa6, 0x67, 0xa, 0xc1})
@@ -148,13 +149,13 @@ func TestAnnounceRandomInfoHashThirdParty(t *testing.T) {
 		t.SkipNow()
 	}
 	req := AnnounceReq{
-		Event: stopped,
+		Event: Stopped,
 	}
 	rand.Read(req.PeerID[:])
 	rand.Read(req.InfoHash[:])
 	wg := sync.WaitGroup{}
 	//ctx, cancel := context.WithCancel(context.Background())
-	for _, url := range trackers {
+	for _, url := range udpTrackers {
 		wg.Add(1)
 		go func(url string) {
 			defer wg.Done()

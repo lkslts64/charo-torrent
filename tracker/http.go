@@ -91,10 +91,10 @@ func (r *httpAnnounceResponse) announceResp() *AnnounceResp {
 	return &AnnounceResp{r.Interval, r.Incomplete, r.Complete, r.Peers, r.MinInterval}
 }
 
-var events = map[event]string{
-	completed: "completed",
-	started:   "started",
-	stopped:   "stopped",
+var events = map[Event]string{
+	Completed: "completed",
+	Started:   "started",
+	Stopped:   "stopped",
 }
 
 func (t *HTTPTrackerURL) Announce(ctx context.Context, r AnnounceReq) (*AnnounceResp, error) {
@@ -170,7 +170,7 @@ func (r AnnounceReq) queryValues() string {
 	if r.Event != 0 {
 		v.Set("event", events[r.Event])
 	}
-	if r.Numwant != 0 {
+	if r.Numwant != -1 {
 		v.Set("numwant", strconv.Itoa(int(r.Numwant)))
 	}
 	if r.Key != 0 {
