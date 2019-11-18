@@ -35,6 +35,14 @@ func (d IncompatibleTypesError) Error() string {
 	return fmt.Sprintf("bencType has %s type while dataType is %s", d.bencType, d.dataType)
 }
 
+type LargeBufferErr struct {
+	RemainingLen int
+}
+
+func (e *LargeBufferErr) Error() string {
+	return fmt.Sprintf("Remaining length: %d\n", e.RemainingLen)
+}
+
 //UnknownValueError  is generated when a bencoded
 //value starts with a byte not included in {l,d,i,0,1,2,3,4,5,6,7,8,9}
 type UnknownValueError struct {
@@ -61,7 +69,9 @@ func Decode(data []byte, v interface{}) error {
 	}
 	_, err = r.b.ReadByte()
 	if err == nil {
-		return errors.New("bencode: data structure provided was filled but bencoded buffer wasn't consumed")
+		return &LargeBufferErr{
+			RemainingLen: r.b.Len() + 1, //+1 cause we read one byte
+		}
 	}
 	if err != io.EOF {
 		return fmt.Errorf("bencode: read last byte error other than EOF: %w", err)
@@ -265,7 +275,7 @@ func (r benReader) readBenDictMap(v reflect.Value) error {
 	keyType := t.Key()
 	elemType := t.Elem()
 	if keyType.Kind() != reflect.String {
-		return errors.New("Maps should have keys of type string")
+		return errors.New("maps should have keys of type string")
 	}
 	//create two zeroed values - the first represents the
 	//map's key type and the second the map's value's type.
