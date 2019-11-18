@@ -1,6 +1,7 @@
 package bencode
 
 import (
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -17,13 +18,15 @@ func testFile(t *testing.T, fileName string) {
 	value, ok, err := Get(data, "info")
 	require.NoError(t, err)
 	if ok && err == nil {
-		fmt.Println(string(value))
+		hash := sha1.Sum(value)
+		fmt.Printf("%x\n", hash)
 	}
 }
 
 func TestFiles(t *testing.T) {
 	testFile(t, "test/alice.torrent")
 	testFile(t, "test/a.torrent")
+	testFile(t, "test/archlinux-2011.08.19-netinstall-i686.iso.torrent")
 }
 
 func TestGet(t *testing.T) {
