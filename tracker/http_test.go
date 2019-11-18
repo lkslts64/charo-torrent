@@ -1,9 +1,12 @@
 package tracker
 
 import (
+	"context"
 	_ "fmt"
+	"math/rand"
 	"net"
 	"net/url"
+	"sync"
 	"testing"
 
 	"github.com/lkslts64/charo-torrent/bencode"
@@ -20,6 +23,7 @@ var reqs = []AnnounceReq{
 		Left:       43242,
 		Uploaded:   8908090,
 		Port:       6981,
+		Numwant:    -1,
 	},
 }
 
@@ -92,4 +96,44 @@ func TestHTTPScrapeResponse(t *testing.T) {
 		"d8:completei4e10:downloadedi5e10:incompletei6e4:name6:randomeee"
 	require.NoError(t, bencode.Decode([]byte(data), &sr))
 	assert.NotNil(t, sr.Files["01234567890123456789"])
+}
+
+var httpTrackers = []string{
+	"http://tracker.bt4g.com:2095/announce",
+	"http://open.trackerlist.xyz:80/announce",
+}
+
+func TestThirdPartyRequest(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.SkipNow()
+	}
+	ctx := context.Background()
+	var peerID [20]byte
+	var ihash [20]byte
+	rand.Read(peerID[:])
+	rand.Read(ihash[:])
+	var wg sync.WaitGroup
+	for _, trackerURL := range udpTrackers {
+		wg.Add(1)
+		go func(trackerURL string) {
+			defer wg.Done()
+			tr, err := NewTrackerURL(trackerURL)
+			require.NoError(t, err)
+			resp, err := tr.Announce(ctx, AnnounceReq{
+				InfoHash: ihash,
+				PeerID:   peerID,
+				Port:     6891,
+				Numwant:  -1,
+				Event:    Stopped,
+			})
+			require.NoError(t, err)
+			if resp.Leechers != 0 || resp.Seeders != 0 || len(resp.Peers) != 0 {
+				// The info hash we generated was random in 2^160 space. If we
+				// get a hit, something is weird.
+				t.FailNow()
+			}
+		}(trackerURL)
+	}
+	wg.Wait()
 }
