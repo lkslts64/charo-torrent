@@ -3,9 +3,12 @@ package peer_wire
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"net"
+	"math"
+
+	"github.com/lkslts64/charo-torrent/bencode"
 )
 
 const Proto = "BitTorrent protocol"
@@ -25,79 +28,43 @@ const (
 	Port
 	//KeepAlive doesn't have an ID at spec but we define one
 	KeepAlive
+	Extended = 20
 )
 
 type Msg struct {
-	Kind     MessageID
-	Index    uint32
-	Begin    uint32
-	Len      uint32
-	Bitfield []byte
-	Block    []byte
+	Kind        MessageID
+	Index       uint32
+	Begin       uint32
+	Len         uint32
+	Bitfield    []byte
+	Block       []byte
+	ExtendedID  ExtensionID
+	ExtendedMsg interface{}
 }
 
-func (m *Msg) writeV2(conn net.Conn) (err error) {
+func (m *Msg) Write(conn io.Writer) (err error) {
 	checkWrite := func(err error) {
 		if err != nil {
 			panic(err)
 		}
 	}
 	var b bytes.Buffer
-	if m.Kind == KeepAlive {
-		checkWrite(writeBinary(&b, 0))
-		_, err = conn.Write(b.Bytes())
-		return
-	}
-	kind := byte(m.Kind)
-	checkWrite(writeBinary(&b, &kind))
-	if m.Index != 0 {
-		checkWrite(writeBinary(&b, &(m.Index)))
-	}
-	if m.Begin != 0 {
-		checkWrite(writeBinary(&b, &(m.Begin)))
-	}
-	if m.Len != 0 {
-		checkWrite(writeBinary(&b, &(m.Len)))
-	}
-	if m.Bitfield != nil {
-		checkWrite(writeBinary(&b, &(m.Bitfield)))
-	}
-	if m.Block != nil {
-		checkWrite(writeBinary(&b, &(m.Block)))
-	}
-	var msgLen [4]byte
-	binary.BigEndian.PutUint32(msgLen[:], uint32(b.Len()))
-	_, err = conn.Write(append(msgLen[:], b.Bytes()...))
-	return
-}
-
-func (m *Msg) Write(conn net.Conn) (err error) {
-	checkWrite := func(err error) {
-		if err != nil {
-			panic(err)
-		}
-	}
-	var b bytes.Buffer
-	if m.Kind == KeepAlive {
-		checkWrite(writeBinary(&b, 0))
-		_, err = conn.Write(b.Bytes())
-		return
-	}
 	switch m.Kind {
-	case Port:
-	case KeepAlive:
+	case Port, KeepAlive:
 	case Choke, Unchoke, Interested, NotInterested:
-		checkWrite(writeBinary(&b, byte(m.Kind)))
+		checkWrite(writeBinary(&b, m.Kind))
 	case Have:
-		checkWrite(writeBinary(&b, byte(m.Kind), m.Index))
+		checkWrite(writeBinary(&b, m.Kind, m.Index))
 	case Bitfield:
-		checkWrite(writeBinary(&b, byte(m.Kind), m.Bitfield))
+		checkWrite(writeBinary(&b, m.Kind, m.Bitfield))
 	case Request, Cancel:
-		checkWrite(writeBinary(&b, byte(m.Kind), m.Index, m.Begin, m.Len))
+		checkWrite(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
 	case Piece:
-		checkWrite(writeBinary(&b, byte(m.Kind), m.Index, m.Begin, m.Block))
+		checkWrite(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
+	case Extended:
+		checkWrite(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
 	default:
-		panic("Unkonwn kind of msg to send")
+		panic("Unknown kind of msg to send")
 	}
 	var msgLen [4]byte
 	binary.BigEndian.PutUint32(msgLen[:], uint32(b.Len()))
@@ -105,23 +72,21 @@ func (m *Msg) Write(conn net.Conn) (err error) {
 	return
 }
 
-func Read(conn net.Conn) (*Msg, error) {
+func Read(conn io.Reader) (*Msg, error) {
 	msg := new(Msg)
 	checkRead := func(err error) {
 		if err != nil {
 			panic(err)
 		}
 	}
-	var msgLen [4]byte
-	_, err := io.ReadFull(conn, msgLen[:])
+	msgLen := make([]byte, 4)
+	_, err := io.ReadFull(conn, msgLen)
 	if err != nil {
 		return nil, err
 	}
-	var b bytes.Buffer
-	var _msgLen uint32
-	checkRead(readFromBinary(&b, &_msgLen))
+	_msgLen := binary.BigEndian.Uint32(msgLen)
 	if _msgLen == 0 {
-		msg.Kind = MsgKeepAlive
+		msg.Kind = KeepAlive
 		return msg, nil
 	}
 	buf := make([]byte, _msgLen)
@@ -129,14 +94,118 @@ func Read(conn net.Conn) (*Msg, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.Write(buf)
-	var kind MessageID
-	checkRead(readFromBinary(&b, &kind))
-	msg.Kind = kind
+	b := bytes.NewBuffer(buf)
+	checkRead(readFromBinary(b, &msg.Kind))
 	switch msg.Kind {
-
+	case Port: //do nothing since we dont support DHT
+	case Choke, Unchoke, Interested, NotInterested:
+	case Have:
+		checkRead(readFromBinary(b, &msg.Index))
+	case Bitfield:
+		msg.Bitfield = b.Bytes()
+	case Request, Cancel:
+		checkRead(readFromBinary(b, &msg.Index, &msg.Begin, &msg.Len))
+	case Piece:
+		checkRead(readFromBinary(b, &msg.Index, &msg.Begin))
+		msg.Block = b.Bytes()
+	case Extended:
+		checkRead(readFromBinary(b, &msg.ExtendedID))
+		err = readExtension(msg.ExtendedID, b.Bytes(), msg)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errors.New("unknown kind of msg")
 	}
+	return msg, nil
+}
 
+//decodes msg.ExtendedMsg
+func writeExtension(msg *Msg) (b []byte) {
+	var err error
+	switch msg.ExtendedID {
+	case 0, ExtMetadataID:
+		b, err = bencode.Encode(&msg.ExtendedMsg)
+		if err != nil {
+			panic(err)
+		}
+		if msg.ExtendedID == 0 {
+			return
+		}
+		emsg := msg.ExtendedMsg.(MetadataExtMsg)
+		if emsg.Data == nil {
+			return
+		}
+		b = append(b, emsg.Data...)
+	default:
+		panic("unknown extension id")
+	}
+	return
+}
+
+//sets msg.ExtendedMsg
+func readExtension(extKind ExtensionID, payload []byte, msg *Msg) error {
+	var err error
+	switch extKind {
+	case 0:
+		msg.ExtendedMsg, err = decodeExtHandshakeMsg(payload)
+		if err != nil {
+			return err
+		}
+	case ExtMetadataID:
+		var metaExt MetadataExtMsg
+		_payload := make([]byte, len(payload))
+		copy(_payload, payload)
+		err = bencode.Decode(payload, &metaExt)
+		if err != nil {
+			//we expect binary data after so we discard this err
+			var errBuf *bencode.LargeBufferErr
+			if !errors.As(err, &errBuf) || metaExt.Kind != MetadataDataID {
+				return err
+			}
+			metaExt.Data = _payload[len(_payload)-errBuf.RemainingLen:]
+		} else {
+			if metaExt.Kind == MetadataDataID {
+				return errors.New("metadata ext: expected binary data")
+			}
+		}
+		msg.ExtendedMsg = metaExt
+	default:
+		return errors.New("unknown extension id")
+	}
+	return nil
+}
+
+//Given a message (m) of kind 'piece', Request
+//returns the message of kind 'request' that
+//gives the equivelant m as response.It panics if
+//m's kind is not 'piece'.
+func (m *Msg) Request() *Msg {
+	if m.Kind != Piece {
+		panic(m.Kind)
+	}
+	return &Msg{
+		Kind:  Request,
+		Index: m.Index,
+		Begin: m.Index,
+		Len:   uint32(len(m.Block)),
+	}
+}
+
+//This is not used till now. If we implement readBitfield then
+//maybe.
+//TODO:make []bool and move marshaling into peer_wire?
+func writeBinaryBitField(w io.Writer, bytefield []bool) error {
+	bitfield := make([]byte, int(math.Ceil(float64(len(bytefield))/8.0)))
+	for i, v := range bytefield {
+		if !v {
+			continue
+		}
+		ind := i / 8
+		mask := byte(0x01 << uint(7-i%8))
+		bitfield[ind] |= mask
+	}
+	return binary.Write(w, binary.BigEndian, bitfield)
 }
 
 func readFromBinary(r io.Reader, data ...interface{}) error {
