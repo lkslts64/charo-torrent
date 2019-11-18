@@ -1,18 +1,12 @@
 package torrent
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"io"
+	"github.com/lkslts64/charo-torrent/peer_wire"
 	"math"
-	"net"
+	"math/rand"
+	"sort"
 	"sync"
 	"time"
-
-	"github.com/lkslts64/charo-torrent/metainfo"
-	"github.com/lkslts64/charo-torrent/peer_wire"
-	"github.com/lkslts64/charo-torrent/tracker"
 )
 
 //Active conns are the ones that we download/upload from/to
@@ -21,19 +15,20 @@ import (
 //Every conn is managed on a seperate goroutine
 
 //Concurency:
-//We have one PaireventID chan. All conn goroutines
-//send data to master goroutine to signify Events.
+//when master wants to send something at peerconns
+//he should try to send it (without blocking) because
+//a peerconn may be closed or reading/writing to db
+//So, we should hold a queue of jobs and try send them
+//every time or !!!reflect.SelectCase!!!
 
 //Every goroutine is associated with a chan of Events.
 //When master gouritine wants to change state of a particular
 //conn goroutine it sends an Event through this channel.
 
-//Event signals that something happend
-//at a peer connection, like the client
-//is snubed or it was dropped.
-type Event int
-
 var maxConns = 55
+
+const maxUploadSlots = 4
+const optimisticSlots = 1
 
 var blockSz = uint32(1 << 14)           //16KiB
 var maxRequestBlockSz = uint32(1 << 15) //32KiB
@@ -50,19 +45,164 @@ type Torrent struct {
 	//manages them so no prob
 	connMu   sync.Mutex
 	numConns int
-	peers    []Peer
-	//TODO: a slice of Peer
-	/*conns       []net.Conn
-	chans       []chan Event
-	extensions  []peer_wire.Extensions
-	peersStatus []peerInfo*/
-	//bit map of peer's owned pieces
+	//pconns   []*PeerConn
+	//pstats   []peerStats
+	//size of len(pconns) * eventChSize is reasonable
+	events chan event2
+
+	//alternative:
+	//---------------
+	//active peer conns
+	//we take msg from peerconn to add it at this map
+	//if numConns < maxConns then we add it,else conn
+	//should get dropped
+	conns []*connection
+	//conns map[*connection]struct{}
+
 	bitFields []BitField
 
-	eventCh chan event
+	//eventCh chan event
+	pieces Pieces
+
+	currChokerRound int
+	optimistic      *connection
 
 	//surely we 'll need this
 	done chan struct{}
+}
+
+type connection struct {
+	pc    *PeerConn
+	stats peerStats
+}
+
+type peerStats struct {
+	//duplicate - also peer conn has these three
+	uploadUseful   int
+	downloadUseful int
+	info           peerInfo
+	//last time we were interested and peer was unchoking
+	lastStartedDownloading time.Time
+	//duration we were in downloading state
+	sumDownloading time.Duration
+	snubbed        bool
+	isSeeding      bool
+	amSeeding      bool
+}
+
+func (ps *peerStats) uploadLimitsReached() bool {
+	//if we have uploaded 100KiB more than downloaded (anacrolix has 100)
+	return ps.uploadUseful-ps.downloadUseful > (1<<10)*300
+}
+
+func (ps *peerStats) isSnubbed() bool {
+	if ps.amSeeding {
+		return false
+	}
+	if ps.uploadLimitsReached() {
+		return true
+	}
+	/*TODO:take into consideration this condition
+	if !ps.lastPieceMsg.IsZero() && time.Since(ps.lastPieceMsg) >= 30*time.Second {
+		return true
+	}*/
+	return false
+}
+
+func (t *Torrent) sendJob(conn *connection, job interface{}) {
+	conn.pc.jobCh.In() <- job
+}
+
+func (t *Torrent) choke(conn *connection) {
+	if !conn.stats.info.amChoking {
+		t.sendJob(conn, &peer_wire.Msg{
+			Kind: peer_wire.Choke,
+		})
+		conn.stats.info.amChoking = !conn.stats.info.amChoking
+	}
+}
+
+func (t *Torrent) unchoke(conn *connection) {
+	if conn.stats.info.amChoking {
+		t.sendJob(conn, &peer_wire.Msg{
+			Kind: peer_wire.Unchoke,
+		})
+		conn.stats.info.amChoking = !conn.stats.info.amChoking
+	}
+}
+
+func (t *Torrent) interested(conn *connection) {
+	if !conn.stats.info.amInterested {
+		t.sendJob(conn, &peer_wire.Msg{
+			Kind: peer_wire.Interested,
+		})
+		conn.stats.info.amInterested = !conn.stats.info.amInterested
+	}
+}
+
+func (t *Torrent) notInterested(conn *connection) {
+	if conn.stats.info.amInterested {
+		t.sendJob(conn, &peer_wire.Msg{
+			Kind: peer_wire.NotInterested,
+		})
+		conn.stats.info.amInterested = !conn.stats.info.amInterested
+	}
+}
+
+func (t *Torrent) have(conn *connection, i uint32) {
+	if !t.tm.ownPiece(i) {
+		panic("send have without having piece")
+	}
+	t.sendJob(conn, &peer_wire.Msg{
+		Kind:  peer_wire.Have,
+		Index: i,
+	})
+}
+
+func (t *Torrent) mainLoop() {
+	chokerTicker := time.NewTicker(10 * time.Second)
+	defer chokerTicker.Stop()
+	for {
+		select {
+		case e := <-t.events:
+
+		case <-chokerTicker.C:
+			t.choking()
+		}
+	}
+
+}
+
+func (t *Torrent) parseEvent(e event2) {
+	switch v := e.val.(type) {
+	case eventID:
+		switch v {
+		case isInterested:
+			e.conn.stats.info.isInterested = true
+			if !e.conn.stats.info.amChoking {
+				t.choking()
+			}
+		case isNotInterested:
+			e.conn.stats.info.isInterested = false
+			if !e.conn.stats.info.amChoking {
+				t.choking()
+			}
+		case isChoking:
+			//forward unsatisfied to other interested-unchoked peers
+		case isUnchoking:
+			//give this peer some requests
+		}
+	case *peer_wire.Msg:
+		switch v.Kind {
+		case peer_wire.Have:
+		case peer_wire.Bitfield:
+		}
+	case *downloadedBlock:
+		//update interests
+	case *uploadedBlock:
+		//add to stats
+	case metainfoSize:
+	}
 }
 
 //Useful for master goroutine
@@ -85,211 +225,7 @@ case bitfield:
 case request, cancel:
 */
 
-type readResult struct {
-	msg *peer_wire.Msg
-	err error
-}
-
-//should close conn on exit - avoids leaks
-func (t *Torrent) peerMain(i int) error {
-	peer := t.peers[i]
-	const readChanSz = 10
-	const requestQueueSz = 10
-	//reading goroutine sends results with this chan
-	readCh := make(chan readResult, readChanSz)
-	//in order to terminate reading goroutine
-	quit := make(chan struct{})
-	//queuing of requests
-	requestCh := make(chan struct{}, requestQueueSz)
-	//first error we catch we abandon and we
-	//broadcast with quit so rest of goroutines exit
-	errCh := make(chan error, 1)
-	defer close(quit) //notify reader goroutine and writers
-	//defer close(peer.actCh) //notify master
-	defer peer.conn.Close()
-	//read msgs until err happens
-	go peer.readMsgs(readCh, quit)
-	ticker := time.NewTicker(peer.keepAliveInterval)
-	defer ticker.Stop()
-	lastRead := time.Now()
-	checkEOF := func(err error) error {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil
-		}
-		return err
-	}
-	for {
-		select {
-		case act := <-peer.actCh:
-			go t.proccessAction(act, peer, errCh, requestCh, quit)
-		case err := <-errCh:
-			return checkEOF(err)
-		case <-t.done:
-			return nil
-		case res := <-readCh:
-			if res.err != nil {
-				return checkEOF(res.err)
-			}
-			lastRead = time.Now()
-			//shouldn't block
-			//<-requestCh
-			//process msg
-			//if msg type == data
-		case t := <-ticker.C:
-			(&peer_wire.Msg{
-				Kind: peer_wire.KeepAlive,
-			}).Write(peer.conn)
-			if t.Sub(lastRead) >= peer.keepAliveInterval &&
-				t.Sub(peer.lastKeepAlive) >= peer.keepAliveInterval {
-				return nil //drop conn
-			}
-		}
-	}
-}
-
-func (t *Torrent) proccessAction(a action, p Peer, errCh chan error,
-	reqCh, quit chan struct{}) {
-	var err error
-	msg := a.val.(peer_wire.Msg)
-	switch a.id {
-	case amChoking, amUnchoking, amInterested, amNotInterested, have,
-		bitfield, cancel, metadataExt:
-		err = msg.Write(p.conn)
-	case request:
-		if v, ok := p.pieces[msg.Index]; ok {
-			panic(v)
-		}
-		p.pieces[msg.Index] = NewPiece(msg.Index)
-		//whole block case - usual case
-		if int(msg.Len) == t.tm.meta.Info.PieceLen && msg.Begin == 0 {
-			//add all blocks at pending state
-			p.pieces[msg.Index].addAllBlocks(uint32(t.tm.meta.Info.PieceLen))
-			err = t.reqPiece(&msg, p, reqCh, quit, errCh)
-		} else {
-			//send only one block req - typically at eng game
-			if msg.Begin%blockSz != 0 {
-				panic(msg)
-			}
-			p.pieces[msg.Index].addBlock(msg.Begin)
-			err = msg.Write(p.conn)
-		}
-	}
-	if err != nil {
-		//err may be already sent by another goroutine so if has been
-		//sent, then we just exit
-		trySendErr(err, errCh)
-	}
-}
-
-func (t *Torrent) reqPiece(msg *peer_wire.Msg, p Peer, reqCh, quit chan struct{},
-	errCh chan<- error) error {
-	lastBlockSz := blockSz % t.tm.meta.Info.PieceLen
-	numBlocksWithoutLast := t.tm.meta.Info.PieceLen / blockSz
-
-	req := func(begin, len uint32) error {
-		//try push to request queue or quit if err from another
-		//goroutine happend
-		select {
-		case reqCh <- struct{}{}:
-			err := (&peer_wire.Msg{
-				Kind:  peer_wire.Request,
-				Index: msg.Index,
-				Begin: uint32(begin),
-				Len:   uint32(len),
-			}).Write(p.conn)
-			if err != nil {
-				return err
-			}
-			p.pieces
-		case <-quit:
-		}
-		return nil
-	}
-
-	for i := 0; i < uint32(t.tm.meta.Info.PieceLen)/blockSz; i++ {
-		err := req(uint32(i)*blockSz, uint32(blockSz))
-		if err != nil {
-			return err
-		}
-	}
-	if lastBlockSz != 0 {
-		err := req(uint32(numBlocksWithoutLast*blockSz), uint32(lastBlockSz))
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-
-}
-
-func trySendErr(err error, errCh chan error) {
-	select {
-	case errCh <- err:
-	default:
-	}
-}
-
-func (t *Torrent) proccessPeerMsg(p *Peer, msg peer_wire.Msg, errCh chan error) {
-	switch msg.Kind {
-	case peer_wire.KeepAlive:
-		p.lastKeepAlive = time.Now()
-	case peer_wire.Interested:
-		//update our local copy and main goroutine's
-		if p.info.isInterested {
-			trySendErr(fmt.Errorf("peer msg useless resent: %b", isInterested), errCh)
-		}
-		p.info.isInterested = true
-		p.eventCh <- event{isInterested, msg}
-	case peer_wire.NotInterested:
-		if !p.info.isInterested {
-			trySendErr(fmt.Errorf("peer msg useless resent: isInterested: %b", isInterested), errCh)
-		}
-		p.info.isInterested = false
-		p.eventCh <- event{isNotInterested, msg}
-	case peer_wire.Choke:
-		if p.info.isChoking {
-			trySendErr(fmt.Errorf("peer msg useless resent: isChoking: %b", isChoking), errCh)
-		}
-		p.info.isChoking = true
-		p.eventCh <- event{isChoking, msg}
-	case peer_wire.Unchoke:
-		if !p.info.isChoking {
-			trySendErr(fmt.Errorf("peer msg useless resent: isChoking: %b", isChoking), errCh)
-		}
-		p.info.isChoking = false
-		p.eventCh <- event{isUnchoking, msg}
-	case peer_wire.Piece:
-
-		//store at db
-		//TODO: check when a piece is complete? we need some infrastructure for this
-
-		p.lastPieceMsg = time.Now()
-	case peer_wire.Request:
-		if p.info.amChoking || !p.info.isInterested {
-			trySendErr(errors.New("peer requested data without being interested or unchoked"), errCh)
-		}
-		if msg.Len > maxRequestBlockSz {
-			trySendErr(errors.New("request exceeded maximum requested block size"), errCh)
-		}
-		if msg.Len < minRequestBlockSz {
-			trySendErr(errors.New("request exceeded minimum requested block size"), errCh)
-		}
-		//check that we have the specified pice
-		t.tm.ownMu.RLock()
-		if !t.tm.ownedPieces.hasPiece(msg.Index) {
-			trySendErr(errors.New("peer requested piece we do not have"), errCh)
-		}
-		t.tm.ownMu.RUnlock()
-		//ensure the we dont exceed the end of the piece
-		if msg.Begin+msg.Len > uint32(t.tm.meta.Info.PieceLen) {
-			trySendErr(errors.New("peer request exceeded length of piece"), errCh)
-		}
-		//read from db
-		//and write to conn
-	}
-}
-
-func NewTorrent(filename string) (*Torrent, error) {
+/*func NewTorrent(filename string) (*Torrent, error) {
 	t, err := NewTorrentMeta(filename)
 	if err != nil {
 		return nil, err
@@ -300,9 +236,164 @@ func NewTorrent(filename string) (*Torrent, error) {
 		chans: make([]chan Event, maxConns),
 		actCh: make(chan interface{}, maxConns),
 	}, nil
+	return nil, nil
+}*/
+
+//this func is started in its own goroutine.
+//when we close eventCh of pconn, the goroutine
+//exits
+func (t *Torrent) addAggregated(i int, conn *connection) {
+	for e := range conn.pc.eventCh {
+		t.events <- event2{conn, e}
+	}
 }
 
-func (t *Torrent) addConn(conn net.Conn) (int, error) {
+/*careful when using this, we might 'range' over nil chan
+func (t *Torrent) aggregateEvents() {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	for i, conn := range t.pconns {
+		if conn != nil {
+			go t.addAggregated(i, conn)
+		}
+	}
+}*/
+
+//careful when using this, we might send over nil chan
+func (t *Torrent) broadcastJob(job interface{}) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	for _, conn := range t.conns {
+		conn.pc.jobCh.In() <- job
+	}
+}
+
+func (t *Torrent) pickOptimisticUnchoke() {
+	possibleOptimisticUnchokes := []*connection{}
+	for i, conn := range t.conns {
+		if conn.stats.info.amChoking && conn.stats.info.isInterested {
+			possibleOptimisticUnchokes = append(possibleOptimisticUnchokes, conn)
+			//newly connected peers have better chances
+			if i >= len(t.conns)-3 { //pulled from my ass
+				possibleOptimisticUnchokes = append(possibleOptimisticUnchokes, conn, conn)
+			}
+		}
+	}
+	if len(possibleOptimisticUnchokes) == 0 {
+		t.optimistic = nil
+	} else {
+		t.optimistic = possibleOptimisticUnchokes[rand.Intn(len(possibleOptimisticUnchokes))]
+	}
+}
+
+type unchokingCandidate *connection
+
+type unchokingCandidates []unchokingCandidate
+
+func (uc unchokingCandidates) Len() int { return len(uc) }
+
+func (uc unchokingCandidates) Less(i, j int) bool {
+	rate := func(index int) int {
+		if uc[index].stats.sumDownloading == 0 {
+			return 0
+		}
+		//weird (hacky) way to determine if we are in seeding mode
+		//from a connection
+		if uc[index].pc.t.conns[index].stats.amSeeding {
+			return uc[index].stats.uploadUseful / int(uc[index].stats.sumDownloading)
+		}
+		return uc[index].stats.downloadUseful / int(uc[index].stats.sumDownloading)
+	}
+	return rate(i) > rate(j)
+}
+
+func (uc unchokingCandidates) Swap(i, j int) {
+	uc[i], uc[j] = uc[j], uc[i]
+}
+
+func (uc unchokingCandidates) contains(cand unchokingCandidate) bool {
+	for _, c := range uc {
+		if c == cand {
+			return true
+		}
+	}
+	return false
+}
+
+//choking algorithm similar to the one used at mainline client
+func (t *Torrent) choking() {
+	if t.currChokerRound%5 == 0 {
+		t.pickOptimisticUnchoke()
+	}
+	bestPeers := unchokingCandidates{}
+	for _, conn := range t.conns {
+		if conn.stats.isSnubbed() || !conn.stats.info.isInterested || conn.stats.isSeeding {
+			continue
+		}
+		bestPeers = append(bestPeers, conn)
+	}
+	sort.Sort(bestPeers)
+	uploadSlots := int(math.Min(maxUploadSlots, float64(len(bestPeers))))
+	//peers that have best upload rates
+	bestPeers = bestPeers[:uploadSlots]
+	optimistics := unchokingCandidates{}
+	for _, conn := range t.conns {
+		if bestPeers.contains(conn) {
+			t.unchoke(conn)
+		} else {
+			optimistics = append(optimistics, conn)
+		}
+	}
+	numOptimistics := int(math.Max(optimisticSlots, float64(maxUploadSlots-uploadSlots)))
+	//if optimistic unchoke belongs to 'downloaders',
+	//we 'll unchoke one more peer randomly
+	if t.optimistic != nil && !bestPeers.contains(t.optimistic) {
+		t.unchoke(t.optimistic)
+		numOptimistics--
+	}
+	var optimisticCount int
+	//unchoke optimistics randomly
+	//only if bestPeers are not sufficient
+	indices := rand.Perm(len(optimistics))
+	for _, i := range indices {
+		if optimistics[i].stats.isSeeding {
+			t.choke(optimistics[i])
+		} else if optimisticCount >= numOptimistics {
+			t.choke(optimistics[i])
+		} else {
+			t.unchoke(optimistics[i])
+			if optimistics[i].stats.info.isInterested {
+				optimisticCount++
+			}
+		}
+	}
+	t.currChokerRound++
+}
+
+func (t *Torrent) addConn(conn *connection) bool {
+	if t.numConns >= maxConns {
+		return false
+	}
+	t.conns = append(t.conns, conn)
+	return true
+}
+
+func (t *Torrent) removeConn(conn *connection) bool {
+	index := -1
+	for i, cn := range t.conns {
+		if cn == conn {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return false
+	}
+	t.conns = append(t.conns[:index], t.conns[index+1:]...)
+	return true
+}
+
+/*func (t *Torrent) addConn(conn net.Conn) (int, error) {
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
 	if t.numConns >= maxConns {
@@ -311,9 +402,9 @@ func (t *Torrent) addConn(conn net.Conn) (int, error) {
 	t.numConns++
 	//Fill one of the gaps of this slice
 	var index int
-	for i, c := range t.conns {
-		if c == nil {
-			c = conn
+	for i, c := range t.pconns {
+		if c.conn == nil {
+			c.conn = conn
 			index = i
 			return index, nil
 		}
@@ -325,114 +416,5 @@ func (t *Torrent) removeConn(i int) {
 	t.connMu.Lock()
 	defer t.connMu.Unlock()
 	t.numConns--
-	t.conns[i] = nil
-}
-
-type PairEventID struct {
-	ID    int
-	event Event
-}
-
-//TorrentMeta stores metadata and stats
-//about the torrent
-type TorrentMeta struct {
-	//nil if we dont have it
-	//TODO:If we dont have it,one conn should be responsible for
-	//getting the meta.Info part with metadata ext.
-	//This conn should set the metaSize too
-	//Restrict access to metainfo before we get the
-	//whole meta.Info part.
-	meta     *metainfo.MetaInfo
-	metaSize int64
-
-	trackerURL tracker.TrackerURL
-
-	//length of data to be downloaded
-	length int64
-
-	//when a piece gets downloaded or uploaded, these fields are updated
-	dataStatsMu sync.Mutex
-	left        int64
-	downloaded  int64
-	//TODO:different mutex for upload?
-	uploaded int64
-	//TODO:make []bool and move marshaling into peer_wire?
-	//access by peer conns and main goroutine concurently
-	//cache of downloaded pieces - dont ask db every time
-	ownMu       sync.RWMutex
-	ownedPieces BitField
-}
-
-func NewTorrentMeta(filename string) (*TorrentMeta, error) {
-	meta, err := metainfo.LoadMetainfoFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	tURL, err := tracker.NewTrackerURL(meta.Announce)
-	if err != nil {
-		return nil, err
-	}
-	total := int64(meta.Info.TotalLength())
-	return &TorrentMeta{
-		meta:        meta,
-		trackerURL:  tURL,
-		length:      total,
-		left:        total,
-		ownedPieces: make([]byte, int(math.Ceil(float64(meta.Info.NumPieces())/8.0))),
-	}, nil
-
-}
-
-//i == index of piece
-func (t *TorrentMeta) addDownloaded(i int) {
-	pieceLen := t.PieceLen(i)
-	t.dataStatsMu.Lock()
-	defer t.dataStatsMu.Unlock()
-	t.downloaded += pieceLen
-	t.left -= pieceLen
-	//index holds the byte of pieceBitfield we are interested.
-	//mask holds the bit of the byte we want to set
-	t.ownedPieces.setPiece(i)
-}
-
-func (t *TorrentMeta) addUploaded(i int) {
-	pieceLen := t.PieceLen(i)
-	t.dataStatsMu.Lock()
-	defer t.dataStatsMu.Unlock()
-	t.uploaded += pieceLen
-}
-
-func (t *TorrentMeta) PieceLen(i int) (pieceLen int64) {
-	numPieces := t.meta.Info.NumPieces()
-	//last piece case
-	if i == t.meta.Info.NumPieces()-1 {
-		pieceLen = int64(numPieces*t.meta.Info.PieceLen) - t.length
-	} else {
-		pieceLen = int64(t.meta.Info.PieceLen)
-	}
-	return
-}
-
-func (t *TorrentMeta) announceTracker(event tracker.Event, port int16) (*tracker.AnnounceResp, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	t.dataStatsMu.Lock()
-	req := tracker.AnnounceReq{
-		InfoHash:   t.meta.Info.Hash,
-		PeerID:     peerID,
-		Downloaded: t.downloaded,
-		Left:       t.left,
-		Uploaded:   t.uploaded,
-		Event:      event,
-		Numwant:    -1,
-		Port:       port,
-	}
-	t.dataStatsMu.Unlock()
-	return t.trackerURL.Announce(ctx, req)
-}
-
-func (t *TorrentMeta) scrapeTracker() (*tracker.ScrapeResp, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	return t.trackerURL.Scrape(ctx, t.meta.Info.Hash)
-}
+	t.pconns[i].conn = nil
+}*/
