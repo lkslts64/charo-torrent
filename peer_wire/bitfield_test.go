@@ -7,11 +7,11 @@ import (
 )
 
 func TestBitfield(t *testing.T) {
-	bf := newBitField(16)
+	bf := NewBitField(16)
 	assert.Equal(t, 2, len(bf))
-	bf = newBitField(15)
+	bf = NewBitField(15)
 	assert.Equal(t, 2, len(bf))
-	bf = newBitField(17)
+	bf = NewBitField(17)
 	assert.Equal(t, 3, len(bf))
 	bf.SetPiece(10)
 	assert.Equal(t, byte(0x20), bf[1])

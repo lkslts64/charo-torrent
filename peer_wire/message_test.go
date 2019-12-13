@@ -62,8 +62,8 @@ func TestReadWrite(t *testing.T) {
 		Kind: KeepAlive,
 	})
 	ReadWrite(t, &Msg{
-		Kind:     Bitfield,
-		Bitfield: []byte{0x43, 0x83, 0x42},
+		Kind: Bitfield,
+		Bf:   []byte{0x43, 0x83, 0x42},
 	})
 }
 

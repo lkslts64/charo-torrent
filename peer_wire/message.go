@@ -36,7 +36,7 @@ type Msg struct {
 	Index       uint32
 	Begin       uint32
 	Len         uint32
-	Bitfield    []byte
+	Bf          BitField
 	Block       []byte
 	ExtendedID  ExtensionID
 	ExtendedMsg interface{}
@@ -56,7 +56,7 @@ func (m *Msg) Write(conn io.Writer) (err error) {
 	case Have:
 		checkWrite(writeBinary(&b, m.Kind, m.Index))
 	case Bitfield:
-		checkWrite(writeBinary(&b, m.Kind, m.Bitfield))
+		checkWrite(writeBinary(&b, m.Kind, m.Bf))
 	case Request, Cancel:
 		checkWrite(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
 	case Piece:
@@ -102,7 +102,7 @@ func Read(conn io.Reader) (*Msg, error) {
 	case Have:
 		checkRead(readFromBinary(b, &msg.Index))
 	case Bitfield:
-		msg.Bitfield = b.Bytes()
+		msg.Bf = b.Bytes()
 	case Request, Cancel:
 		checkRead(readFromBinary(b, &msg.Index, &msg.Begin, &msg.Len))
 	case Piece:
@@ -187,7 +187,7 @@ func (m *Msg) Request() *Msg {
 	return &Msg{
 		Kind:  Request,
 		Index: m.Index,
-		Begin: m.Index,
+		Begin: m.Begin,
 		Len:   uint32(len(m.Block)),
 	}
 }

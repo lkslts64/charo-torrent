@@ -5,7 +5,7 @@ import "math"
 //BitField is zero based index
 type BitField []byte
 
-func newBitField(numPieces int) BitField {
+func NewBitField(numPieces int) BitField {
 	return make([]byte, int(math.Ceil(float64(numPieces)/8.0)))
 }
 
