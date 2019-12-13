@@ -8,6 +8,8 @@ import (
 	"github.com/lkslts64/charo-torrent/bencode"
 )
 
+const pieceSize = 20
+
 //InfoDict contains all the basic information about
 //about the files that the .torrent file is mentioning.
 type InfoDict struct {
@@ -31,13 +33,13 @@ type File struct {
 }
 
 func (info *InfoDict) Parse() error {
-	if len(info.Pieces)%20 != 0 {
+	if len(info.Pieces)%pieceSize != 0 {
 		return errors.New("info parse: SHA-1 hash of pieces has not the right length")
 	}
 	return nil
 }
 
-func (info *InfoDict) SetInfoHash(data []byte) error {
+func (info *InfoDict) setInfoHash(data []byte) error {
 	const key = "info"
 	infoBenc, ok, err := bencode.Get(data, key)
 	if !ok {
@@ -51,25 +53,31 @@ func (info *InfoDict) SetInfoHash(data []byte) error {
 	return nil
 }
 
-/*func (info *InfoDict) SetInfoHash() error {
-	data, err := bencode.Encode(info)
-	if err != nil {
-		return fmt.Errorf("info hash: %w", err)
+func (info *InfoDict) TotalLength() (total int) {
+	if info.Files == nil {
+		total = info.Len
+		return
 	}
-	h := sha1.Sum(data)
-	info.Hash = h
-	return nil
-	//return h[:], nil
-}*/
-func (info *InfoDict) PiecesHash() ([][]byte, error) {
-	if len(info.Pieces)%20 != 0 {
-		return nil, errors.New("hashes of pieces is not divided exctly with 20")
+	for _, f := range info.Files {
+		total += f.Len
 	}
+	return
+}
+
+func (info *InfoDict) NumPieces() uint32 {
+	return uint32(len(info.Pieces)) / pieceSize
+}
+
+func (info *InfoDict) PiecesHash() [][]byte {
 	h := [][]byte{}
-	for i := 0; i < len(info.Pieces); i += 20 {
-		h = append(h, info.Pieces[i:i+20])
+	for i := 0; i < len(info.Pieces); i += pieceSize {
+		h = append(h, info.Pieces[i:i+pieceSize])
 	}
-	return h, nil
+	return h
+}
+
+func (info *InfoDict) PieceHash(i int) []byte {
+	return info.Pieces[i*pieceSize : i*pieceSize+pieceSize]
 }
 
 //maybe discard this and use path from stdlib
