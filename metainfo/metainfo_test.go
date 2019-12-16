@@ -1,8 +1,6 @@
 package metainfo
 
 import (
-	"fmt"
-	"io/ioutil"
 	"path"
 	"testing"
 
@@ -17,7 +15,7 @@ func testFile(t *testing.T, fileName string) {
 	info := meta.Info
 	hp := info.PiecesHash()
 	require.NoError(t, err)
-	t.Log("Piece hashes:")
+	//t.Log("Piece hashes:")
 	for i, hash := range hp {
 		t.Logf("%dth hash: %s\n", i, string(hash))
 	}
@@ -34,19 +32,8 @@ func testFile(t *testing.T, fileName string) {
 			t.Logf("Tracker: %s\n", tracker)
 		}
 	}
-	//fmt.Printf("trackers scrape URL: %s\n", meta.Announce.Scrape())
-	fmt.Printf("info hash: %x\n", info.Hash)
-	_infoBenc, err := bencode.Encode(info)
+	_, err = bencode.Encode(info)
 	require.NoError(t, err)
-	benData, err := ioutil.ReadFile(fileName)
-	infoBenc, ok, err := bencode.Get(benData, "info")
-	if !ok {
-		t.Fail()
-	}
-	require.NoError(t, err)
-	fmt.Println(len(_infoBenc))
-	fmt.Println(len(infoBenc))
-	assert.EqualValues(t, string(_infoBenc), string(infoBenc))
 }
 
 //we dont test the other files because they contain
@@ -54,6 +41,7 @@ func testFile(t *testing.T, fileName string) {
 var files = []string{
 	"testdata/archlinux-2011.08.19-netinstall-i686.iso.torrent",
 	"testdata/a.torrent",
+	"testdata/Parquet-Goodies-2018.torrent",
 }
 
 func TestFile(t *testing.T) {
@@ -84,4 +72,15 @@ func TestUnmarshal(t *testing.T) {
 				Pieces:   []byte("omg"),
 			},
 		})
+}
+
+func TestInfoHash(t *testing.T) {
+	meta, err := LoadMetainfoFile("testdata/Parquet-Goodies-2018.torrent")
+	assert.NoError(t, err)
+	//Infohash from Deluge: c27727f12f2469ca4643f759ac2736a18de545b5
+	assert.Equal(t, []byte{0xc2, 0x77, 0x27, 0xf1, 0x2f, 0x24, 0x69, 0xca, 0x46, 0x43, 0xf7, 0x59, 0xac, 0x27, 0x36, 0xa1, 0x8d, 0xe5, 0x45, 0xb5}, meta.Info.Hash[:])
+	meta, err = LoadMetainfoFile("testdata/oliver-koletszki-Schneeweiss11.torrent")
+	assert.NoError(t, err)
+	//Infohash from Deluge: 800ca2bcc78d4946f640586e4b789654782c8ae5
+	assert.Equal(t, []byte{0x80, 0x0c, 0xa2, 0xbc, 0xc7, 0x8d, 0x49, 0x46, 0xf6, 0x40, 0x58, 0x6e, 0x4b, 0x78, 0x96, 0x54, 0x78, 0x2c, 0x8a, 0xe5}, meta.Info.Hash[:])
 }
