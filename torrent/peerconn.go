@@ -3,12 +3,15 @@ package torrent
 import (
 	"errors"
 	"fmt"
-	"github.com/eapache/channels"
 	"io"
+	"math"
 	"net"
+	"sync"
 	"time"
 
+	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/tevino/abool"
 )
 
 const (
@@ -19,7 +22,7 @@ const (
 )
 
 const (
-	keepAliveInterval time.Duration = 2 * time.Minute //2 mins
+	keepAliveInterval time.Duration = 2 * time.Minute
 	keepAliveSendFreq               = keepAliveInterval - 10*time.Second
 )
 
@@ -43,33 +46,17 @@ type PeerConn struct {
 	//master so the latter will try to limit the rate of them
 	jobCh channels.Channel
 	//channel that we send received msgs
-	eventCh chan event
+	eventCh chan interface{}
 	//reset timer when we write to conn
 	keepAliveTimer *time.Timer
-	lastPieceMsg   time.Time
-	//snubbed        bool
-	//we use chan as a limiting queue - there is no concurency
-	//maybe use something else for efficiency?
-	requestQueueCh chan struct{} //size = 10
-	reqQueue       queue
-	//maybe store msg and not pointers to msgs (we can check for duplicates)
-	pendingRequests map[*peer_wire.Msg]struct{}
-	stats           PeerConnStats
-	amSeeding       bool
-	haveMetadata    bool
-}
-
-type PeerConnStats struct {
-	uploadedUseful   int
-	downloadedUseful int
-}
-
-func (pcs *PeerConnStats) updateUsefulDownload(bytes int) {
-	pcs.downloadedUseful += bytes
-}
-
-func (pcs *PeerConnStats) updateUsefulUpload(bytes int) {
-	pcs.uploadedUseful += bytes
+	rq             requestQueuer //front size = 10, back = 40
+	amSeeding      bool
+	haveMetadata   bool
+	canDownload    *abool.AtomicBool
+	peerBfMu       sync.Mutex
+	peerBf         peer_wire.BitField
+	isSeeding      bool
+	myBf           peer_wire.BitField
 }
 
 type readResult struct {
@@ -77,16 +64,16 @@ type readResult struct {
 	err error
 }
 
-/*func NewPeerConn() *PeerConn {
-
-}*/
-
 func (pc *PeerConn) init() {
 	//pc.jobCh = make(chan job, jobChSize)
 	pc.jobCh = channels.NewInfiniteChannel()
-	pc.eventCh = make(chan event, eventChSize)
-	pc.requestQueueCh = make(chan struct{}, requestQueueChSize)
-	pc.pendingRequests = make(map[*peer_wire.Msg]struct{})
+	pc.eventCh = make(chan interface{}, eventChSize)
+}
+
+func (pc *PeerConn) close() {
+	pc.conn.Close()
+	//send event that we closed conn
+	close(pc.eventCh)
 }
 
 func (pc *PeerConn) mainLoop() error {
@@ -94,13 +81,10 @@ func (pc *PeerConn) mainLoop() error {
 	//pc.initChans()
 	readCh := make(chan readResult, readChSize)
 	quit, idle := make(chan struct{}), make(chan struct{})
-	//TODO:wrap all this at peerconn close
-	//-----------------
+	defer pc.close()
 	defer close(quit)
-	defer close(pc.eventCh)
-	defer pc.conn.Close()
-	//-----------------
 	go pc.readMsgs(readCh, idle, quit)
+	go pc.readRequestJobs(quit)
 	nilOnEOF := func(err error) error {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil
@@ -140,6 +124,8 @@ func (pc *PeerConn) mainLoop() error {
 	}
 }
 
+//read msgs from remote peer
+//run on seperate goroutine
 func (pc *PeerConn) readMsgs(readCh chan<- readResult, idle, quit chan struct{}) {
 	var msg *peer_wire.Msg
 	var err error
@@ -154,15 +140,58 @@ loop:
 		}()
 		//break from loops in not required
 		select {
-		case <-time.After(2 * time.Minute):
+		case <-time.After(keepAliveInterval + 1*time.Minute): //lets be more resilient
 			close(idle)
-			break loop
-		case readCh <- <-readDone:
-			if err != nil {
+		case res := <-readDone:
+			select {
+			case readCh <- res:
+			case <-quit: //we must care for quit here too
 				break loop
 			}
 		case <-quit:
 			break loop
+		}
+	}
+}
+
+//acquiring two locks + atomic operation at this call but this is not a
+//bottleneck since only two goroutines are sharing data
+func (pc *PeerConn) canProcessRequest(bl block) bool {
+	pc.peerBfMu.Lock()
+	defer pc.peerBfMu.Unlock()
+	return pc.peerBf.HasPiece(bl.pc) && !pc.rq.full() &&
+		pc.canDownload.IsSet()
+}
+
+//run on seperate goroutine
+func (pc *PeerConn) readRequestJobs(quit chan struct{}) {
+	var bl block
+	gotBlock := make(chan block)
+loop:
+	for {
+		go func() {
+			cqueue := &pc.t.pieces.cqueue
+			cqueue.cond.L.Lock()
+			for cqueue.empty() || !pc.canProcessRequest(cqueue.peek()) {
+				cqueue.cond.Wait()
+			}
+			bl = cqueue.pop()
+			cqueue.cond.L.Unlock()
+			gotBlock <- bl
+		}()
+		select {
+		case b := <-gotBlock:
+			var ok bool
+			var ready bool
+			if ok, ready = pc.rq.queue(b); !ok {
+				panic("request queuer full")
+			}
+			if ready {
+				pc.jobCh.In() <- b
+			}
+		case <-quit:
+			break loop
+			//TODO:signal to stop if we downloaded all pieces
 		}
 	}
 }
@@ -184,40 +213,33 @@ func (pc *PeerConn) parseJob(j job) (err error) {
 		switch v.Kind {
 		case peer_wire.Interested:
 			pc.info.amInterested = true
+			if !pc.info.isChoking {
+				pc.canDownload.Set()
+			}
 		case peer_wire.NotInterested:
+			pc.canDownload.UnSet()
 			pc.info.amInterested = false
 		case peer_wire.Choke:
 			pc.info.amChoking = true
 		case peer_wire.Unchoke:
 			pc.info.amChoking = false
-		case peer_wire.Request:
-			if !pc.onRequestBlockJob(v) {
-				err = nil
+		case peer_wire.Have:
+			pc.myBf.SetPiece(v.Index)
+			//Surpress have msgs.
+			//From https://wiki.theory.org/index.php/BitTorrentSpecification:
+			//At the same time, it may be worthwhile to send a HAVE message
+			//to a peer that has that piece already since it will be useful in
+			//determining which piece is rare.
+			if pc.peerBf.HasPiece(v.Index) {
 				return
 			}
+		case peer_wire.Bitfield:
+			pc.myBf = v.Bf
+		case peer_wire.Request:
 		}
 		err = pc.sendMsg(v)
 	}
 	return
-}
-
-//TODO:optimize:master can send multipl reqs at once?
-func (pc *PeerConn) onRequestBlockJob(msg *peer_wire.Msg) bool {
-	if !pc.info.canDownload() {
-		//send unsatisfied
-		pc.eventCh <- event{msg}
-		return false
-	}
-	pc.pendingRequests[msg] = struct{}{}
-	select {
-	//msg can be sent immediately
-	case pc.requestQueueCh <- struct{}{}:
-		return true
-	//we should wait because we have max reqeust on flight
-	default:
-		pc.reqQueue.push(msg)
-		return false
-	}
 }
 
 func (pc *PeerConn) sendMsg(msg *peer_wire.Msg) error {
@@ -241,39 +263,67 @@ func (pc *PeerConn) sendMsg(msg *peer_wire.Msg) error {
 }
 
 func (pc *PeerConn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
-	handleStateMsg := func(infoVal bool, evnt eventID) bool {
-		if infoVal {
-			//we will close conn doesn't matter what we send
-			//peer send msg that did not change our state (maybe is bad peer?)
-			return infoVal
+	stateChange := func(currState, futureState bool) bool {
+		if currState == futureState {
+			return futureState
 		}
-		pc.eventCh <- event{evnt}
-		return !infoVal
+		pc.eventCh <- msg
+		return futureState
 	}
 	switch msg.Kind {
 	case peer_wire.KeepAlive, peer_wire.Port:
 	case peer_wire.Interested:
-		pc.info.isInterested = handleStateMsg(pc.info.isInterested, isInterested)
+		pc.info.amInterested = stateChange(pc.info.amInterested, true)
 	case peer_wire.NotInterested:
-		pc.info.isInterested = handleStateMsg(!pc.info.isInterested, isNotInterested)
+		pc.info.amInterested = stateChange(pc.info.amInterested, false)
 	case peer_wire.Choke:
-		//discard pending reqs
-		pc.onChokeMsg()
-		pc.info.isChoking = handleStateMsg(pc.info.isChoking, isChoking)
+		pc.info.amChoking = stateChange(pc.info.amChoking, true)
+		pc.sendUnsatisfiedRequests()
+		pc.canDownload.UnSet()
 	case peer_wire.Unchoke:
-		pc.info.isChoking = handleStateMsg(!pc.info.isChoking, isUnchoking)
+		pc.info.amChoking = stateChange(pc.info.amChoking, false)
+		if pc.info.amInterested {
+			pc.canDownload.Set()
+		}
 	case peer_wire.Piece:
 		err = pc.onPieceMsg(msg)
 	case peer_wire.Request:
-		err = pc.onRequestMsg(msg)
-	case peer_wire.Have, peer_wire.Bitfield:
-		pc.eventCh <- event{msg}
+		err = pc.upload(msg)
+	case peer_wire.Have:
+		if pc.peerBf.HasPiece(msg.Index) {
+			//log this
+		}
+		pc.peerBf.SetPiece(msg.Index)
+		pc.eventCh <- msg
+	case peer_wire.Bitfield:
+		if pc.peerBf != nil {
+			err = errors.New("peer: send bitfield twice")
+		}
+		if pc.haveMetadata {
+			if !pc.bitFieldValid() {
+				err = errors.New("peer: wrong bitfield length")
+				return
+			}
+		}
+		func() {
+			pc.peerBfMu.Lock()
+			defer pc.peerBfMu.Unlock()
+			pc.peerBf = msg.Bf
+		}()
+		pc.eventCh <- msg
 	case peer_wire.Extended:
 		pc.onExtended(msg)
 	default:
 		err = errors.New("unknown msg kind received")
 	}
 	return
+}
+
+//we should have metadata to call this
+func (pc *PeerConn) bitFieldValid() bool {
+	numPieces := pc.t.tm.mi.Info.NumPieces()
+	//no need to lock peerBf - no one will modify it
+	return len(pc.peerBf) != int(math.Ceil(float64(numPieces)/8.0))
 }
 
 type metainfoSize int64
@@ -284,7 +334,7 @@ func (pc *PeerConn) onExtended(msg *peer_wire.Msg) (err error) {
 		pc.exts, err = v.Extensions()
 		if _, ok := pc.exts[peer_wire.ExtMetadataName]; ok {
 			if msize, ok := v.MetadataSize(); ok {
-				pc.eventCh <- event{metainfoSize(msize)}
+				pc.eventCh <- metainfoSize(msize)
 			}
 		}
 	case peer_wire.MetadataExtMsg:
@@ -311,26 +361,15 @@ func (pc *PeerConn) onExtended(msg *peer_wire.Msg) (err error) {
 	return nil
 }
 
-//discard pending and queued requests
-//and send to master what we didn't manage
-//to download as a slice of requests
-func (pc *PeerConn) onChokeMsg() {
-	if pc.info.canDownload() {
-		pc.reqQueue.clear()
-		if len(pc.pendingRequests) > 0 {
-			unsatisfiedRequests := make([]*peer_wire.Msg, len(pc.pendingRequests))
-			var i int
-			for req := range pc.pendingRequests {
-				unsatisfiedRequests[i] = req
-				i++
-			}
-			pc.eventCh <- event{unsatisfiedRequests}
-		}
+func (pc *PeerConn) sendUnsatisfiedRequests() {
+	if !pc.rq.empty() {
+		unsatisfiedRequests := pc.rq.discardAll()
+		pc.eventCh <- unsatisfiedRequests
 	}
 }
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
-func (pc *PeerConn) onRequestMsg(msg *peer_wire.Msg) error {
+func (pc *PeerConn) upload(msg *peer_wire.Msg) error {
 	tmeta := pc.t.tm
 	if !pc.info.canUpload() {
 		//maybe we have choked the peer, but he hasnt been informed and
@@ -341,61 +380,48 @@ func (pc *PeerConn) onRequestMsg(msg *peer_wire.Msg) error {
 		return fmt.Errorf("request length out of range: %d", msg.Len)
 	}
 	//check that we have the requested pice
-	if tmeta.ownPiece(msg.Index) {
+	if pc.myBf.HasPiece(msg.Index) {
 		return fmt.Errorf("peer requested piece we do not have")
 	}
 	//ensure the we dont exceed the end of the piece
+	//TODO: check for the specific piece
 	if endOff := msg.Begin + msg.Len; endOff > uint32(tmeta.mi.Info.PieceLen) {
 		return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
 	}
 	//read from db
 	//and write to conn
-	pc.stats.updateUsefulUpload(int(msg.Len))
-	//TODO:make event for upload
-	pc.eventCh <- event{uploadedBlock(reqMsgToBlock(msg))}
+	pc.eventCh <- uploadedBlock(reqMsgToBlock(msg))
 	return nil
 }
 
 func (pc *PeerConn) onPieceMsg(msg *peer_wire.Msg) error {
-	req := msg.Request()
-	var notRequestedButUseful bool
-	if _, ok := pc.pendingRequests[req]; !ok {
-		//TODO: log it
-		if pc.t.tm.ownPiece(msg.Index) {
-			//we dont need this
+	var ready block
+	var ok bool
+	bl := reqMsgToBlock(msg.Request())
+	if ready, ok = pc.rq.deleteCompleted(bl); !ok {
+		if !pc.t.pieces.valid(bl.pc) {
+			return errors.New("peer: piece doesn't exist")
+		}
+		//peer send us a block we already have
+		//TODO:log this
+		if pc.myBf.HasPiece(msg.Index) {
 			return nil
 		}
-		//we can store at db, god gave us a gift
-		notRequestedButUseful = true
-		//return nil
-		//return fmt.Errorf("hadn't requested this block: %v", msg)
+		var length int
+		var err error
+		if length, err = pc.t.pieces.pcs[bl.pc].lenSafe(bl.off); err != nil {
+			return err
+		}
+		if uint32(length) != bl.len {
+			return errors.New("peer: wrong msg length")
+		}
+	}
+	if (ready != block{}) {
+		pc.sendMsg(ready.reqMsg())
 	}
 	//all good?
-	pc.lastPieceMsg = time.Now()
-	pc.stats.updateUsefulDownload(int(msg.Len))
 	//store at db
-	//free one slot at request Queue and add one
-	//if we had requested this block
-	if !notRequestedButUseful {
-		select {
-		case <-pc.requestQueueCh:
-		default:
-			panic("received piece but request queue was empty")
-		}
-		if !pc.reqQueue.empty() {
-			select {
-			case pc.requestQueueCh <- struct{}{}:
-				msg := pc.reqQueue.pop()
-				pc.sendMsg(msg)
-			default:
-				panic("received piece but request queue is full")
-			}
-		}
-		//remove from pending
-		delete(pc.pendingRequests, req)
-	}
-	//notify master
-	pc.eventCh <- event{downloadedBlock(reqMsgToBlock(msg))}
+	pc.eventCh <- downloadedBlock(reqMsgToBlock(msg))
 	return nil
 }
 
@@ -415,52 +441,33 @@ func (pi *peerInfo) canDownload() bool {
 	return !pi.isChoking && pi.amInterested
 }
 
-type queue []*peer_wire.Msg
-
-func (q *queue) push(msg *peer_wire.Msg) {
-	*q = append(*q, msg)
-}
-
-func (q *queue) peek() *peer_wire.Msg {
-	if q.empty() {
-		return nil
-	}
-	return (*q)[0]
-}
-
-func (q *queue) pop() (head *peer_wire.Msg) {
-	if q.empty() {
-		return
-	}
-	head = (*q)[0]
-	*q = (*q)[1:]
-	return
-}
-
-func (q *queue) empty() bool {
-	return len(*q) == 0
-}
-
-func (q *queue) clear() {
-	q = new(queue)
-}
-
 //TODO: master hold piece struct and manages them.
 //master sends to peer conns block requests
 type block struct {
 	pc  uint32
 	off uint32
+	len uint32
 }
 
-func reqMsgToBlock(msg *peer_wire.Msg) *block {
-	return &block{
-		pc:  msg.Index,
-		off: msg.Begin,
+func (b *block) reqMsg() *peer_wire.Msg {
+	return &peer_wire.Msg{
+		Kind:  peer_wire.Request,
+		Index: b.pc,
+		Begin: b.off,
+		Len:   b.len,
 	}
 }
 
-type downloadedBlock *block
-type uploadedBlock *block
+func reqMsgToBlock(msg *peer_wire.Msg) block {
+	return block{
+		pc:  msg.Index,
+		off: msg.Begin,
+		len: msg.Len,
+	}
+}
+
+type downloadedBlock block
+type uploadedBlock block
 
 /*func (b *block) requestMsg() *peer_wire.Msg {
 	return &peer_wire.Msg{
