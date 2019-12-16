@@ -6,12 +6,10 @@ import (
 	"io"
 	"math"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/peer_wire"
-	"github.com/tevino/abool"
 )
 
 const (
@@ -25,6 +23,8 @@ const (
 	keepAliveInterval time.Duration = 2 * time.Minute
 	keepAliveSendFreq               = keepAliveInterval - 10*time.Second
 )
+
+type wantBlocks byte
 
 //PeerConn represents a peer connection (like a worker)
 //TODO: peer_wire.Msg should be passed through pointers everywhere
@@ -50,10 +50,9 @@ type PeerConn struct {
 	//reset timer when we write to conn
 	keepAliveTimer *time.Timer
 	rq             requestQueuer //front size = 10, back = 40
+	waitingBlocks  bool
 	amSeeding      bool
 	haveMetadata   bool
-	canDownload    *abool.AtomicBool
-	peerBfMu       sync.Mutex
 	peerBf         peer_wire.BitField
 	isSeeding      bool
 	myBf           peer_wire.BitField
@@ -84,7 +83,6 @@ func (pc *PeerConn) mainLoop() error {
 	defer pc.close()
 	defer close(quit)
 	go pc.readMsgs(readCh, idle, quit)
-	go pc.readRequestJobs(quit)
 	nilOnEOF := func(err error) error {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil
@@ -121,6 +119,10 @@ func (pc *PeerConn) mainLoop() error {
 			}
 			pc.keepAliveTimer.Reset(keepAliveSendFreq)
 		}
+		if pc.wantBlocks() {
+			pc.eventCh <- *new(wantBlocks)
+			pc.waitingBlocks = true
+		}
 	}
 }
 
@@ -154,46 +156,8 @@ loop:
 	}
 }
 
-//acquiring two locks + atomic operation at this call but this is not a
-//bottleneck since only two goroutines are sharing data
-func (pc *PeerConn) canProcessRequest(bl block) bool {
-	pc.peerBfMu.Lock()
-	defer pc.peerBfMu.Unlock()
-	return pc.peerBf.HasPiece(bl.pc) && !pc.rq.full() &&
-		pc.canDownload.IsSet()
-}
-
-//run on seperate goroutine
-func (pc *PeerConn) readRequestJobs(quit chan struct{}) {
-	var bl block
-	gotBlock := make(chan block)
-loop:
-	for {
-		go func() {
-			cqueue := &pc.t.pieces.cqueue
-			cqueue.cond.L.Lock()
-			for cqueue.empty() || !pc.canProcessRequest(cqueue.peek()) {
-				cqueue.cond.Wait()
-			}
-			bl = cqueue.pop()
-			cqueue.cond.L.Unlock()
-			gotBlock <- bl
-		}()
-		select {
-		case b := <-gotBlock:
-			var ok bool
-			var ready bool
-			if ok, ready = pc.rq.queue(b); !ok {
-				panic("request queuer full")
-			}
-			if ready {
-				pc.jobCh.In() <- b
-			}
-		case <-quit:
-			break loop
-			//TODO:signal to stop if we downloaded all pieces
-		}
-	}
+func (pc *PeerConn) wantBlocks() bool {
+	return pc.info.canDownload() && !pc.waitingBlocks && pc.rq.needMore()
 }
 
 func (pc *PeerConn) sendKeepAlive() error {
@@ -213,11 +177,7 @@ func (pc *PeerConn) parseJob(j job) (err error) {
 		switch v.Kind {
 		case peer_wire.Interested:
 			pc.info.amInterested = true
-			if !pc.info.isChoking {
-				pc.canDownload.Set()
-			}
 		case peer_wire.NotInterested:
-			pc.canDownload.UnSet()
 			pc.info.amInterested = false
 		case peer_wire.Choke:
 			pc.info.amChoking = true
@@ -238,6 +198,17 @@ func (pc *PeerConn) parseJob(j job) (err error) {
 		case peer_wire.Request:
 		}
 		err = pc.sendMsg(v)
+	case []block:
+		pc.waitingBlocks = false
+		var ok, ready bool
+		for _, bl := range v {
+			if ok, ready = pc.rq.queue(bl); !ok {
+				panic("received blocks but can't queue them")
+			}
+			if ready {
+				pc.sendMsg(bl.reqMsg())
+			}
+		}
 	}
 	return
 }
@@ -279,12 +250,8 @@ func (pc *PeerConn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	case peer_wire.Choke:
 		pc.info.amChoking = stateChange(pc.info.amChoking, true)
 		pc.sendUnsatisfiedRequests()
-		pc.canDownload.UnSet()
 	case peer_wire.Unchoke:
 		pc.info.amChoking = stateChange(pc.info.amChoking, false)
-		if pc.info.amInterested {
-			pc.canDownload.Set()
-		}
 	case peer_wire.Piece:
 		err = pc.onPieceMsg(msg)
 	case peer_wire.Request:
@@ -305,11 +272,7 @@ func (pc *PeerConn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 				return
 			}
 		}
-		func() {
-			pc.peerBfMu.Lock()
-			defer pc.peerBfMu.Unlock()
-			pc.peerBf = msg.Bf
-		}()
+		pc.peerBf = msg.Bf
 		pc.eventCh <- msg
 	case peer_wire.Extended:
 		pc.onExtended(msg)
@@ -416,7 +379,7 @@ func (pc *PeerConn) onPieceMsg(msg *peer_wire.Msg) error {
 			return errors.New("peer: wrong msg length")
 		}
 	}
-	if (ready != block{}) {
+	if pc.info.canDownload() && (ready != block{}) {
 		pc.sendMsg(ready.reqMsg())
 	}
 	//all good?

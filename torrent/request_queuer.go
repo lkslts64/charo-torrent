@@ -1,20 +1,13 @@
 package torrent
 
-import (
-	"sync"
-)
-
 const maxOnFlight = 10
 
 type requestQueuer struct {
-	mu       sync.Mutex
 	onFlight map[block]struct{}
 	pending  *blockQueue
 }
 
 func (rq *requestQueuer) queue(bl block) (ready, ok bool) {
-	rq.mu.Lock()
-	defer rq.mu.Unlock()
 	switch {
 	case len(rq.onFlight) < maxOnFlight:
 		rq.onFlight[bl] = struct{}{}
@@ -27,8 +20,6 @@ func (rq *requestQueuer) queue(bl block) (ready, ok bool) {
 }
 
 func (rq *requestQueuer) deleteCompleted(bl block) (ready block, ok bool) {
-	rq.mu.Lock()
-	defer rq.mu.Unlock()
 	if ok = rq.frontRemove(bl); !ok {
 		return
 	}
@@ -41,8 +32,6 @@ func (rq *requestQueuer) deleteCompleted(bl block) (ready block, ok bool) {
 }
 
 func (rq *requestQueuer) discardAll() []block {
-	rq.mu.Lock()
-	defer rq.mu.Unlock()
 	blocks := make([]block, len(rq.pending.blocks))
 	copy(blocks, rq.pending.blocks)
 	rq.pending.clear()
@@ -51,6 +40,10 @@ func (rq *requestQueuer) discardAll() []block {
 	}
 	rq.onFlight = make(map[block]struct{})
 	return blocks
+}
+
+func (rq *requestQueuer) needMore() bool {
+	return rq.pending.empty()
 }
 
 //lock is held during this call
@@ -69,13 +62,9 @@ func (rq *requestQueuer) frontContains(bl block) bool {
 }
 
 func (rq *requestQueuer) empty() bool {
-	rq.mu.Lock()
-	defer rq.mu.Unlock()
 	return len(rq.onFlight) == 0 && rq.pending.empty()
 }
 
 func (rq *requestQueuer) full() bool {
-	rq.mu.Lock()
-	defer rq.mu.Unlock()
 	return len(rq.onFlight) == maxOnFlight && rq.pending.full()
 }

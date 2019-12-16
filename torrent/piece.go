@@ -45,14 +45,17 @@ func (p *Pieces) valid(i uint32) bool {
 	return i < uint32(len(p.pcs))
 }
 
-//First dispatch blocks of pieces that have been already partially dispatched (if any).
-//These blocks have priority because if we have one block from a piece, then
-//we want the rest blocks of this piece sooner that the others in order to start
-//uploading sooner.
-func (p *Pieces) dispath() {
-	for i := 0; i < len(p.pcs); i++ {
+//First dispatch blocks of pieces that have been already partially dispatched (if any and if
+//peer behind `cn` has the pieces).These blocks have priority because if we have one block
+//from a piece, then we want the rest blocks of this piece sooner that the others in order to
+//start uploading sooner.
+//Dispatch `maxOnFlight` blocks to connection
+func (p *Pieces) dispatch(cn *connection) {
+	peerPieces := cn.bf.FilterNotSet()
+	remaining := maxOnFlight
+	for _, i := range peerPieces {
 		if p.pcs[i].hasUnrequestedBlocks() && p.pcs[i].hasPendingBlocks() {
-			if p._dispatch(i) {
+			if remaining = p._dispatch(i, cn, remaining); remaining == 0 {
 				return
 			}
 		}
@@ -60,38 +63,35 @@ func (p *Pieces) dispath() {
 	var pc int
 	var ok bool
 	for {
-		if pc, ok = p.pickNext(); !ok {
+		if pc, ok = p.pickNext(cn, peerPieces); !ok {
 			return
 		}
-		p._dispatch(pc)
+		if remaining = p._dispatch(pc, cn, remaining); remaining == 0 {
+			return
+		}
 	}
 }
 
-//returns true if cqueue is full and we can't dispatch anymore
-func (p *Pieces) _dispatch(i int) bool {
-	unrequestedQueue := p.pcs[i].unrequestedToBlockQueue()
-	p.cqueue.cond.L.Lock()
-	for !p.cqueue.full() && p.pcs[i].hasUnrequestedBlocks() {
-		bl := unrequestedQueue.pop()
-		p.cqueue.push(bl)
-		p.pcs[i].addBlockPending(int(bl.off))
-	}
-	p.cqueue.cond.L.Unlock()
-	p.cqueue.cond.Broadcast()
-	return p.pcs[i].hasUnrequestedBlocks()
+//try to give peerConn `blocksToDispatch` blocks
+func (p *Pieces) _dispatch(i int, cn *connection, blocksToDispatch int) (remaining int) {
+	unreqBlocks := p.pcs[i].unrequestedBlocksSlc(blocksToDispatch)
+	remaining = blocksToDispatch - len(unreqBlocks)
+	cn.pc.jobCh.In() <- unreqBlocks
+	return
 }
 
+//select a piece for a PeerConn to download.
 //'ok' set to false means no piece has all blocks unrequested, so we cant pick
-//any
-func (p *Pieces) pickNext() (pc int, ok bool) {
+//any.
+func (p *Pieces) pickNext(cn *connection, peerPieces []int) (pc int, ok bool) {
 	switch p.strategy {
 	case random:
 		//pick a random piece and if it is completely unrequested we have a hit.
 		//we have a high chance to hit because we utilize random strategy only
 		//for the first pieces we download (all blocks are unreqeusted initially).
 		for {
-			pc = rand.Intn(len(p.pcs))
-			if p.pcs[pc].allBlocksUnrequested() {
+			pc = rand.Intn(len(peerPieces))
+			if p.pcs[peerPieces[pc]].allBlocksUnrequested() {
 				ok = true
 				return
 			}
@@ -100,10 +100,10 @@ func (p *Pieces) pickNext() (pc int, ok bool) {
 		conns := p.t.conns
 		fmap := make(freqMap)
 		unrequestedPieces := []uint32{}
-		for i := uint32(0); i < uint32(len(p.pcs)); i++ {
+		for _, i := range peerPieces {
 			if p.pcs[i].allBlocksUnrequested() {
 				fmap.initKey(int64(i))
-				unrequestedPieces = append(unrequestedPieces, i)
+				unrequestedPieces = append(unrequestedPieces, uint32(i))
 			}
 		}
 		if len(unrequestedPieces) == 0 {
@@ -281,6 +281,18 @@ func (p *Piece) unrequestedToBlockQueue() *blockQueue {
 		bq.push(p.toBlock(off))
 	}
 	return bq
+}
+
+func (p *Piece) unrequestedBlocksSlc(limit int) (blocks []block) {
+	count := 0
+	for off := range p.unrequestedBlocks {
+		if count >= limit {
+			break
+		}
+		blocks = append(blocks, p.toBlock(off))
+		count++
+	}
+	return
 }
 
 /*func (p *Piece) addBlockDownloaded(bl *block) {
