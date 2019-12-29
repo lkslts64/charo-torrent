@@ -11,7 +11,10 @@ import (
 	"github.com/lkslts64/charo-torrent/bencode"
 )
 
-const Proto = "BitTorrent protocol"
+const (
+	Proto        = "BitTorrent protocol"
+	maxMsgLength = (1 << 10) * 50 //50KiB
+)
 
 type MessageID int8
 
@@ -43,7 +46,7 @@ type Msg struct {
 }
 
 func (m *Msg) Write(conn io.Writer) (err error) {
-	checkWrite := func(err error) {
+	try := func(err error) {
 		if err != nil {
 			panic(err)
 		}
@@ -52,17 +55,17 @@ func (m *Msg) Write(conn io.Writer) (err error) {
 	switch m.Kind {
 	case Port, KeepAlive:
 	case Choke, Unchoke, Interested, NotInterested:
-		checkWrite(writeBinary(&b, m.Kind))
+		try(writeBinary(&b, m.Kind))
 	case Have:
-		checkWrite(writeBinary(&b, m.Kind, m.Index))
+		try(writeBinary(&b, m.Kind, m.Index))
 	case Bitfield:
-		checkWrite(writeBinary(&b, m.Kind, m.Bf))
+		try(writeBinary(&b, m.Kind, m.Bf))
 	case Request, Cancel:
-		checkWrite(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
+		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
 	case Piece:
-		checkWrite(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
+		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
 	case Extended:
-		checkWrite(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
+		try(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
 	default:
 		panic("Unknown kind of msg to send")
 	}
@@ -85,6 +88,9 @@ func Read(conn io.Reader) (*Msg, error) {
 		return nil, err
 	}
 	_msgLen := binary.BigEndian.Uint32(msgLen)
+	if _msgLen > maxMsgLength {
+		return nil, errors.New("peer wire: too long msg")
+	}
 	if _msgLen == 0 {
 		msg.Kind = KeepAlive
 		return msg, nil
