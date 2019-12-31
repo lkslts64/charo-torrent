@@ -30,13 +30,13 @@ func (cq *condQueue) full() bool {
 }
 
 type queue struct {
-	msgs []*peer_wire.Msg
-	len  int
+	msgs  []*peer_wire.Msg
+	limit int
 }
 
-func newQueue(len int) *queue {
+func newQueue(limit int) *queue {
 	return &queue{
-		len: len,
+		limit: limit,
 	}
 }
 
@@ -75,17 +75,17 @@ func (q *queue) empty() bool {
 }
 
 func (q *queue) full() bool {
-	return len(q.msgs) == q.len
+	return len(q.msgs) == q.limit
 }
 
 type blockQueue struct {
 	blocks []block
-	len    int
+	limit  int
 }
 
-func newBlockQueue(len int) *blockQueue {
+func newBlockQueue(limit int) *blockQueue {
 	return &blockQueue{
-		len: len,
+		limit: limit,
 	}
 }
 
@@ -123,5 +123,5 @@ func (q *blockQueue) empty() bool {
 }
 
 func (q *blockQueue) full() bool {
-	return len(q.blocks) == q.len
+	return len(q.blocks) == q.limit
 }
