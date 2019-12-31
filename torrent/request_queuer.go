@@ -7,6 +7,13 @@ type requestQueuer struct {
 	pending  *blockQueue
 }
 
+func newRequestQueuer() *requestQueuer {
+	return &requestQueuer{
+		onFlight: make(map[block]struct{}),
+		pending:  newBlockQueue(maxOnFlight),
+	}
+}
+
 func (rq *requestQueuer) queue(bl block) (ready, ok bool) {
 	switch {
 	case len(rq.onFlight) < maxOnFlight:
