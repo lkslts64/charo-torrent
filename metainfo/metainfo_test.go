@@ -67,7 +67,7 @@ func TestUnmarshal(t *testing.T) {
 	testUnmarshal(t, "d8:announce3:url4:infod12:piece lengthi5e6:pieces3:omgee",
 		&MetaInfo{
 			Announce: "url",
-			Info: InfoDict{
+			Info: &InfoDict{
 				PieceLen: 5,
 				Pieces:   []byte("omg"),
 			},

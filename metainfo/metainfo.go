@@ -17,7 +17,7 @@ type MetaInfo struct {
 	Created      string     `bencode:"created by" empty:"omit"`
 	CreationDate int        `bencode:"creation date" empty:"omit"`
 	Encoding     string     `bencode:"encoding" empty:"omit"`
-	Info         InfoDict   `bencode:"info"`
+	Info         *InfoDict  `bencode:"info"`
 	//URLList      []string    `bencode:"url-list" empty:"omit"`
 }
 
