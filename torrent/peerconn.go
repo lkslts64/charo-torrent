@@ -4,10 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"time"
 
+	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
@@ -24,61 +24,77 @@ const (
 	keepAliveSendFreq               = keepAliveInterval - 10*time.Second
 )
 
-type wantBlocks byte
-
-//PeerConn represents a peer connection (like a worker)
+//conn represents a peer connection.
+//This is controled by worker goroutines.
 //TODO: peer_wire.Msg should be passed through pointers everywhere
-type PeerConn struct {
+type conn struct {
 	cl *Client
 	t  *Torrent
 	//tcp connection with peer
-	conn net.Conn
+	cn   net.Conn
 	exts peer_wire.Extensions
-	//main goroutine also has this info - needs to be synced between
+	//main goroutine also has this state - needs to be synced between
 	//the two goroutines
-	info peerInfo
+	state *connState
 	//chanel that we receive msgs to be sent (generally)
 	//jobCh chan job - infinite chan
 	//we want to avoid deadlocks between jobCh and eventCh.
 	//Also we dont want master to block until workers(peerConns)
 	//receive jobs (they are doing heavy I/O).
-	//jobs distributed to each peerConn are controlled by
-	//master so the latter will try to limit the rate of them
+	//TODO:get rid of the inf channel - and avoid deadlocks
+	//by prioritizing jobCh at select in mainLoop?
 	jobCh channels.Channel
 	//channel that we send received msgs
-	eventCh chan interface{}
-	//reset timer when we write to conn
+	eventCh        chan interface{}
 	keepAliveTimer *time.Timer
-	rq             requestQueuer //front size = 10, back = 40
+	rq             *requestQueuer //front size = 10, back = 10
 	waitingBlocks  bool
-	amSeeding      bool
-	haveMetadata   bool
-	peerBf         peer_wire.BitField
-	isSeeding      bool
-	myBf           peer_wire.BitField
+	amSeedingCh    chan struct{}
+	haveInfoCh     chan struct{}
+	peerBf         bitmap.Bitmap
+	myBf           bitmap.Bitmap
 }
 
+//just wraps a msg with an error
 type readResult struct {
 	msg *peer_wire.Msg
 	err error
 }
 
-func (pc *PeerConn) init() {
-	//pc.jobCh = make(chan job, jobChSize)
-	pc.jobCh = channels.NewInfiniteChannel()
-	pc.eventCh = make(chan interface{}, eventChSize)
+func newConn(t *Torrent, cl *Client, cn net.Conn) *conn {
+	c := &conn{
+		cl:          cl,
+		t:           t,
+		cn:          cn,
+		state:       newConnState(),
+		jobCh:       channels.NewInfiniteChannel(),
+		eventCh:     make(chan interface{}, eventChSize),
+		rq:          newRequestQueuer(),
+		amSeedingCh: make(chan struct{}),
+		haveInfoCh:  make(chan struct{}),
+	}
+	//inform master about new conn
+	t.newConnCh <- &connChansInfo{
+		c.jobCh,
+		c.eventCh,
+		c.amSeedingCh,
+		c.haveInfoCh,
+	}
+	return c
 }
 
-func (pc *PeerConn) close() {
-	pc.conn.Close()
-	//send event that we closed conn
+func (pc *conn) close() {
+	pc.cn.Close()
+	//send event that we closed and after close chan - avoid leak goroutines
+	pc.eventCh <- *new(connDroped)
 	close(pc.eventCh)
 }
 
-func (pc *PeerConn) mainLoop() error {
+func (pc *conn) mainLoop() error {
 	var err error
-	//pc.initChans()
+	//pc.init()
 	readCh := make(chan readResult, readChSize)
+	//we need o quit chan in order to not leak readMsgs goroutine
 	quit, idle := make(chan struct{}), make(chan struct{})
 	defer pc.close()
 	defer close(quit)
@@ -102,7 +118,6 @@ func (pc *PeerConn) mainLoop() error {
 			if err != nil {
 				return nilOnEOF(err)
 			}
-		//msg available from peer
 		case res := <-readCh:
 			if res.err != nil {
 				return nilOnEOF(res.err)
@@ -113,7 +128,7 @@ func (pc *PeerConn) mainLoop() error {
 		case <-pc.keepAliveTimer.C:
 			err = (&peer_wire.Msg{
 				Kind: peer_wire.KeepAlive,
-			}).Write(pc.conn)
+			}).Write(pc.cn)
 			if err != nil {
 				return err
 			}
@@ -128,7 +143,7 @@ func (pc *PeerConn) mainLoop() error {
 
 //read msgs from remote peer
 //run on seperate goroutine
-func (pc *PeerConn) readMsgs(readCh chan<- readResult, idle, quit chan struct{}) {
+func (pc *conn) readMsgs(readCh chan<- readResult, idle, quit chan struct{}) {
 	var msg *peer_wire.Msg
 	var err error
 	readDone := make(chan readResult)
@@ -137,7 +152,7 @@ loop:
 		//we won't block on read forever cause conn will close
 		//if main goroutine exits
 		go func() {
-			msg, err = peer_wire.Read(pc.conn)
+			msg, err = peer_wire.Read(pc.cn)
 			readDone <- readResult{msg, err}
 		}()
 		//break from loops in not required
@@ -156,14 +171,14 @@ loop:
 	}
 }
 
-func (pc *PeerConn) wantBlocks() bool {
-	return pc.info.canDownload() && !pc.waitingBlocks && pc.rq.needMore()
+func (pc *conn) wantBlocks() bool {
+	return pc.state.canDownload() && !pc.waitingBlocks && pc.rq.needMore()
 }
 
-func (pc *PeerConn) sendKeepAlive() error {
+func (pc *conn) sendKeepAlive() error {
 	err := (&peer_wire.Msg{
 		Kind: peer_wire.KeepAlive,
-	}).Write(pc.conn)
+	}).Write(pc.cn)
 	if err != nil {
 		return err
 	}
@@ -171,31 +186,28 @@ func (pc *PeerConn) sendKeepAlive() error {
 	return nil
 }
 
-func (pc *PeerConn) parseJob(j job) (err error) {
+func (pc *conn) parseJob(j job) (err error) {
 	switch v := j.val.(type) {
 	case *peer_wire.Msg:
 		switch v.Kind {
 		case peer_wire.Interested:
-			pc.info.amInterested = true
+			pc.state.amInterested = true
 		case peer_wire.NotInterested:
-			pc.info.amInterested = false
+			pc.state.amInterested = false
 		case peer_wire.Choke:
-			pc.info.amChoking = true
+			pc.state.amChoking = true
 		case peer_wire.Unchoke:
-			pc.info.amChoking = false
+			pc.state.amChoking = false
 		case peer_wire.Have:
-			pc.myBf.SetPiece(v.Index)
+			pc.myBf.Set(int(v.Index), true)
 			//Surpress have msgs.
 			//From https://wiki.theory.org/index.php/BitTorrentSpecification:
 			//At the same time, it may be worthwhile to send a HAVE message
 			//to a peer that has that piece already since it will be useful in
 			//determining which piece is rare.
-			if pc.peerBf.HasPiece(v.Index) {
+			if pc.peerBf.Get(int(v.Index)) {
 				return
 			}
-		case peer_wire.Bitfield:
-			pc.myBf = v.Bf
-		case peer_wire.Request:
 		}
 		err = pc.sendMsg(v)
 	case []block:
@@ -209,31 +221,37 @@ func (pc *PeerConn) parseJob(j job) (err error) {
 				pc.sendMsg(bl.reqMsg())
 			}
 		}
+	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
+		pc.myBf = v
+		pc.sendMsg(&peer_wire.Msg{
+			Kind: peer_wire.Bitfield,
+			Bf:   pc.encodeBitMap(pc.myBf),
+		})
 	}
 	return
 }
 
-func (pc *PeerConn) sendMsg(msg *peer_wire.Msg) error {
+func (pc *conn) sendMsg(msg *peer_wire.Msg) error {
 	//is mandatory to stop timer and recv from chan
 	//in order to reset it
 	if !pc.keepAliveTimer.Stop() {
 		<-pc.keepAliveTimer.C
 		err := (&peer_wire.Msg{
 			Kind: peer_wire.KeepAlive,
-		}).Write(pc.conn)
+		}).Write(pc.cn)
 		if err != nil {
 			return err
 		}
 	}
 	pc.keepAliveTimer.Reset(keepAliveSendFreq)
-	err := msg.Write(pc.conn)
+	err := msg.Write(pc.cn)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (pc *PeerConn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
+func (pc *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	stateChange := func(currState, futureState bool) bool {
 		if currState == futureState {
 			return futureState
@@ -244,36 +262,36 @@ func (pc *PeerConn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	switch msg.Kind {
 	case peer_wire.KeepAlive, peer_wire.Port:
 	case peer_wire.Interested:
-		pc.info.amInterested = stateChange(pc.info.amInterested, true)
+		pc.state.amInterested = stateChange(pc.state.amInterested, true)
 	case peer_wire.NotInterested:
-		pc.info.amInterested = stateChange(pc.info.amInterested, false)
+		pc.state.amInterested = stateChange(pc.state.amInterested, false)
 	case peer_wire.Choke:
-		pc.info.amChoking = stateChange(pc.info.amChoking, true)
-		pc.sendUnsatisfiedRequests()
+		pc.state.amChoking = stateChange(pc.state.amChoking, true)
+		pc.discardBlocks()
 	case peer_wire.Unchoke:
-		pc.info.amChoking = stateChange(pc.info.amChoking, false)
+		pc.state.amChoking = stateChange(pc.state.amChoking, false)
 	case peer_wire.Piece:
 		err = pc.onPieceMsg(msg)
 	case peer_wire.Request:
 		err = pc.upload(msg)
 	case peer_wire.Have:
-		if pc.peerBf.HasPiece(msg.Index) {
+		if pc.peerBf.Get(int(msg.Index)) {
 			//log this
+			return
 		}
-		pc.peerBf.SetPiece(msg.Index)
+		pc.peerBf.Set(int(msg.Index), true)
 		pc.eventCh <- msg
 	case peer_wire.Bitfield:
-		if pc.peerBf != nil {
+		if !pc.peerBf.IsEmpty() {
 			err = errors.New("peer: send bitfield twice")
 		}
-		if pc.haveMetadata {
-			if !pc.bitFieldValid() {
-				err = errors.New("peer: wrong bitfield length")
-				return
-			}
+		var tmp *bitmap.Bitmap
+		tmp, err = pc.decodeBitfield(msg.Bf)
+		if err != nil {
+			return
 		}
-		pc.peerBf = msg.Bf
-		pc.eventCh <- msg
+		pc.peerBf = *tmp
+		pc.eventCh <- pc.peerBf.Copy()
 	case peer_wire.Extended:
 		pc.onExtended(msg)
 	default:
@@ -282,16 +300,62 @@ func (pc *PeerConn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	return
 }
 
-//we should have metadata to call this
-func (pc *PeerConn) bitFieldValid() bool {
-	numPieces := pc.t.tm.mi.Info.NumPieces()
-	//no need to lock peerBf - no one will modify it
-	return len(pc.peerBf) != int(math.Ceil(float64(numPieces)/8.0))
+func (c *conn) encodeBitMap(bm bitmap.Bitmap) (bf peer_wire.BitField) {
+	bf = peer_wire.NewBitField(c.t.numPieces())
+	bm.IterTyped(func(piece int) bool {
+		bf.SetPiece(piece)
+		return true
+	})
+	return
 }
+
+func (c *conn) decodeBitfield(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
+	var bfLen int
+	var bm *bitmap.Bitmap
+	if c.haveInfo() {
+		numPieces := c.t.numPieces()
+		if !bf.Valid(numPieces) {
+			return nil, errors.New("bf length is not valid")
+		}
+		bfLen = peer_wire.BfLen(numPieces)
+	} else {
+		bfLen = len(bf) * 8
+	}
+	for i := 0; i < bfLen; i++ {
+		if bf.HasPiece(i) {
+			bm.Set(i, true)
+		}
+	}
+	return bm, nil
+}
+
+//in order for this function to work correctly,no values should
+//be ever sent at `ch`.
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *conn) seeding() bool {
+	return isClosed(c.amSeedingCh)
+}
+
+func (c *conn) haveInfo() bool {
+	return isClosed(c.haveInfoCh)
+}
+
+/*//we should have metadata in order to call this
+func (pc *conn) peerBitFieldValid() bool {
+	return pc.peerBf.Valid(pc.t.tm.mi.Info.NumPieces())
+}*/
 
 type metainfoSize int64
 
-func (pc *PeerConn) onExtended(msg *peer_wire.Msg) (err error) {
+func (pc *conn) onExtended(msg *peer_wire.Msg) (err error) {
 	switch v := msg.ExtendedMsg.(type) {
 	case peer_wire.ExtHandshakeDict:
 		pc.exts, err = v.Extensions()
@@ -305,7 +369,7 @@ func (pc *PeerConn) onExtended(msg *peer_wire.Msg) (err error) {
 		case peer_wire.MetadataDataID:
 		case peer_wire.MetadataRejID:
 		case peer_wire.MetadataReqID:
-			if !pc.haveMetadata {
+			if !pc.haveInfo() {
 				pc.sendMsg(&peer_wire.Msg{
 					Kind:       peer_wire.Extended,
 					ExtendedID: peer_wire.ExtMetadataID,
@@ -324,7 +388,7 @@ func (pc *PeerConn) onExtended(msg *peer_wire.Msg) (err error) {
 	return nil
 }
 
-func (pc *PeerConn) sendUnsatisfiedRequests() {
+func (pc *conn) discardBlocks() {
 	if !pc.rq.empty() {
 		unsatisfiedRequests := pc.rq.discardAll()
 		pc.eventCh <- unsatisfiedRequests
@@ -332,32 +396,34 @@ func (pc *PeerConn) sendUnsatisfiedRequests() {
 }
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
-func (pc *PeerConn) upload(msg *peer_wire.Msg) error {
+func (pc *conn) upload(msg *peer_wire.Msg) error {
 	tmeta := pc.t.tm
-	if !pc.info.canUpload() {
+	bl := reqMsgToBlock(msg)
+	if !pc.state.canUpload() {
 		//maybe we have choked the peer, but he hasnt been informed and
 		//thats why he send us request, dont drop conn just ignore the req
 		return nil
 	}
-	if msg.Len > maxRequestBlockSz || msg.Len < minRequestBlockSz {
+	if bl.len > maxRequestBlockSz || bl.len < minRequestBlockSz {
 		return fmt.Errorf("request length out of range: %d", msg.Len)
 	}
 	//check that we have the requested pice
-	if pc.myBf.HasPiece(msg.Index) {
+	if pc.myBf.Get(bl.pc) {
 		return fmt.Errorf("peer requested piece we do not have")
 	}
 	//ensure the we dont exceed the end of the piece
 	//TODO: check for the specific piece
-	if endOff := msg.Begin + msg.Len; endOff > uint32(tmeta.mi.Info.PieceLen) {
+	if endOff := bl.off + bl.len; endOff > tmeta.mi.Info.PieceLen {
 		return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
 	}
 	//read from db
 	//and write to conn
-	pc.eventCh <- uploadedBlock(reqMsgToBlock(msg))
+	pc.eventCh <- uploadedBlock(bl)
 	return nil
 }
 
-func (pc *PeerConn) onPieceMsg(msg *peer_wire.Msg) error {
+//store block and send another request if request queuer permits it.
+func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	var ready block
 	var ok bool
 	bl := reqMsgToBlock(msg.Request())
@@ -367,7 +433,7 @@ func (pc *PeerConn) onPieceMsg(msg *peer_wire.Msg) error {
 		}
 		//peer send us a block we already have
 		//TODO:log this
-		if pc.myBf.HasPiece(msg.Index) {
+		if pc.myBf.Get(bl.pc) {
 			return nil
 		}
 		var length int
@@ -375,68 +441,40 @@ func (pc *PeerConn) onPieceMsg(msg *peer_wire.Msg) error {
 		if length, err = pc.t.pieces.pcs[bl.pc].lenSafe(bl.off); err != nil {
 			return err
 		}
-		if uint32(length) != bl.len {
+		if length != bl.len {
 			return errors.New("peer: wrong msg length")
 		}
 	}
-	if pc.info.canDownload() && (ready != block{}) {
+	if pc.state.canDownload() && (ready != block{}) {
 		pc.sendMsg(ready.reqMsg())
 	}
 	//all good?
 	//store at db
-	pc.eventCh <- downloadedBlock(reqMsgToBlock(msg))
+	pc.eventCh <- downloadedBlock(bl)
 	return nil
-}
-
-//TODO:sync.atomic ??
-type peerInfo struct {
-	amInterested bool
-	amChoking    bool
-	isInterested bool
-	isChoking    bool
-}
-
-func (pi *peerInfo) canUpload() bool {
-	return !pi.amChoking && pi.isInterested
-}
-
-func (pi *peerInfo) canDownload() bool {
-	return !pi.isChoking && pi.amInterested
 }
 
 //TODO: master hold piece struct and manages them.
 //master sends to peer conns block requests
 type block struct {
-	pc  uint32
-	off uint32
-	len uint32
+	pc  int
+	off int
+	len int
 }
 
 func (b *block) reqMsg() *peer_wire.Msg {
 	return &peer_wire.Msg{
 		Kind:  peer_wire.Request,
-		Index: b.pc,
-		Begin: b.off,
-		Len:   b.len,
+		Index: uint32(b.pc),
+		Begin: uint32(b.off),
+		Len:   uint32(b.len),
 	}
 }
 
 func reqMsgToBlock(msg *peer_wire.Msg) block {
 	return block{
-		pc:  msg.Index,
-		off: msg.Begin,
-		len: msg.Len,
+		pc:  int(msg.Index),
+		off: int(msg.Begin),
+		len: int(msg.Len),
 	}
 }
-
-type downloadedBlock block
-type uploadedBlock block
-
-/*func (b *block) requestMsg() *peer_wire.Msg {
-	return &peer_wire.Msg{
-		Kind:  peer_wire.Request,
-		Index: b.pc,
-		Begin: b.off,
-		Len:   b.len,
-	}
-}*/
