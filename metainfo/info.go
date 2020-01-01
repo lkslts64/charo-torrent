@@ -64,8 +64,8 @@ func (info *InfoDict) TotalLength() (total int) {
 	return
 }
 
-func (info *InfoDict) NumPieces() uint32 {
-	return uint32(len(info.Pieces)) / pieceSize
+func (info *InfoDict) NumPieces() int {
+	return len(info.Pieces) / pieceSize
 }
 
 func (info *InfoDict) PiecesHash() [][]byte {
