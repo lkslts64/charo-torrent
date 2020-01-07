@@ -4,12 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
-	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
@@ -29,8 +30,9 @@ const (
 //This is controled by worker goroutines.
 //TODO: peer_wire.Msg should be passed through pointers everywhere
 type conn struct {
-	cl *Client
-	t  *Torrent
+	cl     *Client
+	t      *Torrent
+	logger *log.Logger
 	//tcp connection with peer
 	cn   net.Conn
 	exts peer_wire.Extensions
@@ -44,33 +46,34 @@ type conn struct {
 	//receive jobs (they are doing heavy I/O).
 	//TODO:get rid of the inf channel - and avoid deadlocks
 	//by prioritizing jobCh at select in mainLoop?
-	jobCh channels.Channel
+	jobCh chan interface{}
 	//channel that we send received msgs
 	eventCh        chan interface{}
 	keepAliveTimer *time.Timer
 	rq             *requestQueuer //front size = 10, back = 10
 	peerReqs       map[block]struct{}
-	muPeerReqs     sync.Mutex
-	waitingBlocks  bool
-	amSeedingCh    chan struct{}
-	haveInfoCh     chan struct{}
-	peerBf         bitmap.Bitmap
-	myBf           bitmap.Bitmap
+	//An integer, the number of outstanding request messages this peer supports
+	//without dropping any. The default in in libtorrent is 250.
+	peerReqq      int
+	muPeerReqs    sync.Mutex
+	waitingBlocks bool
+	amSeedingCh   chan struct{}
+	haveInfoCh    chan struct{}
+	peerBf        bitmap.Bitmap
+	myBf          bitmap.Bitmap
+	peerID        []byte
 }
 
 //just wraps a msg with an error
-type readResult struct {
-	msg *peer_wire.Msg
-	err error
-}
-
-func newConn(t *Torrent, cl *Client, cn net.Conn) *conn {
+func newConn(t *Torrent, cl *Client, cn net.Conn, peerID []byte) *conn {
 	c := &conn{
-		cl:          cl,
-		t:           t,
+		cl: cl,
+		t:  t,
+		//TODO:change logger output to a file
+		logger:      log.New(os.Stdout, string(peerID), log.LstdFlags),
 		cn:          cn,
 		state:       newConnState(),
-		jobCh:       channels.NewInfiniteChannel(),
+		jobCh:       make(chan interface{}, jobChSize),
 		eventCh:     make(chan interface{}, eventChSize),
 		rq:          newRequestQueuer(),
 		amSeedingCh: make(chan struct{}),
@@ -93,6 +96,11 @@ func (pc *conn) close() {
 	close(pc.eventCh)
 }
 
+type readResult struct {
+	msg *peer_wire.Msg
+	err error
+}
+
 func (pc *conn) mainLoop() error {
 	var err error
 	//pc.init()
@@ -112,33 +120,40 @@ func (pc *conn) mainLoop() error {
 	pc.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
 	//TODO:set when the peer becomes downloader
 	for {
+		//prioritize jobCh so we dont enter into a deadlock state between
+		//jobCh and eventCh.
 		select {
-		case <-pc.t.done:
-		//job came from main routine
-		case act := <-pc.jobCh.Out():
+		case act := <-pc.jobCh:
 			//TODO:pass values to job ch as interface{}
 			//no need for job type wrapper
 			err = pc.parseJob(act.(job))
-		case msg := <-readCh:
-			err = pc.parsePeerMsg(msg)
-		case err = <-readErrCh:
-		case <-idle:
-			return errors.New("peer idle")
-		case <-pc.keepAliveTimer.C:
-			err = (&peer_wire.Msg{
-				Kind: peer_wire.KeepAlive,
-			}).Write(pc.cn)
-			if err != nil {
-				return err
+		default:
+			select {
+			case <-pc.t.done:
+			//job came from main routine
+			case msg := <-readCh:
+				err = pc.parsePeerMsg(msg)
+			case err = <-readErrCh:
+			case <-idle:
+				err = errors.New("peer idle")
+			case <-pc.keepAliveTimer.C:
+				err = (&peer_wire.Msg{
+					Kind: peer_wire.KeepAlive,
+				}).Write(pc.cn)
+				if err != nil {
+					return err
+				}
+				pc.keepAliveTimer.Reset(keepAliveSendFreq)
 			}
-			pc.keepAliveTimer.Reset(keepAliveSendFreq)
-		}
-		if err != nil {
-			return nilOnEOF(err)
-		}
-		if pc.wantBlocks() {
-			pc.eventCh <- *new(wantBlocks)
-			pc.waitingBlocks = true
+			if err != nil {
+				pc.logger.Println(err)
+				return nilOnEOF(err)
+			}
+			if pc.wantBlocks() {
+				pc.eventCh <- *new(wantBlocks)
+				pc.waitingBlocks = true
+				pc.logger.Println("want blocks send")
+			}
 		}
 	}
 }
@@ -150,7 +165,6 @@ func (pc *conn) readMsgs(readCh chan<- *peer_wire.Msg, idle, quit chan struct{},
 	var msg *peer_wire.Msg
 	var err error
 	readDone := make(chan readResult)
-
 loop:
 	for {
 		//we won't block on read forever cause conn will close
@@ -166,6 +180,7 @@ loop:
 		case res := <-readDone:
 			if res.err != nil {
 				errCh <- res.err
+				break loop
 			}
 			var sendToChan bool
 			switch res.msg.Kind {
@@ -175,7 +190,12 @@ loop:
 				//avoid flooding readCh by not sending requests that are
 				//already requested from peer and by discarding requests when
 				//our buffer is full.
-				if _, ok := pc.peerReqs[b]; !ok && len(pc.peerReqs) <= maxOnFlight {
+				switch _, ok := pc.peerReqs[b]; {
+				case ok:
+					pc.logger.Printf("peer send duplicate request for block %v\n", b)
+				case len(pc.peerReqs) >= pc.t.reqq:
+					pc.logger.Print("peer requests buffer is full\n")
+				default: //all good
 					pc.peerReqs[b] = struct{}{}
 					sendToChan = true
 				}
@@ -185,9 +205,9 @@ loop:
 				pc.muPeerReqs.Lock()
 				if _, ok := pc.peerReqs[b]; ok {
 					delete(pc.peerReqs, b)
+					pc.logger.Printf("canceled request for block %v\n", b)
 				}
 				pc.muPeerReqs.Unlock()
-				continue
 			default:
 				sendToChan = true
 			}
@@ -309,7 +329,7 @@ func (pc *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		err = pc.upload(msg)
 	case peer_wire.Have:
 		if pc.peerBf.Get(int(msg.Index)) {
-			//log this
+			pc.logger.Printf("peer send duplicate Have msg of piece %d\n", msg.Index)
 			return
 		}
 		pc.peerBf.Set(int(msg.Index), true)
@@ -444,6 +464,7 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 	if !pc.state.canUpload() {
 		//maybe we have choked the peer, but he hasnt been informed and
 		//thats why he send us request, dont drop conn just ignore the req
+		pc.logger.Print("peer send request msg while choked\n")
 		return nil
 	}
 	if bl.len > maxRequestBlockSz || bl.len < minRequestBlockSz {
@@ -477,21 +498,27 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	var ok bool
 	bl := reqMsgToBlock(msg.Request())
 	if ready, ok = pc.rq.deleteCompleted(bl); !ok {
+		//We didnt' request this piece, but maybe it is useful
+		pc.logger.Printf("received unexpected block %v\n", bl)
 		if !pc.t.pieces.valid(bl.pc) {
-			return errors.New("peer: piece doesn't exist")
+			return errors.New("peer send piece doesn't exist")
 		}
 		//peer send us a block we already have
-		//TODO:log this
 		if pc.myBf.Get(bl.pc) {
+			pc.logger.Printf("peer send block we already have: %v\n", bl)
 			return nil
 		}
 		var length int
 		var err error
-		if length, err = pc.t.pieces.pcs[bl.pc].lenSafe(bl.off); err != nil {
-			return err
-		}
-		if length != bl.len {
-			return errors.New("peer: wrong msg length")
+		if length, err = pc.t.pieces.pcs[bl.pc].lenSafe(bl.off); err != nil ||
+			length != bl.len {
+			switch {
+			case errors.Is(err, errDivOffset):
+				pc.logger.Println(err)
+			case errors.Is(err, errLargeOffset):
+				return err
+			}
+			return nil
 		}
 	}
 	if pc.state.canDownload() && (ready != block{}) {
