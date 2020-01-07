@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
+	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
@@ -46,7 +47,7 @@ type conn struct {
 	//receive jobs (they are doing heavy I/O).
 	//TODO:get rid of the inf channel - and avoid deadlocks
 	//by prioritizing jobCh at select in mainLoop?
-	jobCh chan interface{}
+	jobCh channels.Channel
 	//channel that we send received msgs
 	eventCh        chan interface{}
 	keepAliveTimer *time.Timer
@@ -65,19 +66,21 @@ type conn struct {
 }
 
 //just wraps a msg with an error
-func newConn(t *Torrent, cl *Client, cn net.Conn, peerID []byte) *conn {
+func newConn(t *Torrent, cn net.Conn, peerID []byte, peerReqq int) *conn {
 	c := &conn{
-		cl: cl,
+		cl: t.cl,
 		t:  t,
 		//TODO:change logger output to a file
 		logger:      log.New(os.Stdout, string(peerID), log.LstdFlags),
 		cn:          cn,
 		state:       newConnState(),
-		jobCh:       make(chan interface{}, jobChSize),
+		jobCh:       channels.NewInfiniteChannel(),
 		eventCh:     make(chan interface{}, eventChSize),
 		rq:          newRequestQueuer(),
 		amSeedingCh: make(chan struct{}),
 		haveInfoCh:  make(chan struct{}),
+		peerReqq:    peerReqq,
+		peerReqs:    make(map[block]struct{}),
 	}
 	//inform master about new conn
 	t.newConnCh <- &connChansInfo{
@@ -94,6 +97,7 @@ func (pc *conn) close() {
 	//send event that we closed and after close chan - avoid leak goroutines
 	pc.eventCh <- *new(connDroped)
 	close(pc.eventCh)
+	pc.logger.Println("closed connection")
 }
 
 type readResult struct {
@@ -120,40 +124,35 @@ func (pc *conn) mainLoop() error {
 	pc.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
 	//TODO:set when the peer becomes downloader
 	for {
-		//prioritize jobCh so we dont enter into a deadlock state between
-		//jobCh and eventCh.
 		select {
-		case act := <-pc.jobCh:
+		case act := <-pc.jobCh.Out():
 			//TODO:pass values to job ch as interface{}
 			//no need for job type wrapper
 			err = pc.parseJob(act.(job))
-		default:
-			select {
-			case <-pc.t.done:
-			//job came from main routine
-			case msg := <-readCh:
-				err = pc.parsePeerMsg(msg)
-			case err = <-readErrCh:
-			case <-idle:
-				err = errors.New("peer idle")
-			case <-pc.keepAliveTimer.C:
-				err = (&peer_wire.Msg{
-					Kind: peer_wire.KeepAlive,
-				}).Write(pc.cn)
-				if err != nil {
-					return err
-				}
-				pc.keepAliveTimer.Reset(keepAliveSendFreq)
-			}
+		case <-pc.t.done:
+		//job came from main routine
+		case msg := <-readCh:
+			err = pc.parsePeerMsg(msg)
+		case err = <-readErrCh:
+		case <-idle:
+			err = errors.New("peer idle")
+		case <-pc.keepAliveTimer.C:
+			err = (&peer_wire.Msg{
+				Kind: peer_wire.KeepAlive,
+			}).Write(pc.cn)
 			if err != nil {
-				pc.logger.Println(err)
-				return nilOnEOF(err)
+				return err
 			}
-			if pc.wantBlocks() {
-				pc.eventCh <- *new(wantBlocks)
-				pc.waitingBlocks = true
-				pc.logger.Println("want blocks send")
-			}
+			pc.keepAliveTimer.Reset(keepAliveSendFreq)
+		}
+		if err != nil {
+			pc.logger.Println(err)
+			return nilOnEOF(err)
+		}
+		if pc.wantBlocks() {
+			pc.eventCh <- *new(wantBlocks)
+			pc.waitingBlocks = true
+			pc.logger.Println("want blocks send")
 		}
 	}
 }
@@ -364,7 +363,7 @@ func (c *conn) encodeBitMap(bm bitmap.Bitmap) (bf peer_wire.BitField) {
 
 func (c *conn) decodeBitfield(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
 	var bfLen int
-	var bm *bitmap.Bitmap
+	var bm bitmap.Bitmap
 	if c.haveInfo() {
 		numPieces := c.t.numPieces()
 		if !bf.Valid(numPieces) {
@@ -379,7 +378,7 @@ func (c *conn) decodeBitfield(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
 			bm.Set(i, true)
 		}
 	}
-	return bm, nil
+	return &bm, nil
 }
 
 //in order for this function to work correctly,no values should
@@ -450,7 +449,6 @@ func (pc *conn) discardBlocks() {
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
 func (pc *conn) upload(msg *peer_wire.Msg) error {
-	tmeta := pc.t.tm
 	bl := reqMsgToBlock(msg)
 	if pc.isCanceled(bl) {
 		return nil
@@ -476,7 +474,7 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 	}
 	//ensure the we dont exceed the end of the piece
 	//TODO: check for the specific piece
-	if endOff := bl.off + bl.len; endOff > tmeta.PieceLen(uint32(bl.pc)) {
+	if endOff := bl.off + bl.len; endOff > pc.t.PieceLen(uint32(bl.pc)) {
 		return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
 	}
 	//read from db
