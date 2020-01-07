@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -48,6 +49,8 @@ type conn struct {
 	eventCh        chan interface{}
 	keepAliveTimer *time.Timer
 	rq             *requestQueuer //front size = 10, back = 10
+	peerReqs       map[block]struct{}
+	muPeerReqs     sync.Mutex
 	waitingBlocks  bool
 	amSeedingCh    chan struct{}
 	haveInfoCh     chan struct{}
@@ -93,12 +96,13 @@ func (pc *conn) close() {
 func (pc *conn) mainLoop() error {
 	var err error
 	//pc.init()
-	readCh := make(chan readResult, readChSize)
+	readCh := make(chan *peer_wire.Msg, readChSize)
+	readErrCh := make(chan error, 1)
 	//we need o quit chan in order to not leak readMsgs goroutine
 	quit, idle := make(chan struct{}), make(chan struct{})
 	defer pc.close()
 	defer close(quit)
-	go pc.readMsgs(readCh, idle, quit)
+	go pc.readMsgs(readCh, idle, quit, readErrCh)
 	nilOnEOF := func(err error) error {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil
@@ -115,14 +119,9 @@ func (pc *conn) mainLoop() error {
 			//TODO:pass values to job ch as interface{}
 			//no need for job type wrapper
 			err = pc.parseJob(act.(job))
-			if err != nil {
-				return nilOnEOF(err)
-			}
-		case res := <-readCh:
-			if res.err != nil {
-				return nilOnEOF(res.err)
-			}
-			pc.parsePeerMsg(res.msg)
+		case msg := <-readCh:
+			err = pc.parsePeerMsg(msg)
+		case err = <-readErrCh:
 		case <-idle:
 			return errors.New("peer idle")
 		case <-pc.keepAliveTimer.C:
@@ -134,6 +133,9 @@ func (pc *conn) mainLoop() error {
 			}
 			pc.keepAliveTimer.Reset(keepAliveSendFreq)
 		}
+		if err != nil {
+			return nilOnEOF(err)
+		}
 		if pc.wantBlocks() {
 			pc.eventCh <- *new(wantBlocks)
 			pc.waitingBlocks = true
@@ -143,10 +145,12 @@ func (pc *conn) mainLoop() error {
 
 //read msgs from remote peer
 //run on seperate goroutine
-func (pc *conn) readMsgs(readCh chan<- readResult, idle, quit chan struct{}) {
+func (pc *conn) readMsgs(readCh chan<- *peer_wire.Msg, idle, quit chan struct{},
+	errCh chan error) {
 	var msg *peer_wire.Msg
 	var err error
 	readDone := make(chan readResult)
+
 loop:
 	for {
 		//we won't block on read forever cause conn will close
@@ -160,10 +164,39 @@ loop:
 		case <-time.After(keepAliveInterval + 1*time.Minute): //lets be more resilient
 			close(idle)
 		case res := <-readDone:
-			select {
-			case readCh <- res:
-			case <-quit: //we must care for quit here too
-				break loop
+			if res.err != nil {
+				errCh <- res.err
+			}
+			var sendToChan bool
+			switch res.msg.Kind {
+			case peer_wire.Request:
+				b := reqMsgToBlock(msg)
+				pc.muPeerReqs.Lock()
+				//avoid flooding readCh by not sending requests that are
+				//already requested from peer and by discarding requests when
+				//our buffer is full.
+				if _, ok := pc.peerReqs[b]; !ok && len(pc.peerReqs) <= maxOnFlight {
+					pc.peerReqs[b] = struct{}{}
+					sendToChan = true
+				}
+				pc.muPeerReqs.Unlock()
+			case peer_wire.Cancel:
+				b := reqMsgToBlock(msg)
+				pc.muPeerReqs.Lock()
+				if _, ok := pc.peerReqs[b]; ok {
+					delete(pc.peerReqs, b)
+				}
+				pc.muPeerReqs.Unlock()
+				continue
+			default:
+				sendToChan = true
+			}
+			if sendToChan {
+				select {
+				case readCh <- res.msg:
+				case <-quit: //we must care for quit here too
+					break loop
+				}
 			}
 		case <-quit:
 			break loop
@@ -399,6 +432,15 @@ func (pc *conn) discardBlocks() {
 func (pc *conn) upload(msg *peer_wire.Msg) error {
 	tmeta := pc.t.tm
 	bl := reqMsgToBlock(msg)
+	if pc.isCanceled(bl) {
+		return nil
+	}
+	//ensure we delete the request at every case
+	defer func() {
+		pc.muPeerReqs.Lock()
+		defer pc.muPeerReqs.Unlock()
+		delete(pc.peerReqs, bl)
+	}()
 	if !pc.state.canUpload() {
 		//maybe we have choked the peer, but he hasnt been informed and
 		//thats why he send us request, dont drop conn just ignore the req
@@ -407,19 +449,26 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 	if bl.len > maxRequestBlockSz || bl.len < minRequestBlockSz {
 		return fmt.Errorf("request length out of range: %d", msg.Len)
 	}
-	//check that we have the requested pice
+	//check that we have the requested piece
 	if pc.myBf.Get(bl.pc) {
 		return fmt.Errorf("peer requested piece we do not have")
 	}
 	//ensure the we dont exceed the end of the piece
 	//TODO: check for the specific piece
-	if endOff := bl.off + bl.len; endOff > tmeta.mi.Info.PieceLen {
+	if endOff := bl.off + bl.len; endOff > tmeta.PieceLen(uint32(bl.pc)) {
 		return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
 	}
 	//read from db
 	//and write to conn
 	pc.eventCh <- uploadedBlock(bl)
 	return nil
+}
+
+func (pc *conn) isCanceled(b block) bool {
+	pc.muPeerReqs.Lock()
+	defer pc.muPeerReqs.Unlock()
+	_, ok := pc.peerReqs[b]
+	return ok
 }
 
 //store block and send another request if request queuer permits it.
