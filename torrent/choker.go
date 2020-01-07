@@ -44,23 +44,32 @@ func (c *choker) pickOptimisticUnchoke() {
 	}
 }
 
-type unchokingCandidate *connInfo
+//type unchokingCandidate *connInfo
 
-type unchokingCandidates []unchokingCandidate
+type unchokingCandidates []*connInfo
 
 func (uc unchokingCandidates) Len() int { return len(uc) }
 
 func (uc unchokingCandidates) Less(i, j int) bool {
-	rate := func(index int) time.Duration {
+	rate := func(index int) int {
 		if uc[index].stats.sumDownloading == 0 {
 			return 0
 		}
 		t := uc[index].t
 		c := (*connInfo)(uc[index])
+		var dur time.Duration
 		if t.seeding {
-			return c.durationUploading()
+			dur = c.durationUploading()
+			if dur == 0 {
+				return 0
+			}
+			return c.stats.uploadUseful / int(c.durationUploading())
 		}
-		return c.durationDownloading()
+		dur = c.durationDownloading()
+		if dur == 0 {
+			return 0
+		}
+		return c.stats.downloadUseful / int(c.durationDownloading())
 	}
 	return rate(i) > rate(j)
 }
@@ -69,7 +78,7 @@ func (uc unchokingCandidates) Swap(i, j int) {
 	uc[i], uc[j] = uc[j], uc[i]
 }
 
-func (uc unchokingCandidates) contains(cand unchokingCandidate) bool {
+func (uc unchokingCandidates) contains(cand *connInfo) bool {
 	for _, c := range uc {
 		if c == cand {
 			return true
@@ -92,35 +101,30 @@ func (c *choker) reviewUnchokedPeers() {
 	}
 	sort.Sort(bestPeers)
 	uploadSlots := int(math.Min(maxUploadSlots, float64(len(bestPeers))))
+	optimisticCandidates := bestPeers[uploadSlots:]
 	//peers that have best upload rates
 	bestPeers = bestPeers[:uploadSlots]
-	optimistics := []*connInfo{}
-	for _, conn := range c.t.conns {
-		if bestPeers.contains(conn) {
-			conn.unchoke()
-		} else {
-			optimistics = append(optimistics, conn)
-		}
+	for _, conn := range bestPeers {
+		conn.unchoke()
 	}
 	numOptimistics := int(math.Max(optimisticSlots, float64(maxUploadSlots-uploadSlots)))
-	//if optimistic unchoke belongs to 'downloaders',
-	//we 'll unchoke one more peer randomly
+	//if we haven't yet unchoked optimistic peer,then do it
 	if c.optimistic != nil && !bestPeers.contains(c.optimistic) {
 		c.optimistic.unchoke()
 		numOptimistics--
 	}
 	var optimisticCount int
-	//unchoke optimistics in random order
-	//only if bestPeers are not sufficient
-	indices := rand.Perm(len(optimistics))
+	//unchoke optimistics in random order (only if bestPeers are not sufficient)
+	//and choke the remaining ones.
+	indices := rand.Perm(len(optimisticCandidates))
 	for _, i := range indices {
-		if optimistics[i].peerSeeding() {
-			optimistics[i].choke()
+		if optimisticCandidates[i].peerSeeding() {
+			optimisticCandidates[i].choke()
 		} else if optimisticCount >= numOptimistics {
-			optimistics[i].choke()
+			optimisticCandidates[i].choke()
 		} else {
-			optimistics[i].unchoke()
-			if optimistics[i].state.isInterested {
+			optimisticCandidates[i].unchoke()
+			if optimisticCandidates[i].state.isInterested {
 				optimisticCount++
 			}
 		}
