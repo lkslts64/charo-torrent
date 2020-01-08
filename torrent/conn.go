@@ -45,8 +45,6 @@ type conn struct {
 	//we want to avoid deadlocks between jobCh and eventCh.
 	//Also we dont want master to block until workers(peerConns)
 	//receive jobs (they are doing heavy I/O).
-	//TODO:get rid of the inf channel - and avoid deadlocks
-	//by prioritizing jobCh at select in mainLoop?
 	jobCh channels.Channel
 	//channel that we send received msgs
 	eventCh        chan interface{}
@@ -205,6 +203,8 @@ loop:
 				if _, ok := pc.peerReqs[b]; ok {
 					delete(pc.peerReqs, b)
 					pc.logger.Printf("canceled request for block %v\n", b)
+				} else {
+					unsatisfiedCancels.Inc()
 				}
 				pc.muPeerReqs.Unlock()
 			default:
@@ -314,14 +314,14 @@ func (pc *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	switch msg.Kind {
 	case peer_wire.KeepAlive, peer_wire.Port:
 	case peer_wire.Interested:
-		pc.state.amInterested = stateChange(pc.state.amInterested, true)
+		pc.state.isInterested = stateChange(pc.state.isInterested, true)
 	case peer_wire.NotInterested:
-		pc.state.amInterested = stateChange(pc.state.amInterested, false)
+		pc.state.isInterested = stateChange(pc.state.isInterested, false)
 	case peer_wire.Choke:
-		pc.state.amChoking = stateChange(pc.state.amChoking, true)
+		pc.state.isChoking = stateChange(pc.state.isChoking, true)
 		pc.discardBlocks()
 	case peer_wire.Unchoke:
-		pc.state.amChoking = stateChange(pc.state.amChoking, false)
+		pc.state.isChoking = stateChange(pc.state.isChoking, false)
 	case peer_wire.Piece:
 		err = pc.onPieceMsg(msg)
 	case peer_wire.Request:
@@ -459,6 +459,9 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 		defer pc.muPeerReqs.Unlock()
 		delete(pc.peerReqs, bl)
 	}()
+	if !pc.haveInfo() {
+		return errors.New("peer send requested and we dont have info dict")
+	}
 	if !pc.state.canUpload() {
 		//maybe we have choked the peer, but he hasnt been informed and
 		//thats why he send us request, dont drop conn just ignore the req
@@ -469,7 +472,7 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 		return fmt.Errorf("request length out of range: %d", msg.Len)
 	}
 	//check that we have the requested piece
-	if pc.myBf.Get(bl.pc) {
+	if !pc.myBf.Get(bl.pc) {
 		return fmt.Errorf("peer requested piece we do not have")
 	}
 	//ensure the we dont exceed the end of the piece
@@ -487,7 +490,7 @@ func (pc *conn) isCanceled(b block) bool {
 	pc.muPeerReqs.Lock()
 	defer pc.muPeerReqs.Unlock()
 	_, ok := pc.peerReqs[b]
-	return ok
+	return !ok
 }
 
 //store block and send another request if request queuer permits it.
@@ -501,9 +504,9 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		if !pc.t.pieces.valid(bl.pc) {
 			return errors.New("peer send piece doesn't exist")
 		}
-		//peer send us a block we already have
+		//TODO: check if we have the particular block
 		if pc.myBf.Get(bl.pc) {
-			pc.logger.Printf("peer send block we already have: %v\n", bl)
+			pc.logger.Printf("peer send block of piece we already have: %v\n", bl)
 			return nil
 		}
 		var length int
@@ -512,11 +515,18 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 			length != bl.len {
 			switch {
 			case errors.Is(err, errDivOffset):
+				//peer gave us a useful block but with offset % blockSz != 0
+				//We dont punish him but we dont save to storage also, we dont
+				//want to mix our block offsets (we have precomputed which blocks
+				//to ask for).
 				pc.logger.Println(err)
+				return nil
 			case errors.Is(err, errLargeOffset):
 				return err
+			default: //second cond is false at if stmt
+				pc.logger.Println("length of piece msg is wrong")
+				return nil
 			}
-			return nil
 		}
 	}
 	if pc.state.canDownload() && (ready != block{}) {
