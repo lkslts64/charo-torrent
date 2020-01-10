@@ -89,6 +89,9 @@ func (uc unchokingCandidates) contains(cand *connInfo) bool {
 
 //reviewUnchokedPeers algorithm similar to the one used at mainline client
 func (c *choker) reviewUnchokedPeers() {
+	if len(c.t.conns) == 0 {
+		return
+	}
 	if c.currRound%5 == 0 {
 		c.pickOptimisticUnchoke()
 	}
