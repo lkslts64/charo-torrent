@@ -31,9 +31,11 @@ const (
 //This is controled by worker goroutines.
 //TODO: peer_wire.Msg should be passed through pointers everywhere
 type conn struct {
-	cl     *Client
-	t      *Torrent
-	logger *log.Logger
+	//TODO:remove this
+	storage func()
+	cl      *Client
+	t       *Torrent
+	logger  *log.Logger
 	//tcp connection with peer
 	cn   net.Conn
 	exts peer_wire.Extensions
@@ -128,24 +130,23 @@ func (pc *conn) mainLoop() error {
 			//no need for job type wrapper
 			err = pc.parseJob(act.(job))
 		case <-pc.t.done:
-		//job came from main routine
+			return nil
 		case msg := <-readCh:
 			err = pc.parsePeerMsg(msg)
 		case err = <-readErrCh:
 		case <-idle:
 			err = errors.New("peer idle")
 		case <-pc.keepAliveTimer.C:
-			err = (&peer_wire.Msg{
-				Kind: peer_wire.KeepAlive,
-			}).Write(pc.cn)
-			if err != nil {
-				return err
-			}
-			pc.keepAliveTimer.Reset(keepAliveSendFreq)
+			err = pc.sendKeepAlive()
 		}
 		if err != nil {
-			pc.logger.Println(err)
-			return nilOnEOF(err)
+			switch err = nilOnEOF(err); err {
+			case nil:
+				pc.logger.Println("lost connection with peer")
+			default:
+				pc.logger.Println(err)
+			}
+			return err
 		}
 		if pc.wantBlocks() {
 			pc.eventCh <- *new(wantBlocks)
@@ -202,9 +203,9 @@ loop:
 				pc.muPeerReqs.Lock()
 				if _, ok := pc.peerReqs[b]; ok {
 					delete(pc.peerReqs, b)
-					pc.logger.Printf("canceled request for block %v\n", b)
+					//pc.logger.Printf("canceled request for block %v\n", b)
 				} else {
-					unsatisfiedCancels.Inc()
+					latecomerCancels.Inc()
 				}
 				pc.muPeerReqs.Unlock()
 			default:
@@ -482,6 +483,7 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 	}
 	//read from db
 	//and write to conn
+	pc.storage()
 	pc.eventCh <- uploadedBlock(bl)
 	return nil
 }
