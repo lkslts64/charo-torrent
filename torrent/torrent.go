@@ -1,11 +1,18 @@
 package torrent
 
 import (
+	"context"
+	"crypto/sha1"
+	"errors"
+	"log"
+	"sync"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/eapache/channels"
+	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/lkslts64/charo-torrent/tracker"
 )
 
 //Active conns are the ones that we download/upload from/to
@@ -34,9 +41,12 @@ var maxRequestBlockSz = 1 << 15 //32KiB
 //spec doesn't say anything about this by we enfore it
 var minRequestBlockSz = 1 << 13 //8KiB
 
+const metadataPieceSz = 1 << 14
+
 //Torrent
 type Torrent struct {
-	tm *TorrentMeta
+	cl     *Client
+	logger log.Logger
 	//pconns   []*PeerConn
 	//pstats   []peerStats
 	//size of len(pconns) * eventChSize is reasonable
@@ -53,21 +63,58 @@ type Torrent struct {
 	//was established/closed
 	//this chan has size = maxConns / 2 ?
 	newConnCh chan *connChansInfo
-	numConns  int
-	//conns map[*connection]struct{}
-
-	//bitFields []peer_wire.BitField
-
-	//eventCh chan event
-	pieces pieces
+	pieces    pieces
 
 	chk *choker
 
 	//are we seeding
 	seeding bool
+	//An integer, the number of outstanding request messages this client supports
+	//without dropping any. The default in in libtorrent is 250.
+	reqq int
 
 	//surely we 'll need this
 	done chan struct{}
+
+	//nil if we dont have it but infoHash should be setted
+	//Restrict access to metainfo before we get the
+	//whole mi.Info part.
+	mi *metainfo.MetaInfo
+	//haveInfo bool
+	infoSize int64
+	//we serve metadata only if we have it all.
+	//lock only when writing
+	metadataMu          sync.Mutex
+	infoRaw             []byte
+	ownedMetadataPieces []bool
+	//frequency map of infoSizes we have received
+	infoSizeFreq freqMap
+
+	trackerURL tracker.TrackerURL
+
+	//length of data to be downloaded
+	length int
+
+	//when a piece gets downloaded or uploaded, these fields are updated
+	//UPDATE: we dont need mutex
+	dataStatsMu sync.Mutex
+	left        int
+	downloaded  int
+	//TODO:different mutex for upload?
+	uploaded int
+}
+
+func newTorrent(cl *Client) *Torrent {
+	t := &Torrent{
+		cl:           cl,
+		reqq:         250, //libtorent also has this default
+		done:         make(chan struct{}),
+		events:       make(chan event, maxConns*eventChSize),
+		newConnCh:    make(chan *connChansInfo, maxConns),
+		infoSizeFreq: newFreqMap(),
+	}
+	t.chk = newChoker(t)
+	return t
 }
 
 func (t *Torrent) mainLoop() {
@@ -75,17 +122,16 @@ func (t *Torrent) mainLoop() {
 	defer t.chk.ticker.Stop()
 	for {
 		select {
-		case _ = <-t.events:
-
+		case e := <-t.events:
+			t.parseEvent(e)
 		case cc := <-t.newConnCh: //we established a new connection
 			if !t.addConn(cc) {
-				//log that we rejected a conn
+				t.logger.Println("rejected a connection with peer")
 			}
 		case <-t.chk.ticker.C:
 			t.chk.reviewUnchokedPeers()
 		}
 	}
-
 }
 
 func (t *Torrent) parseEvent(e event) {
@@ -151,7 +197,7 @@ func (t *Torrent) parseEvent(e event) {
 //this func is started in its own goroutine.
 //when we close eventCh of pconn, the goroutine
 //exits
-func (t *Torrent) addAggregated(i int, conn *connInfo) {
+func (t *Torrent) addAggregated(conn *connInfo) {
 	for e := range conn.eventCh {
 		t.events <- event{conn, e}
 	}
@@ -190,7 +236,7 @@ func (t *Torrent) reviewInterestsOnPieceDownload(i int) {
 }
 
 func (t *Torrent) addConn(cc *connChansInfo) bool {
-	if t.numConns >= maxConns {
+	if len(t.conns) >= maxConns {
 		return false
 	}
 	ci := &connInfo{
@@ -204,15 +250,16 @@ func (t *Torrent) addConn(cc *connChansInfo) bool {
 	}
 	t.conns = append(t.conns, ci)
 	//notify conn that we have metainfo or we are seeding by closing these chans
-	if t.tm.haveInfo() {
+	if t.haveInfo() {
 		close(ci.amSeedingCh)
 	}
 	if t.seeding {
 		close(ci.haveInfoCh)
 	}
 	if t.pieces.ownedPieces.Len() > 0 {
-		ci.jobCh.In() <- t.pieces.ownedPieces.Copy()
+		ci.sendJob(t.pieces.ownedPieces.Copy())
 	}
+	go t.addAggregated(ci)
 	return true
 }
 
@@ -242,7 +289,141 @@ func (t *Torrent) uploaders() (uploaders []*connInfo) {
 }
 
 func (t *Torrent) numPieces() int {
-	return t.tm.mi.Info.NumPieces()
+	return t.mi.Info.NumPieces()
+}
+
+func (t *Torrent) downloadMetadata() bool {
+	//take the infoSize that we have seen most times from peers
+	infoSize := t.infoSizeFreq.max()
+	if infoSize == 0 || infoSize > 10000000 { //10MB,anacrolix pulled from his ass
+		return false
+	}
+	t.infoRaw = make([]byte, infoSize)
+	isLastSmaller := infoSize%metadataPieceSz != 0
+	numPieces := infoSize / metadataPieceSz
+	if isLastSmaller {
+		numPieces++
+	}
+	t.ownedMetadataPieces = make([]bool, numPieces)
+	//send requests to all conns
+	return true
+}
+
+func (t *Torrent) downloadedMetadata() bool {
+	for _, v := range t.ownedMetadataPieces {
+		if !v {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *Torrent) writeMetadataPiece(b []byte, i int) error {
+	//tm.metadataMu.Lock()
+	//defer tm.metadataMu.Unlock()
+	if t.ownedMetadataPieces[i] {
+		return nil
+	}
+	//TODO:log this
+	if i*metadataPieceSz >= len(t.infoRaw) {
+		return errors.New("write metadata piece: out of range")
+	}
+	if len(b) > metadataPieceSz {
+		return errors.New("write metadata piece: length of of piece too big")
+	}
+	if len(b) != metadataPieceSz && i != len(t.ownedMetadataPieces)-1 {
+		return errors.New("write metadata piece:piece is not the last and length is not 16KB")
+	}
+	copy(t.infoRaw[i*metadataPieceSz:], b)
+	t.ownedMetadataPieces[i] = true
+	if t.downloadedMetadata() {
+		//Broadcast to all we have the info
+	}
+	return nil
+}
+
+func (t *Torrent) readMetadataPiece(b []byte, i int) error {
+	if !t.haveInfo() {
+		panic("read metadata piece:we dont have info")
+	}
+	//out of range
+	if i*metadataPieceSz >= len(t.infoRaw) {
+		return errors.New("read metadata piece: out of range")
+	}
+
+	//last piece case
+	if (i+1)*metadataPieceSz >= len(t.infoRaw) {
+		b = t.infoRaw[i*metadataPieceSz:]
+	} else {
+		b = t.infoRaw[i*metadataPieceSz : (i+1)*metadataPieceSz]
+	}
+	return nil
+}
+
+//TODO:validate & open storage & set rawinfo etc.
+func (t *Torrent) setInfoDict() bool {
+	if sha1.Sum(t.infoRaw) != t.mi.Info.Hash {
+		return false
+	}
+	return true
+}
+
+//i == index of piece
+func (t *Torrent) addDownloaded(i uint32) {
+	pieceLen := t.PieceLen(i)
+	t.dataStatsMu.Lock()
+	defer t.dataStatsMu.Unlock()
+	t.downloaded += pieceLen
+	t.left -= pieceLen
+	//index holds the byte of pieceBitfield we are interested.
+	//mask holds the bit of the byte we want to set
+	//t.ownedPieces.setPiece(i)
+}
+
+func (t *Torrent) addUploaded(i uint32) {
+	pieceLen := t.PieceLen(i)
+	t.dataStatsMu.Lock()
+	defer t.dataStatsMu.Unlock()
+	t.uploaded += pieceLen
+}
+
+func (t *Torrent) PieceLen(i uint32) (pieceLen int) {
+	numPieces := int(t.mi.Info.NumPieces())
+	//last piece case
+	if int(i) == numPieces-1 {
+		pieceLen = t.length % int(t.mi.Info.PieceLen)
+	} else {
+		pieceLen = t.mi.Info.PieceLen
+	}
+	return
+}
+
+func (t *Torrent) announceTracker(event tracker.Event, port int16) (*tracker.AnnounceResp, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	t.dataStatsMu.Lock()
+	req := tracker.AnnounceReq{
+		InfoHash:   t.mi.Info.Hash,
+		PeerID:     peerID,
+		Downloaded: int64(t.downloaded),
+		Left:       int64(t.left),
+		Uploaded:   int64(t.uploaded),
+		Event:      event,
+		Numwant:    -1,
+		Port:       port,
+	}
+	t.dataStatsMu.Unlock()
+	return t.trackerURL.Announce(ctx, req)
+}
+
+func (t *Torrent) scrapeTracker() (*tracker.ScrapeResp, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return t.trackerURL.Scrape(ctx, t.mi.Info.Hash)
+}
+
+func (t *Torrent) haveInfo() bool {
+	return t.mi.Info != nil
 }
 
 /*func (t *Torrent) addConn(conn net.Conn) (int, error) {
@@ -348,7 +529,7 @@ func (cn *connInfo) sendBitfield() {
 
 //manages if we are interested in peer after a sending us bitfield msg
 func (cn *connInfo) reviewInterestsOnBitfield() {
-	if !cn.t.tm.haveInfo() || cn.t.seeding {
+	if !cn.t.haveInfo() || cn.t.seeding {
 		return
 	}
 	for i := 0; i < cn.t.numPieces(); i++ {
@@ -363,7 +544,7 @@ func (cn *connInfo) reviewInterestsOnBitfield() {
 
 //manages if we are interested in peer after sending us a have msg
 func (cn *connInfo) reviewInterestsOnHave(i int) {
-	if !cn.t.tm.haveInfo() || cn.t.seeding {
+	if !cn.t.haveInfo() || cn.t.seeding {
 		return
 	}
 	if !cn.t.pieces.ownedPieces.Get(i) {
@@ -408,7 +589,7 @@ func (cn *connInfo) isSnubbed() bool {
 }
 
 func (cn *connInfo) peerSeeding() bool {
-	if !cn.t.tm.haveInfo() { //we don't know if it has all (maybe he has)
+	if !cn.t.haveInfo() { //we don't know if it has all (maybe he has)
 		return false
 	}
 	return cn.peerBf.Len() == cn.t.numPieces()
