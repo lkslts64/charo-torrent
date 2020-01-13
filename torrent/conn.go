@@ -31,11 +31,9 @@ const (
 //This is controled by worker goroutines.
 //TODO: peer_wire.Msg should be passed through pointers everywhere
 type conn struct {
-	//TODO:remove this
-	storage func()
-	cl      *Client
-	t       *Torrent
-	logger  *log.Logger
+	cl     *Client
+	t      *Torrent
+	logger *log.Logger
 	//tcp connection with peer
 	cn   net.Conn
 	exts peer_wire.Extensions
@@ -55,14 +53,16 @@ type conn struct {
 	peerReqs       map[block]struct{}
 	//An integer, the number of outstanding request messages this peer supports
 	//without dropping any. The default in in libtorrent is 250.
-	peerReqq      int
-	muPeerReqs    sync.Mutex
-	waitingBlocks bool
-	amSeedingCh   chan struct{}
-	haveInfoCh    chan struct{}
-	peerBf        bitmap.Bitmap
-	myBf          bitmap.Bitmap
-	peerID        []byte
+	peerReqq   int
+	muPeerReqs sync.Mutex
+	//how many blocks we are waiting to be forwarded to us
+	waitingBlocks int
+	//TODO: we don't need these two chans per conn but per torrent.
+	amSeedingCh chan struct{}
+	haveInfoCh  chan struct{}
+	peerBf      bitmap.Bitmap
+	myBf        bitmap.Bitmap
+	peerID      []byte
 }
 
 //just wraps a msg with an error
@@ -150,7 +150,7 @@ func (pc *conn) mainLoop() error {
 		}
 		if pc.wantBlocks() {
 			pc.eventCh <- *new(wantBlocks)
-			pc.waitingBlocks = true
+			pc.waitingBlocks = maxOnFlight
 			pc.logger.Println("want blocks send")
 		}
 	}
@@ -225,7 +225,7 @@ loop:
 }
 
 func (pc *conn) wantBlocks() bool {
-	return pc.state.canDownload() && !pc.waitingBlocks && pc.rq.needMore()
+	return pc.state.canDownload() && pc.waitingBlocks == 0 && pc.rq.needMore()
 }
 
 func (pc *conn) sendKeepAlive() error {
@@ -264,7 +264,7 @@ func (pc *conn) parseJob(j job) (err error) {
 		}
 		err = pc.sendMsg(v)
 	case []block:
-		pc.waitingBlocks = false
+		pc.waitingBlocks -= len(v)
 		var ok, ready bool
 		for _, bl := range v {
 			if ok, ready = pc.rq.queue(bl); !ok {
@@ -469,7 +469,7 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 		pc.logger.Print("peer send request msg while choked\n")
 		return nil
 	}
-	if bl.len > maxRequestBlockSz || bl.len < minRequestBlockSz {
+	if bl.len > maxRequestBlockSz {
 		return fmt.Errorf("request length out of range: %d", msg.Len)
 	}
 	//check that we have the requested piece
@@ -483,7 +483,16 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 	}
 	//read from db
 	//and write to conn
-	pc.storage()
+	data := make([]byte, bl.len)
+	if err := pc.t.readBlock(data, bl.pc, bl.off); err != nil {
+		return nil
+	}
+	pc.sendMsg(&peer_wire.Msg{
+		Kind:  peer_wire.Piece,
+		Index: msg.Index,
+		Begin: msg.Begin,
+		Block: data,
+	})
 	pc.eventCh <- uploadedBlock(bl)
 	return nil
 }
@@ -534,8 +543,9 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	if pc.state.canDownload() && (ready != block{}) {
 		pc.sendMsg(ready.reqMsg())
 	}
-	//all good?
-	//store at db
+	if err := pc.t.writeBlock(msg.Block, bl.pc, bl.off); err != nil {
+		return nil
+	}
 	pc.eventCh <- downloadedBlock(bl)
 	return nil
 }
