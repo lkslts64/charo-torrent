@@ -80,11 +80,14 @@ func (info *InfoDict) PieceHash(i int) []byte {
 	return info.Pieces[i*pieceSize : i*pieceSize+pieceSize]
 }
 
-//maybe discard this and use path from stdlib
-func (f File) PathToDir() string {
-	var dir string
-	for _, v := range f.Path {
-		dir += v + "/"
+func (info *InfoDict) FilesInfo() []File {
+	if len(info.Files) == 0 {
+		return []File{
+			{
+				Path: nil,
+				Len:  info.Len,
+			},
+		}
 	}
-	return dir[:len(dir)-1]
+	return info.Files
 }
