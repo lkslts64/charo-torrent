@@ -23,6 +23,11 @@ type pieces struct {
 	strategy requestStrategy
 	//cache of downloaded pieces - dont ask db every time
 	ownedPieces bitmap.Bitmap
+	//conns that want requests but we couldn't give them when they asked us.
+	//we need in case we did't have anything unrequested but something happened
+	// (e.g a piece verification failed or we droped a piece) and we need to forward requests
+	//again.
+	requestExpecters map[*connInfo]struct{}
 }
 
 func newPieces(t *Torrent) *pieces {
@@ -53,7 +58,7 @@ func (p *pieces) dispatch(cn *connInfo) {
 	availablePieces := cn.peerBf.ToSortedSlice()
 	remaining := maxOnFlight
 	for _, i := range availablePieces {
-		if p.pcs[i].hasUnrequestedBlocks() && p.pcs[i].hasPendingBlocks() {
+		if p.pcs[i].isPartialyRequested() {
 			if remaining = p._dispatch(i, cn, remaining); remaining == 0 {
 				return
 			}
@@ -65,6 +70,9 @@ func (p *pieces) dispatch(cn *connInfo) {
 	)
 	for {
 		if pc, ok = p.strategy(availablePieces); !ok {
+			//we didn't manage to give conn as much requests as wanted.
+			//Howerver,we might give in the future
+			p.requestExpecters[cn] = struct{}{}
 			return
 		}
 		if remaining = p._dispatch(pc, cn, remaining); remaining == 0 {
@@ -199,19 +207,17 @@ type piece struct {
 
 func newPiece(t *Torrent, i int) *piece {
 	pieceLen := t.PieceLen(uint32(i))
-	lastBlockLen := pieceLen % blockSz
-	isLastSmaller := lastBlockLen != 0
+	lastBlockLen := t.blockRequestSize
 	var extra int
-	if isLastSmaller {
+	if lastBytes := pieceLen % t.blockRequestSize; lastBytes != 0 {
 		extra = 1
-	} else {
-		lastBlockLen = blockSz
+		lastBlockLen = lastBytes
 	}
-	blocks := pieceLen/blockSz + extra
+	blocks := pieceLen/t.blockRequestSize + extra
 	//set all blocks to unrequested
 	var unrequestedBlocks bitmap.Bitmap
 	for j := 0; j < blocks; j++ {
-		unrequestedBlocks.Set(j*blockSz, true)
+		unrequestedBlocks.Set(j*t.blockRequestSize, true)
 	}
 	return &piece{
 		index:             i,
@@ -224,11 +230,11 @@ func newPiece(t *Torrent, i int) *piece {
 //length of block at offset off
 //TODO:rename to blockLen()
 func (p *piece) len(off int) int {
-	bl := int(off / blockSz)
+	bl := int(off / p.t.blockRequestSize)
 	if bl == p.blocks-1 {
 		return p.lastBlockLen
 	}
-	return int(blockSz)
+	return int(p.t.blockRequestSize)
 }
 
 var errLargeOffset = errors.New("offset too big")
@@ -237,14 +243,14 @@ var errDivOffset = errors.New("offset remainder with block size is not zero")
 
 //length of block at offset off
 func (p *piece) lenSafe(off int) (int, error) {
-	if off%blockSz != 0 {
+	if off%p.t.blockRequestSize != 0 {
 		return 0, errDivOffset
 	}
-	switch bl := int(off / blockSz); {
+	switch bl := int(off / p.t.blockRequestSize); {
 	case bl == p.blocks-1:
 		return p.lastBlockLen, nil
 	case bl < p.blocks-1:
-		return int(blockSz), nil
+		return int(p.t.blockRequestSize), nil
 	default:
 		return 0, errLargeOffset
 	}
@@ -263,7 +269,7 @@ func (p *piece) toBlock(off int) block {
 	return block{
 		pc:  p.index,
 		off: off,
-		len: blockSz,
+		len: p.t.blockRequestSize,
 	}
 }
 
@@ -307,6 +313,10 @@ func (p *piece) hasUnrequestedBlocks() bool {
 	return p.unrequestedBlocks.Len() > 0
 }
 
+func (p *piece) isPartialyRequested() bool {
+	return p.hasUnrequestedBlocks() && p.hasPendingBlocks()
+}
+
 func changeBlockState(curr, new bitmap.Bitmap, off int) {
 	if !curr.Get(off) {
 		panic("piece: exepcted to find block here")
@@ -329,14 +339,14 @@ func (p *piece) addBlockPending(off int) {
 
 func (p *piece) markBlockComplete(off int) bool {
 	changeBlockState(p.pendingBlocks, p.completeBlocks, off)
-	return p.complete() && p.markComplete()
+	return p.complete() && p.verifyPiece()
 }
 
 func (p *piece) complete() bool {
 	return p.completeBlocks.Len() == int(p.blocks)
 }
 
-func (p *piece) markComplete() bool {
+func (p *piece) verifyPiece() bool {
 	//read from storage and check hash
-	return true
+	return p.t.storage.HashPiece(p.index, p.t.PieceLen(uint32(p.index)))
 }
