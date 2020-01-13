@@ -12,6 +12,7 @@ import (
 	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/lkslts64/charo-torrent/torrent/storage"
 	"github.com/lkslts64/charo-torrent/tracker"
 )
 
@@ -36,10 +37,8 @@ var maxConns = 55
 const maxUploadSlots = 4
 const optimisticSlots = 1
 
-var blockSz = 1 << 14           //16KiB
-var maxRequestBlockSz = 1 << 15 //32KiB
-//spec doesn't say anything about this by we enfore it
-var minRequestBlockSz = 1 << 13 //8KiB
+//var blockSz = 1 << 14 //16KiB
+var maxRequestBlockSz = 1 << 14
 
 const metadataPieceSz = 1 << 14
 
@@ -52,31 +51,29 @@ type Torrent struct {
 	//size of len(pconns) * eventChSize is reasonable
 	events chan event
 
-	//alternative:
-	//---------------
-	//active peer conns
-	//we take msg from peerconn to add it at this map
-	//if numConns < maxConns then we add it,else conn
-	//should get dropped
+	storage *storage.Storage
+	//These are active conns
 	conns []*connInfo
 	//conn can send a mgs to this chan so master goroutine knows a new connection
 	//was established/closed
 	//this chan has size = maxConns / 2 ?
 	newConnCh chan *connChansInfo
-	pieces    pieces
+	pieces    *pieces
 
-	chk *choker
+	choker *choker
 
 	//are we seeding
 	seeding bool
-	//An integer, the number of outstanding request messages this client supports
+	//An integer, the number of outstanding request messages we support
 	//without dropping any. The default in in libtorrent is 250.
 	reqq int
+
+	blockRequestSize int
 
 	//surely we 'll need this
 	done chan struct{}
 
-	//nil if we dont have it but infoHash should be setted
+	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
 	//whole mi.Info part.
 	mi *metainfo.MetaInfo
@@ -95,13 +92,10 @@ type Torrent struct {
 	//length of data to be downloaded
 	length int
 
-	//when a piece gets downloaded or uploaded, these fields are updated
-	//UPDATE: we dont need mutex
 	dataStatsMu sync.Mutex
 	left        int
 	downloaded  int
-	//TODO:different mutex for upload?
-	uploaded int
+	uploaded    int
 }
 
 func newTorrent(cl *Client) *Torrent {
@@ -113,13 +107,13 @@ func newTorrent(cl *Client) *Torrent {
 		newConnCh:    make(chan *connChansInfo, maxConns),
 		infoSizeFreq: newFreqMap(),
 	}
-	t.chk = newChoker(t)
+	t.choker = newChoker(t)
 	return t
 }
 
 func (t *Torrent) mainLoop() {
-	t.chk.startTicker()
-	defer t.chk.ticker.Stop()
+	t.choker.startTicker()
+	defer t.choker.ticker.Stop()
 	for {
 		select {
 		case e := <-t.events:
@@ -128,8 +122,8 @@ func (t *Torrent) mainLoop() {
 			if !t.addConn(cc) {
 				t.logger.Println("rejected a connection with peer")
 			}
-		case <-t.chk.ticker.C:
-			t.chk.reviewUnchokedPeers()
+		case <-t.choker.ticker.C:
+			t.choker.reviewUnchokedPeers()
 		}
 	}
 }
@@ -141,12 +135,12 @@ func (t *Torrent) parseEvent(e event) {
 		case peer_wire.Interested:
 			e.conn.state.isInterested = true
 			if !e.conn.state.amChoking {
-				t.chk.reviewUnchokedPeers()
+				t.choker.reviewUnchokedPeers()
 			}
 		case peer_wire.NotInterested:
 			e.conn.state.isInterested = false
 			if !e.conn.state.amChoking {
-				t.chk.reviewUnchokedPeers()
+				t.choker.reviewUnchokedPeers()
 			}
 		case peer_wire.Choke:
 			e.conn.state.isChoking = true
@@ -175,7 +169,7 @@ func (t *Torrent) parseEvent(e event) {
 	//before conn goroutine exits, it sends a dropConn event
 	case connDroped:
 		t.removeConn(e.conn)
-		t.chk.reviewUnchokedPeers()
+		t.choker.reviewUnchokedPeers()
 
 	}
 }
@@ -197,9 +191,9 @@ func (t *Torrent) parseEvent(e event) {
 //this func is started in its own goroutine.
 //when we close eventCh of pconn, the goroutine
 //exits
-func (t *Torrent) addAggregated(conn *connInfo) {
-	for e := range conn.eventCh {
-		t.events <- event{conn, e}
+func (t *Torrent) aggregateEvents(ci *connInfo) {
+	for e := range ci.eventCh {
+		t.events <- event{ci, e}
 	}
 }
 
@@ -259,7 +253,7 @@ func (t *Torrent) addConn(cc *connChansInfo) bool {
 	if t.pieces.ownedPieces.Len() > 0 {
 		ci.sendJob(t.pieces.ownedPieces.Copy())
 	}
-	go t.addAggregated(ci)
+	go t.aggregateEvents(ci)
 	return true
 }
 
@@ -276,7 +270,42 @@ func (t *Torrent) removeConn(ci *connInfo) bool {
 	}
 	t.conns[index] = nil //ensure is garbage collected (maybe not required)
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
+	if t.pieces != nil {
+		if _, ok := t.pieces.availableRequesters[ci]; ok {
+			delete(t.pieces.availableRequesters, ci)
+		}
+	}
 	return true
+}
+
+//TODO: maybe wrap these at the same func passing as arg the func (read/write)
+func (t *Torrent) writeBlock(data []byte, piece, begin int) error {
+	off := int64(piece*t.mi.Info.PieceLen + begin)
+	n, err := t.storage.WriteBlock(data, off)
+	if n != t.blockRequestSize {
+		if errors.Is(err, storage.ErrAlreadyWritten) {
+			//TODO: if not in endgame mode, then panic.
+			t.logger.Printf("attempted to write same block twice")
+			return nil
+		}
+		t.logger.Printf("coudn't write whole block from storage, written only %d bytes\n", n)
+	}
+	if err != nil {
+		t.logger.Printf("storage write err %s\n", err)
+	}
+	return err
+}
+
+func (t *Torrent) readBlock(data []byte, piece, begin int) error {
+	off := int64(piece*t.mi.Info.PieceLen + begin)
+	n, err := t.storage.ReadBlock(data, off)
+	if n != len(data) {
+		t.logger.Printf("coudn't read whole block from storage, read only %d bytes\n", n)
+	}
+	if err != nil {
+		t.logger.Printf("storage read err %s\n", err)
+	}
+	return err
 }
 
 func (t *Torrent) uploaders() (uploaders []*connInfo) {
@@ -396,6 +425,14 @@ func (t *Torrent) PieceLen(i uint32) (pieceLen int) {
 		pieceLen = t.mi.Info.PieceLen
 	}
 	return
+}
+
+//call this when we get info
+func (t *Torrent) blockSize() int {
+	if t.mi.Info.PieceLen < maxRequestBlockSz {
+		return t.mi.Info.PieceLen
+	}
+	return maxRequestBlockSz
 }
 
 func (t *Torrent) announceTracker(event tracker.Event, port int16) (*tracker.AnnounceResp, error) {
@@ -572,6 +609,12 @@ func (cn *connInfo) durationUploading() time.Duration {
 func (cn *connInfo) startDownloading() {
 	if cn.state.canDownload() {
 		cn.stats.lastStartedDownloading = time.Now()
+		//Set last piece msg the first time we get into `downloading` state.
+		//We didn't got any piece msg but we want to have an initial time to check
+		//if we are snubbed.
+		if cn.stats.lastPieceMsg.IsZero() {
+			cn.stats.lastPieceMsg = time.Now()
+		}
 	}
 }
 
