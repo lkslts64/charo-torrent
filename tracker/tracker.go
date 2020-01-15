@@ -20,10 +20,8 @@ const (
 	Stopped
 )
 
-//Omit IP field
 type AnnounceReq struct {
-	InfoHash [20]byte
-	//TODO: pointer to global const peerID.
+	InfoHash   [20]byte
 	PeerID     [20]byte
 	Downloaded int64
 	Left       int64
