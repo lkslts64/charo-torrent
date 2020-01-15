@@ -38,8 +38,8 @@ func (h *HandShake) Do(
 }
 
 //Initiate should be called when a client wants to initiate
-//a handshake with a peer.InfoHash field should not be empty.
-func (h *HandShake) Initiate(conn net.Conn) error {
+//a handshake .InfoHash field should not be empty.
+func (h *HandShake) Initiate(conn io.ReadWriter) error {
 	var err error
 	if err = h.write(conn); err != nil {
 		return fmt.Errorf("hs initiate: %w", err)
@@ -49,7 +49,7 @@ func (h *HandShake) Initiate(conn net.Conn) error {
 		return fmt.Errorf("hs initiate: %w", err)
 	}
 	if h.InfoHash != _h.InfoHash {
-		return fmt.Errorf("hs initiate:info_hash response of peer %v doesn't match the client's", conn.RemoteAddr())
+		return fmt.Errorf("hs initiate:info_hash response of peer  doesn't match the client's")
 	}
 	return nil
 }
@@ -57,7 +57,7 @@ func (h *HandShake) Initiate(conn net.Conn) error {
 //Receipt should be called when client is the recipient
 //of a handshake. InfoHash field must be zero - will be
 //filled inside.
-func (h *HandShake) Receipt(conn net.Conn, ihashes map[[20]byte]struct{}) error {
+func (h *HandShake) Receipt(conn io.ReadWriter, ihashes map[[20]byte]struct{}) error {
 	var err error
 	var _h *HandShake
 	if _h, err = readHs(conn); err != nil {
