@@ -34,7 +34,7 @@ func (h *HandShake) Do(
 	default:
 		err = h.Initiate(conn)
 	}
-	return fmt.Errorf("handshake: %w", err)
+	return err
 }
 
 //Initiate should be called when a client wants to initiate
@@ -60,7 +60,7 @@ func (h *HandShake) Initiate(conn io.ReadWriter) error {
 func (h *HandShake) Receipt(conn io.ReadWriter, ihashes map[[20]byte]struct{}) error {
 	var err error
 	var _h *HandShake
-	if _h, err = readHs(conn); err != nil {
+	if _h, err = readHsWithoutPeerID(conn); err != nil {
 		return fmt.Errorf("hs receipt: %w", err)
 	}
 	if _, ok := ihashes[_h.InfoHash]; !ok {
@@ -70,7 +70,7 @@ func (h *HandShake) Receipt(conn io.ReadWriter, ihashes map[[20]byte]struct{}) e
 	if err = h.write(conn); err != nil {
 		return fmt.Errorf("hs receipt: %w", err)
 	}
-	return nil
+	return _h.readPeerID(conn)
 }
 
 //write sends write the bytes of h to conn.
@@ -86,27 +86,51 @@ func (h *HandShake) write(conn io.Writer) error {
 	return nil
 }
 
-//readHs writes response to the receiver
 func readHs(conn io.Reader) (*HandShake, error) {
+	hs, err := readHsWithoutPeerID(conn)
+	if err != nil {
+		return nil, err
+	}
+	if err = hs.readPeerID(conn); err != nil {
+		return nil, err
+	}
+	return hs, nil
+}
+
+func readHsWithoutPeerID(conn io.Reader) (*HandShake, error) {
 	h := new(HandShake)
 	pstrLenSlc := make([]byte, 20)
 	var err error
 	_, err = io.ReadFull(conn, pstrLenSlc)
 	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+		return nil, err
 	}
 	if pstrLenSlc[0] != 19 && bytes.Equal(pstrLenSlc[1:], proto[:]) {
 		return nil, errors.New("proto or protoLen are not the right one(s)")
 	}
-	buf := make([]byte, 48)
+	buf := make([]byte, 28)
 	_, err = io.ReadFull(conn, buf)
 	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+		return nil, err
 	}
 	b := bytes.NewBuffer(buf)
-	err = binary.Read(b, binary.BigEndian, h)
+	err = binary.Read(b, binary.BigEndian, &h.Reserved)
 	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
+		return nil, err
+	}
+	err = binary.Read(b, binary.BigEndian, &h.InfoHash)
+	if err != nil {
+		return nil, err
 	}
 	return h, nil
+}
+
+func (h *HandShake) readPeerID(conn io.Reader) error {
+	buf := make([]byte, 20)
+	_, err := io.ReadFull(conn, buf)
+	if err != nil {
+		return err
+	}
+	b := bytes.NewBuffer(buf)
+	return binary.Read(b, binary.BigEndian, &h.PeerID)
 }
