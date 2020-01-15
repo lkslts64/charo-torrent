@@ -46,15 +46,12 @@ func (c *choker) pickOptimisticUnchoke() {
 
 //type unchokingCandidate *connInfo
 
-type unchokingCandidates []*connInfo
+type byRate []*connInfo
 
-func (uc unchokingCandidates) Len() int { return len(uc) }
+func (uc byRate) Len() int { return len(uc) }
 
-func (uc unchokingCandidates) Less(i, j int) bool {
+func (uc byRate) Less(i, j int) bool {
 	rate := func(index int) int {
-		if uc[index].stats.sumDownloading == 0 {
-			return 0
-		}
 		t := uc[index].t
 		c := (*connInfo)(uc[index])
 		var dur time.Duration
@@ -74,17 +71,8 @@ func (uc unchokingCandidates) Less(i, j int) bool {
 	return rate(i) > rate(j)
 }
 
-func (uc unchokingCandidates) Swap(i, j int) {
+func (uc byRate) Swap(i, j int) {
 	uc[i], uc[j] = uc[j], uc[i]
-}
-
-func (uc unchokingCandidates) contains(cand *connInfo) bool {
-	for _, c := range uc {
-		if c == cand {
-			return true
-		}
-	}
-	return false
 }
 
 //reviewUnchokedPeers algorithm similar to the one used at mainline client
@@ -95,14 +83,14 @@ func (c *choker) reviewUnchokedPeers() {
 	if c.currRound%5 == 0 {
 		c.pickOptimisticUnchoke()
 	}
-	bestPeers := unchokingCandidates{}
+	bestPeers := []*connInfo{}
 	for _, conn := range c.t.conns {
 		if conn.isSnubbed() || !conn.state.isInterested || conn.peerSeeding() {
 			continue
 		}
 		bestPeers = append(bestPeers, conn)
 	}
-	sort.Sort(bestPeers)
+	sort.Sort(byRate(bestPeers))
 	uploadSlots := int(math.Min(maxUploadSlots, float64(len(bestPeers))))
 	optimisticCandidates := bestPeers[uploadSlots:]
 	//peers that have best upload rates
@@ -112,7 +100,7 @@ func (c *choker) reviewUnchokedPeers() {
 	}
 	numOptimistics := int(math.Max(optimisticSlots, float64(maxUploadSlots-uploadSlots)))
 	//if we haven't yet unchoked optimistic peer,then do it
-	if c.optimistic != nil && !bestPeers.contains(c.optimistic) {
+	if c.optimistic != nil && !contains(bestPeers, c.optimistic) {
 		c.optimistic.unchoke()
 		numOptimistics--
 	}
@@ -133,4 +121,13 @@ func (c *choker) reviewUnchokedPeers() {
 		}
 	}
 	c.currRound++
+}
+
+func contains(conns []*connInfo, cand *connInfo) bool {
+	for _, c := range conns {
+		if c == cand {
+			return true
+		}
+	}
+	return false
 }
