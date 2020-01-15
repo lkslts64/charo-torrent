@@ -3,13 +3,14 @@ package torrent
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
-//The strategy for piece picking
-//Select a piece for a PeerConn to download.
+//The strategy for piece picking.In order for a piece to be picked, all piece's blocks
+//should be unrequested.Selects a piece for a conn to download.
 //'ok' set to false means no piece in peerPieces has all blocks unrequested,
 //so we cant pick any.
 type requestStrategy func(availablePieces []int) (pc int, ok bool)
@@ -27,11 +28,12 @@ type pieces struct {
 	//we need in case we did't have anything unrequested but something happened
 	// (e.g a piece verification failed or we droped a piece) and we need to forward requests
 	//again.
+	//when a conn is dropped, it is removed from here too.
 	requestExpecters map[*connInfo]struct{}
 }
 
 func newPieces(t *Torrent) *pieces {
-	numPieces := int(t.mi.Info.NumPieces())
+	numPieces := int(t.numPieces())
 	pcs := make([]*piece, numPieces)
 	for i := 0; i < numPieces; i++ {
 		pcs[i] = newPiece(t, i)
@@ -45,7 +47,7 @@ func newPieces(t *Torrent) *pieces {
 }
 
 func (p *pieces) valid(i int) bool {
-	return i < len(p.pcs)
+	return i >= 0 && i < len(p.pcs)
 }
 
 //First dispatch blocks of pieces that have been already partially dispatched (if any and if
@@ -139,15 +141,42 @@ func (p *pieces) rarestStrategy(availablePieces []int) (pc int, ok bool) {
 	return
 }
 
-//also checks if whole piece is complete
-func (p *pieces) markBlockComplete(i, off int) {
-	if p.pcs[i].markBlockComplete(off) {
-		//change strategy after completion of first block
-		if p.ownedPieces.Len() == 0 {
-			p.strategy = p.rarestStrategy
+func (p *pieces) pieceVerified(i int) bool {
+	p.pcs[i].verificationSuccess()
+	//change strategy after completion of first block
+	if p.ownedPieces.Len() == 0 {
+		p.strategy = p.rarestStrategy
+	}
+	p.ownedPieces.Set(i, true)
+	p.t.reviewInterestsOnPieceDownload(i)
+	return p.allVerified()
+}
+
+//return a slice containing how many blocks a piece has.
+//Index i corresponds at piece i
+func (p *pieces) blocks() []int {
+	ret := []int{}
+	for _, piece := range p.pcs {
+		ret = append(ret, piece.blocks)
+	}
+	return ret
+}
+
+func (p *pieces) allVerified() bool {
+	for _, piece := range p.pcs {
+		if !piece.verified {
+			return false
 		}
-		p.ownedPieces.Set(i, true)
-		p.t.reviewInterestsOnPieceDownload(i)
+	}
+	return true
+}
+
+func (p *pieces) pieceVerificationFailed(i int) {
+	p.t.logger.Printf("piece verification for piece %d failed\n", i)
+	p.pcs[i].verificationFailed()
+	//try to forward blocks to conns that wanted blocks in the past
+	for c := range p.requestExpecters {
+		p.dispatch(c)
 	}
 }
 
@@ -191,8 +220,9 @@ func (p *pieces) hasUnrequestedPieces() bool {
 //At all cases,this equality should hold true:
 //len(pendingBlocks)+len(downloadedBlocks)+len(unrequestedBlocks) == totalBlocks
 type piece struct {
-	t     *Torrent
-	index int
+	t        *Torrent
+	index    int
+	verified bool
 	//hash  []byte
 	//num of blocks
 	blocks       int
@@ -203,6 +233,10 @@ type piece struct {
 	pendingBlocks bitmap.Bitmap
 	//keeps track of which blocks we have been downloaded
 	completeBlocks bitmap.Bitmap
+	//conns that we have received blocks for this piece
+	//TODO: ban a conn with most maliciousness (see conn_stats.go)
+	//on verification failure.
+	contributors []*connInfo
 }
 
 func newPiece(t *Torrent, i int) *piece {
@@ -229,7 +263,7 @@ func newPiece(t *Torrent, i int) *piece {
 
 //length of block at offset off
 //TODO:rename to blockLen()
-func (p *piece) len(off int) int {
+func (p *piece) blockLen(off int) int {
 	bl := int(off / p.t.blockRequestSize)
 	if bl == p.blocks-1 {
 		return p.lastBlockLen
@@ -242,7 +276,7 @@ var errLargeOffset = errors.New("offset too big")
 var errDivOffset = errors.New("offset remainder with block size is not zero")
 
 //length of block at offset off
-func (p *piece) lenSafe(off int) (int, error) {
+func (p *piece) blockLenSafe(off int) (int, error) {
 	if off%p.t.blockRequestSize != 0 {
 		return 0, errDivOffset
 	}
@@ -261,7 +295,7 @@ func (p *piece) msgRequest(off int) *peer_wire.Msg {
 		Kind:  peer_wire.Request,
 		Index: uint32(p.index),
 		Begin: uint32(off),
-		Len:   uint32(p.len(off)),
+		Len:   uint32(p.blockLen(off)),
 	}
 }
 
@@ -269,7 +303,7 @@ func (p *piece) toBlock(off int) block {
 	return block{
 		pc:  p.index,
 		off: off,
-		len: p.t.blockRequestSize,
+		len: p.blockLen(off),
 	}
 }
 
@@ -337,16 +371,42 @@ func (p *piece) addBlockPending(off int) {
 	changeBlockState(p.unrequestedBlocks, p.pendingBlocks, off)
 }
 
-func (p *piece) markBlockComplete(off int) bool {
+func (p *piece) markBlockComplete(ci *connInfo, off int) {
 	changeBlockState(p.pendingBlocks, p.completeBlocks, off)
-	return p.complete() && p.verifyPiece()
+	p.contributors = append(p.contributors, ci)
+	if p.complete() {
+		p.sendVerificationJob()
+	}
 }
 
 func (p *piece) complete() bool {
 	return p.completeBlocks.Len() == int(p.blocks)
 }
 
-func (p *piece) verifyPiece() bool {
-	//read from storage and check hash
-	return p.t.storage.HashPiece(p.index, p.t.PieceLen(uint32(p.index)))
+func (p *piece) sendVerificationJob() {
+	//give the conn with the worst download rate the verification job
+	_conns := make([]*connInfo, len(p.t.conns))
+	copy(_conns, p.t.conns)
+	sort.Sort(byRate(_conns))
+	worse := _conns[len(_conns)-1]
+	hp := verifyPiece(p.index)
+	worse.sendJob(job{hp})
+}
+
+func (p *piece) verificationFailed() {
+	for _, c := range p.contributors {
+		c.stats.badPiecesContributions++
+	}
+	if !p.complete() {
+		panic("pieceVerificationFailed: piece was not complete")
+	}
+	p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
+	p.contributors = []*connInfo{}
+}
+
+func (p *piece) verificationSuccess() {
+	p.verified = true
+	for _, c := range p.contributors {
+		c.stats.goodPiecesContributions++
+	}
 }
