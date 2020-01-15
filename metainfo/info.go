@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"io/ioutil"
 
 	"github.com/lkslts64/charo-torrent/bencode"
 )
@@ -40,17 +41,33 @@ func (info *InfoDict) Parse() error {
 }
 
 func (info *InfoDict) setInfoHash(data []byte) error {
-	const key = "info"
-	infoBenc, ok, err := bencode.Get(data, key)
+	infoBytes, ok, err := bencode.Get(data, "info")
 	if !ok {
-		return fmt.Errorf("set info hash: key %s doesn't exist in dict", key)
+		return errors.New("set info hash: key info doesn't exist in dict")
 	}
 	if err != nil {
 		return fmt.Errorf("set info hash: %w", err)
 	}
-	h := sha1.Sum(infoBenc)
+	h := sha1.Sum(infoBytes)
 	info.Hash = h
 	return nil
+}
+
+//Bytes returns the info dict in bencoded form.
+//`data` is the bytes of a .torrent file
+func (info *InfoDict) Bytes(filename string) ([]byte, error) {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	infoBenc, ok, err := bencode.Get(data, "info")
+	if !ok {
+		return nil, errors.New("set info hash: key info doesn't exist in dict")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("set info hash: %w", err)
+	}
+	return infoBenc, nil
 }
 
 func (info *InfoDict) TotalLength() (total int) {
