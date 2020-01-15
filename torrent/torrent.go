@@ -10,6 +10,7 @@ import (
 
 	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/eapache/channels"
+	"github.com/lkslts64/charo-torrent/bencode"
 	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 	"github.com/lkslts64/charo-torrent/torrent/storage"
@@ -45,7 +46,7 @@ const metadataPieceSz = 1 << 14
 //Torrent
 type Torrent struct {
 	cl     *Client
-	logger log.Logger
+	logger *log.Logger
 	//pconns   []*PeerConn
 	//pstats   []peerStats
 	//size of len(pconns) * eventChSize is reasonable
@@ -92,10 +93,7 @@ type Torrent struct {
 	//length of data to be downloaded
 	length int
 
-	dataStatsMu sync.Mutex
-	left        int
-	downloaded  int
-	uploaded    int
+	stats *TorrentStats
 }
 
 func newTorrent(cl *Client) *Torrent {
@@ -121,6 +119,9 @@ func (t *Torrent) mainLoop() {
 		case cc := <-t.newConnCh: //we established a new connection
 			if !t.addConn(cc) {
 				t.logger.Println("rejected a connection with peer")
+			} else {
+				//TODO: check at paper if we should call this
+				t.choker.reviewUnchokedPeers()
 			}
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
@@ -158,10 +159,18 @@ func (t *Torrent) parseEvent(e event) {
 			e.conn.peerBf.Set(int(v.Index), true)
 		}
 	case downloadedBlock:
-		t.pieces.markBlockComplete(int(v.pc), int(v.off))
+		t.pieces.pcs[v.pc].markBlockComplete(e.conn, int(v.off))
 		//update interests
 	case uploadedBlock:
 		//add to stats
+	case pieceVerificationOk:
+		if v.ok {
+			if t.pieces.pieceVerified(v.pieceIndex) {
+				t.startSeeding()
+			}
+		} else {
+			t.pieces.pieceVerificationFailed(v.pieceIndex)
+		}
 	case metainfoSize:
 	case bitmap.Bitmap:
 		e.conn.peerBf = v
@@ -171,6 +180,14 @@ func (t *Torrent) parseEvent(e event) {
 		t.removeConn(e.conn)
 		t.choker.reviewUnchokedPeers()
 
+	}
+}
+
+func (t *Torrent) startSeeding() {
+	t.logger.Printf("operating in seeding mode...")
+	t.seeding = true
+	for _, c := range t.conns {
+		close(c.amSeedingCh)
 	}
 }
 
@@ -250,6 +267,7 @@ func (t *Torrent) addConn(cc *connChansInfo) bool {
 	if t.seeding {
 		close(ci.haveInfoCh)
 	}
+	//if we have some pieces, we should sent a bitfield
 	if t.pieces.ownedPieces.Len() > 0 {
 		ci.sendJob(t.pieces.ownedPieces.Copy())
 	}
@@ -271,8 +289,8 @@ func (t *Torrent) removeConn(ci *connInfo) bool {
 	t.conns[index] = nil //ensure is garbage collected (maybe not required)
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
 	if t.pieces != nil {
-		if _, ok := t.pieces.availableRequesters[ci]; ok {
-			delete(t.pieces.availableRequesters, ci)
+		if _, ok := t.pieces.requestExpecters[ci]; ok {
+			delete(t.pieces.requestExpecters, ci)
 		}
 	}
 	return true
@@ -344,6 +362,7 @@ func (t *Torrent) downloadedMetadata() bool {
 			return false
 		}
 	}
+	//setInfo
 	return true
 }
 
@@ -366,7 +385,7 @@ func (t *Torrent) writeMetadataPiece(b []byte, i int) error {
 	copy(t.infoRaw[i*metadataPieceSz:], b)
 	t.ownedMetadataPieces[i] = true
 	if t.downloadedMetadata() {
-		//Broadcast to all we have the info
+		t.verifyInfoDict()
 	}
 	return nil
 }
@@ -389,31 +408,28 @@ func (t *Torrent) readMetadataPiece(b []byte, i int) error {
 	return nil
 }
 
-//TODO:validate & open storage & set rawinfo etc.
-func (t *Torrent) setInfoDict() bool {
+func (t *Torrent) verifyInfoDict() bool {
 	if sha1.Sum(t.infoRaw) != t.mi.Info.Hash {
 		return false
 	}
+	if err := bencode.Decode(t.infoRaw, t.mi.Info); err != nil {
+		t.logger.Fatal("cant decode info dict")
+	}
+	t.gotInfo()
 	return true
 }
 
-//i == index of piece
-func (t *Torrent) addDownloaded(i uint32) {
-	pieceLen := t.PieceLen(i)
-	t.dataStatsMu.Lock()
-	defer t.dataStatsMu.Unlock()
-	t.downloaded += pieceLen
-	t.left -= pieceLen
-	//index holds the byte of pieceBitfield we are interested.
-	//mask holds the bit of the byte we want to set
-	//t.ownedPieces.setPiece(i)
-}
-
-func (t *Torrent) addUploaded(i uint32) {
-	pieceLen := t.PieceLen(i)
-	t.dataStatsMu.Lock()
-	defer t.dataStatsMu.Unlock()
-	t.uploaded += pieceLen
+//TODO:open storage & create pieces etc.
+func (t *Torrent) gotInfo() {
+	t.length = t.mi.Info.TotalLength()
+	t.stats.Left = t.length
+	t.blockRequestSize = t.blockSize()
+	t.pieces = newPieces(t)
+	t.storage = storage.Open(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	//notify conns that we have the info
+	for _, c := range t.conns {
+		close(c.haveInfoCh)
+	}
 }
 
 func (t *Torrent) PieceLen(i uint32) (pieceLen int) {
@@ -429,27 +445,25 @@ func (t *Torrent) PieceLen(i uint32) (pieceLen int) {
 
 //call this when we get info
 func (t *Torrent) blockSize() int {
-	if t.mi.Info.PieceLen < maxRequestBlockSz {
+	if maxRequestBlockSz > t.mi.Info.PieceLen {
 		return t.mi.Info.PieceLen
 	}
 	return maxRequestBlockSz
 }
 
-func (t *Torrent) announceTracker(event tracker.Event, port int16) (*tracker.AnnounceResp, error) {
+func (t *Torrent) announceTracker(event tracker.Event) (*tracker.AnnounceResp, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	t.dataStatsMu.Lock()
 	req := tracker.AnnounceReq{
 		InfoHash:   t.mi.Info.Hash,
 		PeerID:     peerID,
-		Downloaded: int64(t.downloaded),
-		Left:       int64(t.left),
-		Uploaded:   int64(t.uploaded),
+		Downloaded: int64(t.stats.Downloaded),
+		Left:       int64(t.stats.Left),
+		Uploaded:   int64(t.stats.Uploaded),
 		Event:      event,
 		Numwant:    -1,
-		Port:       port,
+		Port:       t.cl.port,
 	}
-	t.dataStatsMu.Unlock()
 	return t.trackerURL.Announce(ctx, req)
 }
 
@@ -489,7 +503,7 @@ func (t *Torrent) removeConn(i int) {
 	t.pconns[i].conn = nil
 }*/
 
-//connInfo sends msgs to conn using two chans.It also holds
+//connInfo sends msgs to conn .It also holds
 //some informations like state,bitmap which also conn holds too -
 //we dont share, we communicate so we have some duplicate data-.
 type connInfo struct {
@@ -499,6 +513,7 @@ type connInfo struct {
 	eventCh     chan interface{}
 	amSeedingCh chan struct{}
 	haveInfoCh  chan struct{}
+	//drop        chan struct{}
 	//peer's bitmap
 	peerBf  bitmap.Bitmap //also conn has this
 	numWant int           //how many pieces are we interested to download from peer
