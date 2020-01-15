@@ -5,7 +5,7 @@ import "time"
 type connStats struct {
 	uploadUseful   int
 	downloadUseful int
-	//TODO:initally it holds the time the connection was made
+	//initally it holds the time that we first got in `downloading` state
 	lastPieceMsg time.Time
 	//last time we were interested and peer was unchoking
 	lastStartedDownloading time.Time
@@ -14,7 +14,9 @@ type connStats struct {
 	//duration we are in downloading state
 	sumDownloading time.Duration
 	//duration we are in uploading state
-	sumUploading time.Duration
+	sumUploading            time.Duration
+	badPiecesContributions  int
+	goodPiecesContributions int
 }
 
 func newConnStats() *connStats {
@@ -31,8 +33,8 @@ func (cs *connStats) stopUploading() {
 	cs.sumUploading += time.Since(cs.lastStartedUploading)
 }
 
-func (cs *connStats) onBlockDownload() {
-	cs.downloadUseful += int(blockSz)
+func (cs *connStats) onBlockDownload(len int) {
+	cs.downloadUseful += len
 	cs.lastPieceMsg = time.Now()
 }
 
@@ -47,4 +49,8 @@ func (cs *connStats) uploadLimitsReached() bool {
 
 func (cs *connStats) isSnubbed() bool {
 	return cs.uploadLimitsReached() || time.Since(cs.lastPieceMsg) >= time.Minute
+}
+
+func (cs *connStats) malliciousness() int {
+	return cs.badPiecesContributions - cs.goodPiecesContributions
 }
