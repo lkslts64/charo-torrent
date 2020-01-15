@@ -60,13 +60,15 @@ type conn struct {
 	//TODO: we don't need these two chans per conn but per torrent.
 	amSeedingCh chan struct{}
 	haveInfoCh  chan struct{}
-	peerBf      bitmap.Bitmap
-	myBf        bitmap.Bitmap
-	peerID      []byte
+	//TODO: we 'll need this later.
+	//drop        chan struct{}
+	peerBf bitmap.Bitmap
+	myBf   bitmap.Bitmap
+	peerID []byte
 }
 
 //just wraps a msg with an error
-func newConn(t *Torrent, cn net.Conn, peerID []byte, peerReqq int) *conn {
+func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 	c := &conn{
 		cl: t.cl,
 		t:  t,
@@ -79,10 +81,11 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte, peerReqq int) *conn {
 		rq:          newRequestQueuer(),
 		amSeedingCh: make(chan struct{}),
 		haveInfoCh:  make(chan struct{}),
-		peerReqq:    peerReqq,
-		peerReqs:    make(map[block]struct{}),
+		//drop:        make(chan struct{}),
+		//peerReqq: peerReqq,
+		peerReqs: make(map[block]struct{}),
 	}
-	//inform master about new conn
+	//inform others about the new conn
 	t.newConnCh <- &connChansInfo{
 		c.jobCh,
 		c.eventCh,
@@ -122,7 +125,6 @@ func (pc *conn) mainLoop() error {
 		return err
 	}
 	pc.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
-	//TODO:set when the peer becomes downloader
 	for {
 		select {
 		case act := <-pc.jobCh.Out():
@@ -152,6 +154,10 @@ func (pc *conn) mainLoop() error {
 			pc.eventCh <- *new(wantBlocks)
 			pc.waitingBlocks = maxOnFlight
 			pc.logger.Println("want blocks send")
+		}
+		if !pc.useful() {
+			pc.logger.Println("conn is not useful anymore for both ends")
+			return nil
 		}
 	}
 }
@@ -224,8 +230,20 @@ loop:
 	}
 }
 
-func (pc *conn) wantBlocks() bool {
-	return pc.state.canDownload() && pc.waitingBlocks == 0 && pc.rq.needMore()
+func (c *conn) wantBlocks() bool {
+	return c.state.canDownload() && c.waitingBlocks == 0 && c.rq.needMore()
+}
+
+//returns true if its worth to keep the conn alive
+func (c *conn) useful() bool {
+	if !c.haveInfo() {
+		return true
+	}
+	return !(c.peerSeeding() && c.amSeeding())
+}
+
+func (c *conn) peerSeeding() bool {
+	return c.peerBf.Len() == c.t.numPieces()
 }
 
 func (pc *conn) sendKeepAlive() error {
@@ -280,6 +298,12 @@ func (pc *conn) parseJob(j job) (err error) {
 			Kind: peer_wire.Bitfield,
 			Bf:   pc.encodeBitMap(pc.myBf),
 		})
+	case verifyPiece:
+		correct := pc.t.storage.HashPiece(int(v), pc.t.PieceLen(uint32(v)))
+		pc.eventCh <- pieceVerificationOk{
+			pieceIndex: int(v),
+			ok:         correct,
+		}
 	}
 	return
 }
@@ -336,7 +360,7 @@ func (pc *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		pc.eventCh <- msg
 	case peer_wire.Bitfield:
 		if !pc.peerBf.IsEmpty() {
-			err = errors.New("peer: send bitfield twice")
+			err = errors.New("peer: send bitfield twice or have before bitfield")
 		}
 		var tmp *bitmap.Bitmap
 		tmp, err = pc.decodeBitfield(msg.Bf)
@@ -393,7 +417,7 @@ func isClosed(ch chan struct{}) bool {
 	}
 }
 
-func (c *conn) seeding() bool {
+func (c *conn) amSeeding() bool {
 	return isClosed(c.amSeedingCh)
 }
 
@@ -477,7 +501,6 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 		return fmt.Errorf("peer requested piece we do not have")
 	}
 	//ensure the we dont exceed the end of the piece
-	//TODO: check for the specific piece
 	if endOff := bl.off + bl.len; endOff > pc.t.PieceLen(uint32(bl.pc)) {
 		return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
 	}
@@ -522,7 +545,7 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		}
 		var length int
 		var err error
-		if length, err = pc.t.pieces.pcs[bl.pc].lenSafe(bl.off); err != nil ||
+		if length, err = pc.t.pieces.pcs[bl.pc].blockLenSafe(bl.off); err != nil ||
 			length != bl.len {
 			switch {
 			case errors.Is(err, errDivOffset):
