@@ -14,33 +14,31 @@ import (
 	"github.com/lkslts64/charo-torrent/metainfo"
 )
 
-// Creates natives files for any zero-length file entries in the info. This is
-// a helper for file-based storages, which don't address or write to zero-
-// length files because they have no corresponding pieces.
-func CreateNativeZeroLengthFiles(info *metainfo.InfoDict, dir string) (err error) {
-	for _, fi := range info.FilesInfo() {
-		if fi.Len != 0 {
-			continue
-		}
-		name := filepath.Join(append([]string{dir, info.Name}, fi.Path...)...)
-		os.MkdirAll(filepath.Dir(name), 0777)
-		var f io.Closer
-		f, err = os.Create(name)
-		if err != nil {
-			break
-		}
-		f.Close()
-	}
-	return
-}
-
-// Exposes file-based storage of a torrent, as one big ReadWriterAt.
+//Storage is a file-based storage for torrent data
 type Storage struct {
-	logger log.Logger
+	logger *log.Logger
 	//fts    *fileTorrentImpl
 	dir    string
 	mi     *metainfo.MetaInfo
 	pieces []*piece
+}
+
+//Open initializes the storage.`blocks` is a slice containing how many
+//blocks each piece has.
+func Open(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) *Storage {
+	pieces := make([]*piece, mi.Info.NumPieces())
+	for i := 0; i < len(pieces); i++ {
+		pieces[i] = &piece{
+			blocks:      blocks[i],
+			dirtyBlocks: make(map[int64]struct{}),
+		}
+	}
+	return &Storage{
+		logger: logger,
+		mi:     mi,
+		dir:    baseDir,
+		pieces: pieces,
+	}
 }
 
 // Returns EOF on short or missing file.
@@ -85,6 +83,7 @@ func (s *Storage) pieceOff(pieceIndex int) int64 {
 
 var errReadNonVerified = errors.New("storage: trying to read non verified piece")
 
+//ReadBlock is like ReadAt but fails if the piece to be read is not verified
 func (s *Storage) ReadBlock(b []byte, off int64) (n int, err error) {
 	piece := s.pieces[s.pieceIndex(off)]
 	if !piece.isVerified() {
@@ -125,6 +124,8 @@ func (s *Storage) ReadAt(b []byte, off int64) (n int, err error) {
 
 var ErrAlreadyWritten = errors.New("storage: trying to write at already written block")
 
+//WriteBlock behaves like WriteAt but it fails if another write has occured
+//at the same offset
 func (s *Storage) WriteBlock(p []byte, off int64) (n int, err error) {
 	piece := s.pieces[s.pieceIndex(off)]
 	if !piece.reserveOffset(off) {
@@ -174,7 +175,8 @@ func (s *Storage) fileInfoName(fi metainfo.File) string {
 
 var errNotReadyForVerification = errors.New("storage: not all piece's blocks are written")
 
-//HashPiece hashes `pieceIndex` whose length is `len`.
+//HashPiece hashes `pieceIndex` whose length is `len` and returns if
+//the hash was the expected.
 func (s *Storage) HashPiece(pieceIndex int, len int) (correct bool) {
 	piece := s.pieces[pieceIndex]
 	if piece.isVerified() {
