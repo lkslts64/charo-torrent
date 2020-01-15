@@ -51,8 +51,6 @@ func TestGet(t *testing.T) {
 	if ok {
 		t.Fatal("it was in dict unexpectedly")
 	}
-	fmt.Println(err)
-	fmt.Println(errors.Unwrap(err))
 	var uv *UnknownValueError
 	if !errors.As(err, &uv) {
 		t.Fatal("no unknown error value")
