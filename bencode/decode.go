@@ -102,8 +102,8 @@ func decode(r benReader, v reflect.Value) error {
 			return errors.New("cant handle non empty interfaces right now")
 		}
 	case reflect.Ptr:
-		//if pointer is nil,create a new zeroed (but not nil) value of type v
-		//and pass v.Elem() to decode. After, set this `e` to `v`.
+		//if pointer is nil,create a new zeroed (but not nil) value `e` of type `v`
+		//and pass `e.Elem()` to decode. After, set `e` to `v`.
 		if !v.Elem().IsValid() {
 			e := reflect.New(t.Elem())
 			if err := decode(r, e.Elem()); err != nil {
