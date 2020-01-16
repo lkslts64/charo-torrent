@@ -95,21 +95,14 @@ func (p *pieces) _dispatch(i int, cn *connInfo, blocksToDispatch int) (remaining
 }
 
 func (p *pieces) randomStrategy(availablePieces []int) (pc int, ok bool) {
-	//pick a random piece and if it is completely unrequested we have a hit.
-	//we have a high chance to hit because we utilize random strategy only
-	//for the first pieces we download (all blocks are unreqeusted initially).
-	count := 0
-	for {
-		if count > 10 {
-			panic("random strategy: failed to pick many times")
-		}
-		pc = rand.Intn(len(availablePieces))
-		if p.pcs[availablePieces[pc]].allBlocksUnrequested() {
+	piecesPerm := rand.Perm(len(availablePieces))
+	for _, i := range piecesPerm {
+		if p.pcs[i].allBlocksUnrequested() {
 			ok = true
 			return
 		}
-		count++
 	}
+	return
 }
 
 func (p *pieces) rarestStrategy(availablePieces []int) (pc int, ok bool) {
@@ -254,6 +247,7 @@ func newPiece(t *Torrent, i int) *piece {
 		unrequestedBlocks.Set(j*t.blockRequestSize, true)
 	}
 	return &piece{
+		t:                 t,
 		index:             i,
 		unrequestedBlocks: unrequestedBlocks,
 		blocks:            blocks,
@@ -262,13 +256,12 @@ func newPiece(t *Torrent, i int) *piece {
 }
 
 //length of block at offset off
-//TODO:rename to blockLen()
 func (p *piece) blockLen(off int) int {
-	bl := int(off / p.t.blockRequestSize)
+	bl := off / p.t.blockRequestSize
 	if bl == p.blocks-1 {
 		return p.lastBlockLen
 	}
-	return int(p.t.blockRequestSize)
+	return p.t.blockRequestSize
 }
 
 var errLargeOffset = errors.New("offset too big")
@@ -307,13 +300,13 @@ func (p *piece) toBlock(off int) block {
 	}
 }
 
-func (p *piece) unrequestedToBlockQueue() *blockQueue {
+/*func (p *piece) unrequestedToBlockQueue() *blockQueue {
 	bq := newBlockQueue(p.blocks) //don't limit length of queue
 	for off := range p.unrequestedBlocks.ToSortedSlice() {
 		bq.push(p.toBlock(off))
 	}
 	return bq
-}
+}*/
 
 func (p *piece) unrequestedBlocksSlc(limit int) (blocks []block) {
 	count := 0
@@ -351,7 +344,7 @@ func (p *piece) isPartialyRequested() bool {
 	return p.hasUnrequestedBlocks() && p.hasPendingBlocks()
 }
 
-func changeBlockState(curr, new bitmap.Bitmap, off int) {
+func changeBlockState(curr, new *bitmap.Bitmap, off int) {
 	if !curr.Get(off) {
 		panic("piece: exepcted to find block here")
 	}
@@ -364,15 +357,15 @@ func changeBlockState(curr, new bitmap.Bitmap, off int) {
 
 //assume block was in pending before
 func (p *piece) addBlockUnrequsted(off int) {
-	changeBlockState(p.pendingBlocks, p.unrequestedBlocks, off)
+	changeBlockState(&p.pendingBlocks, &p.unrequestedBlocks, off)
 }
 
 func (p *piece) addBlockPending(off int) {
-	changeBlockState(p.unrequestedBlocks, p.pendingBlocks, off)
+	changeBlockState(&p.unrequestedBlocks, &p.pendingBlocks, off)
 }
 
 func (p *piece) markBlockComplete(ci *connInfo, off int) {
-	changeBlockState(p.pendingBlocks, p.completeBlocks, off)
+	changeBlockState(&p.pendingBlocks, &p.completeBlocks, off)
 	p.contributors = append(p.contributors, ci)
 	if p.complete() {
 		p.sendVerificationJob()
