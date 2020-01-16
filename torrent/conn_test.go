@@ -1,7 +1,10 @@
 package torrent
 
 import (
+	"io"
+	"log"
 	"net"
+	"os"
 	"testing"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -17,8 +20,7 @@ import (
 func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 	w, r := net.Pipe()
 	tr := newTorrent(&Client{})
-	cn := newConn(tr, r, make([]byte, 20), 250)
-	//make eventCh too big so we dont block
+	cn := newConn(tr, r, make([]byte, 20))
 	go cn.mainLoop()
 	numPieces := 100
 	bf := peer_wire.NewBitField(numPieces)
@@ -52,7 +54,7 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 func TestConnState(t *testing.T) {
 	w, r := net.Pipe()
 	tr := newTorrent(&Client{})
-	cn := newConn(tr, r, make([]byte, 20), 250)
+	cn := newConn(tr, r, make([]byte, 20))
 	go cn.mainLoop()
 	//we dont expect conn to send an event since state didn't change
 	(&peer_wire.Msg{
@@ -78,104 +80,158 @@ func TestConnState(t *testing.T) {
 	}
 }
 
-//load a torrent file and change conn's state to uploadable
-//TODO:implement storage for this
-func BenchmarkPeerRequest(b *testing.B) {
+type dummyStorage struct{}
+
+func (ds dummyStorage) ReadBlock(b []byte, off int64) (n int, err error) {
+	//time.Sleep(1 * time.Millisecond)
+	n = len(b)
+	return
+}
+
+func (ds dummyStorage) WriteBlock(b []byte, off int64) (n int, err error) {
+	//time.Sleep(1 * time.Millisecond)
+	n = len(b)
+	return
+}
+
+func (ds dummyStorage) HashPiece(pieceIndex int, len int) (correct bool) {
+	//time.Sleep(1 * time.Millisecond)
+	correct = true
+	return
+}
+
+//The last asertion may fail but no fuss because it just tests how efficient
+//is our cancellation mechanism.
+func TestPeerRequestAndCancel(t *testing.T) {
 	w, r := net.Pipe()
-	cn, tr, err := loadFileThenPrepareUpload(w, r, "../metainfo/testdata/archlinux-2011.08.19-netinstall-i686.iso.torrent")
-	require.NoError(b, err)
-	for i := 0; i < tr.mi.Info.NumPieces(); i++ {
+	//we need to read the Piece msgs that r produces (see net.Pipe docs)
+	go readForever(w)
+	cn, tr, err := loadTorrentFile(w, r, "../metainfo/testdata/archlinux-2011.08.19-netinstall-i686.iso.torrent")
+	require.NoError(t, err)
+	tr.storage = dummyStorage{}
+	allowUpload(cn, w)
+	numPieces := 200
+	//If a piece is uploaded we ll get notified at eventCh.But if we send
+	//a Cancel for a Request, then we dont know if the conn will upload the
+	//block or it will se the Cancel first and ignore it.So, we are not sure
+	//about how many values eventCh will send (which is not wanted).As a
+	//workaround we send a Cancel for a piece that we don't own so a value
+	//won't be send to eventCh in all cases.
+	for i := 0; i < numPieces; i++ {
+		if i == numPieces-2 { //skip this piece, we 'll send Cancel for it
+			continue
+		}
 		cn.myBf.Set(i, true)
 	}
-	//conn will produce an event from every request so if we write all requests
-	//without interploation of rcvEvents eventChan will block.
-	for i := 0; i < b.N; i++ {
-		start := 0
-		for start+eventChSize < tr.mi.Info.NumPieces() {
-			writeRequests(w, start, eventChSize)
-			if !rcvEvents(cn.eventCh, start, eventChSize) {
-				b.Fail()
+	count := 0
+	ch := make(chan struct{})
+	go func() {
+		for e := range cn.eventCh {
+			switch e.(type) {
+			case uploadedBlock:
+			default:
+				t.FailNow()
 			}
-			start += eventChSize
+			count++
+			if count >= numPieces-2 {
+				close(ch)
+				return
+			}
+		}
+	}()
+	for i := 0; i < numPieces-1; i++ {
+		(&peer_wire.Msg{
+			Kind:  peer_wire.Request,
+			Index: uint32(i),
+			Len:   1 << 14,
+		}).Write(w)
+		//send cancel for the piece we dont have
+		if i == numPieces-2 {
+			(&peer_wire.Msg{
+				Kind:  peer_wire.Cancel,
+				Index: uint32(i),
+				Len:   1 << 14,
+			}).Write(w)
+		}
+	}
+	<-ch
+	assert.EqualValues(t, 0, latecomerCancels.Load())
+}
+
+func BenchmarkPeerPieceMsg(b *testing.B) {
+	w, r := net.Pipe()
+	cn, tr, err := loadTorrentFile(w, r, "../metainfo/testdata/oliver-koletszki-Schneeweiss11.torrent")
+	tr.storage = dummyStorage{}
+	tr.blockRequestSize = tr.blockSize()
+	tr.pieces = newPieces(tr)
+	require.NoError(b, err)
+	allowDownload(cn, w)
+	msg := &peer_wire.Msg{
+		Kind:  peer_wire.Piece,
+		Block: make([]byte, 1<<14),
+	}
+	msgBytes, err := msg.EncodeBinary()
+	require.NoError(b, err)
+	bl := block{
+		len: 1 << 14,
+	}
+	b.SetBytes(int64(len(msg.Block)))
+	var n int
+	for i := 0; i < b.N; i++ {
+		cn.rq.queue(bl)
+		n, err = w.Write(msgBytes)
+		require.NoError(b, err)
+		assert.Equal(b, n, len(msgBytes))
+		<-cn.eventCh
+	}
+	close(tr.done) //signal to close conn
+	<-cn.eventCh   //conn dropped
+	<-cn.eventCh   //closed chan
+}
+
+func readForever(r io.Reader) {
+	b := make([]byte, 1000)
+	for {
+		_, err := r.Read(b)
+		if err == io.EOF {
+			break
 		}
 	}
 }
 
-//just ensure cancelation doesn't have any obvious problems
-func TestRequestAndCancel(t *testing.T) {
-	w, r := net.Pipe()
-	cn, tr, err := loadFileThenPrepareUpload(w, r, "../metainfo/testdata/oliver-koletszki-Schneeweiss11.torrent")
-	require.NoError(t, err)
-	for i := 0; i < tr.mi.Info.NumPieces(); i++ {
-		cn.myBf.Set(i, true)
-	}
-	start := 0
-	writeRequestsThenCancel(w, start, eventChSize)
-}
-
-func loadFileThenPrepareUpload(w, r net.Conn, filename string) (*conn, *Torrent, error) {
+func loadTorrentFile(w, r net.Conn, filename string) (*conn, *Torrent, error) {
 	tr := newTorrent(&Client{})
-	cn := newConn(tr, r, make([]byte, 20), 250)
+	cn := newConn(tr, r, make([]byte, 20))
 	var err error
 	tr.mi, err = metainfo.LoadMetainfoFile(filename)
 	if err != nil {
 		return nil, nil, err
 	}
-	//signal conn that we have the info
-	close(cn.haveInfoCh)
+	tr.logger = log.New(os.Stdout, "test_logger", log.LstdFlags)
+	cn.jobCh.In() <- job{haveInfo{}}
 	go cn.mainLoop()
-	allowUpload := func() {
-		(&peer_wire.Msg{
-			Kind: peer_wire.Interested,
-		}).Write(w)
-		cn.jobCh.In() <- job{&peer_wire.Msg{
-			Kind: peer_wire.Unchoke,
-		}}
-		w.Read(make([]byte, 100))
-		<-cn.eventCh
-	}
-	allowUpload()
 	return cn, tr, nil
 }
 
-func writeRequestsThenCancel(w net.Conn, start, n int) {
-	writeRequests(w, start, n)
-	cancelRequests(w, start, n)
+func allowUpload(cn *conn, w net.Conn) {
+	(&peer_wire.Msg{
+		Kind: peer_wire.Interested,
+	}).Write(w)
+	cn.jobCh.In() <- job{&peer_wire.Msg{
+		Kind: peer_wire.Unchoke,
+	}}
+	<-cn.eventCh
 }
 
-func writeRequests(w net.Conn, start, n int) {
-	for i := start; i < start+n; i++ {
-		(&peer_wire.Msg{
-			Kind:  peer_wire.Request,
-			Index: uint32(i),
-			Len:   1 << 14,
-			Begin: 0,
-		}).Write(w)
-	}
+func allowDownload(cn *conn, w net.Conn) {
+	(&peer_wire.Msg{
+		Kind: peer_wire.Unchoke,
+	}).Write(w)
+	cn.jobCh.In() <- job{&peer_wire.Msg{
+		Kind: peer_wire.Interested,
+	}}
+	w.Read(make([]byte, 50))
+	<-cn.eventCh
+	//want blocks will be send also
+	<-cn.eventCh
 }
-
-func cancelRequests(w net.Conn, start, n int) {
-	for i := start; i < start+n; i++ {
-		(&peer_wire.Msg{
-			Kind:  peer_wire.Cancel,
-			Index: uint32(start + n - 1),
-			Len:   1 << 14,
-			Begin: 0,
-		}).Write(w)
-	}
-}
-
-//returns false on failure
-func rcvEvents(ch chan interface{}, start, n int) bool {
-	for i := start; i < start+n; i++ {
-		e := <-ch
-		switch e.(type) {
-		case uploadedBlock:
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-//TODO: test piece msgs reading
