@@ -14,8 +14,15 @@ import (
 	"github.com/lkslts64/charo-torrent/metainfo"
 )
 
-//Storage is a file-based storage for torrent data
-type Storage struct {
+//Storage is the interface every storage should adhere to
+type Storage interface {
+	ReadBlock(b []byte, off int64) (n int, err error)
+	WriteBlock(b []byte, off int64) (n int, err error)
+	HashPiece(pieceIndex int, len int) (correct bool)
+}
+
+//FileStorage is a file-based storage for torrent data
+type FileStorage struct {
 	logger *log.Logger
 	//fts    *fileTorrentImpl
 	dir    string
@@ -23,9 +30,9 @@ type Storage struct {
 	pieces []*piece
 }
 
-//Open initializes the storage.`blocks` is a slice containing how many
-//blocks each piece has.
-func Open(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) *Storage {
+//OpenFileStorage initializes the storage.`blocks` is a slice containing how many
+//blocks each piece has. Surely we can find `blocks` by metainfo but is expensive.
+func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) *FileStorage {
 	pieces := make([]*piece, mi.Info.NumPieces())
 	for i := 0; i < len(pieces); i++ {
 		pieces[i] = &piece{
@@ -33,7 +40,7 @@ func Open(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logge
 			dirtyBlocks: make(map[int64]struct{}),
 		}
 	}
-	return &Storage{
+	return &FileStorage{
 		logger: logger,
 		mi:     mi,
 		dir:    baseDir,
@@ -42,7 +49,7 @@ func Open(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logge
 }
 
 // Returns EOF on short or missing file.
-func (s *Storage) readFileAt(fi metainfo.File, b []byte, off int64) (n int, err error) {
+func (s *FileStorage) readFileAt(fi metainfo.File, b []byte, off int64) (n int, err error) {
 	f, err := os.Open(s.fileInfoName(fi))
 	if os.IsNotExist(err) {
 		// File missing is treated the same as a short file.
@@ -71,29 +78,32 @@ func (s *Storage) readFileAt(fi metainfo.File, b []byte, off int64) (n int, err 
 	return
 }
 
+//TODO: these meths should not have receiver (be functions)
+
 //returns the piece index that off corresponds to.
-func (s *Storage) pieceIndex(off int64) int {
+func (s *FileStorage) pieceIndex(off int64) int {
 	return int(off / int64(s.mi.Info.PieceLen))
 }
 
 //returns the offset that `pieceIndex` starts.
-func (s *Storage) pieceOff(pieceIndex int) int64 {
+func (s *FileStorage) pieceOff(pieceIndex int) int64 {
 	return int64(pieceIndex * s.mi.Info.PieceLen)
 }
 
-var errReadNonVerified = errors.New("storage: trying to read non verified piece")
+var ErrReadNonVerified = errors.New("storage: trying to read non verified piece")
 
 //ReadBlock is like ReadAt but fails if the piece to be read is not verified
-func (s *Storage) ReadBlock(b []byte, off int64) (n int, err error) {
+func (s *FileStorage) ReadBlock(b []byte, off int64) (n int, err error) {
 	piece := s.pieces[s.pieceIndex(off)]
 	if !piece.isVerified() {
-		panic(errReadNonVerified)
+		err = ErrReadNonVerified
+		return
 	}
 	return s.ReadAt(b, off)
 }
 
 // Only returns EOF at the end of the torrent. Premature EOF is ErrUnexpectedEOF.
-func (s *Storage) ReadAt(b []byte, off int64) (n int, err error) {
+func (s *FileStorage) ReadAt(b []byte, off int64) (n int, err error) {
 	for _, fi := range s.mi.Info.FilesInfo() {
 		flen := int64(fi.Len)
 		for off < flen {
@@ -126,7 +136,7 @@ var ErrAlreadyWritten = errors.New("storage: trying to write at already written 
 
 //WriteBlock behaves like WriteAt but it fails if another write has occured
 //at the same offset
-func (s *Storage) WriteBlock(p []byte, off int64) (n int, err error) {
+func (s *FileStorage) WriteBlock(p []byte, off int64) (n int, err error) {
 	piece := s.pieces[s.pieceIndex(off)]
 	if !piece.reserveOffset(off) {
 		err = ErrAlreadyWritten
@@ -135,7 +145,7 @@ func (s *Storage) WriteBlock(p []byte, off int64) (n int, err error) {
 	return s.WriteAt(p, off)
 }
 
-func (s *Storage) WriteAt(p []byte, off int64) (n int, err error) {
+func (s *FileStorage) WriteAt(p []byte, off int64) (n int, err error) {
 	for _, fi := range s.mi.Info.FilesInfo() {
 		flen := int64(fi.Len)
 		if off >= flen {
@@ -169,21 +179,21 @@ func (s *Storage) WriteAt(p []byte, off int64) (n int, err error) {
 	return
 }
 
-func (s *Storage) fileInfoName(fi metainfo.File) string {
+func (s *FileStorage) fileInfoName(fi metainfo.File) string {
 	return filepath.Join(append([]string{s.dir, s.mi.Info.Name}, fi.Path...)...)
 }
 
-var errNotReadyForVerification = errors.New("storage: not all piece's blocks are written")
+var ErrNotReadyForVerification = errors.New("storage: not all piece's blocks are written")
 
 //HashPiece hashes `pieceIndex` whose length is `len` and returns if
 //the hash was the expected.
-func (s *Storage) HashPiece(pieceIndex int, len int) (correct bool) {
+func (s *FileStorage) HashPiece(pieceIndex int, len int) (correct bool) {
 	piece := s.pieces[pieceIndex]
 	if piece.isVerified() {
-		panic("storage: piece already verified")
+		s.logger.Fatal("storage: piece already verified")
 	}
 	if !piece.readyForVerification() {
-		panic(errNotReadyForVerification)
+		s.logger.Fatal(ErrNotReadyForVerification)
 	}
 	defer func() {
 		if correct {
