@@ -75,6 +75,36 @@ func (m *Msg) Write(conn io.Writer) (err error) {
 	return
 }
 
+func (m *Msg) EncodeBinary() ([]byte, error) {
+	try := func(err error) {
+		if err != nil {
+			panic(err)
+		}
+	}
+	var b bytes.Buffer
+	switch m.Kind {
+	case Port, KeepAlive:
+	case Choke, Unchoke, Interested, NotInterested:
+		try(writeBinary(&b, m.Kind))
+	case Have:
+		try(writeBinary(&b, m.Kind, m.Index))
+	case Bitfield:
+		try(writeBinary(&b, m.Kind, m.Bf))
+	case Request, Cancel:
+		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
+	case Piece:
+		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
+	case Extended:
+		try(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
+	default:
+		panic("Unknown kind of msg to send")
+	}
+	var msgLen [4]byte
+	binary.BigEndian.PutUint32(msgLen[:], uint32(b.Len()))
+	buf := append(msgLen[:], b.Bytes()...)
+	return buf, nil
+}
+
 func Read(conn io.Reader) (*Msg, error) {
 	msg := new(Msg)
 	checkRead := func(err error) {
