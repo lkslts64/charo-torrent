@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	requestQueueChSize = 10
-	readChSize         = 50
-	jobChSize          = 50
-	eventChSize        = 50
+	//the size could be t.reqq?
+	readChSize  = 250
+	jobChSize   = 50
+	eventChSize = 250
 )
 
 const (
@@ -51,15 +51,14 @@ type conn struct {
 	keepAliveTimer *time.Timer
 	rq             *requestQueuer //front size = 10, back = 10
 	peerReqs       map[block]struct{}
+	haveInfo       bool
+	amSeeding      bool
 	//An integer, the number of outstanding request messages this peer supports
 	//without dropping any. The default in in libtorrent is 250.
 	peerReqq   int
 	muPeerReqs sync.Mutex
 	//how many blocks we are waiting to be forwarded to us
 	waitingBlocks int
-	//TODO: we don't need these two chans per conn but per torrent.
-	amSeedingCh chan struct{}
-	haveInfoCh  chan struct{}
 	//TODO: we 'll need this later.
 	//drop        chan struct{}
 	peerBf bitmap.Bitmap
@@ -73,14 +72,12 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		cl: t.cl,
 		t:  t,
 		//TODO:change logger output to a file
-		logger:      log.New(os.Stdout, string(peerID), log.LstdFlags),
-		cn:          cn,
-		state:       newConnState(),
-		jobCh:       channels.NewInfiniteChannel(),
-		eventCh:     make(chan interface{}, eventChSize),
-		rq:          newRequestQueuer(),
-		amSeedingCh: make(chan struct{}),
-		haveInfoCh:  make(chan struct{}),
+		logger:  log.New(os.Stdout, string(peerID), log.LstdFlags),
+		cn:      cn,
+		state:   newConnState(),
+		jobCh:   channels.NewInfiniteChannel(),
+		eventCh: make(chan interface{}, eventChSize),
+		rq:      newRequestQueuer(),
 		//drop:        make(chan struct{}),
 		//peerReqq: peerReqq,
 		peerReqs: make(map[block]struct{}),
@@ -89,8 +86,6 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 	t.newConnCh <- &connChansInfo{
 		c.jobCh,
 		c.eventCh,
-		c.amSeedingCh,
-		c.haveInfoCh,
 	}
 	return c
 }
@@ -155,7 +150,7 @@ func (pc *conn) mainLoop() error {
 			pc.waitingBlocks = maxOnFlight
 			pc.logger.Println("want blocks send")
 		}
-		if !pc.useful() {
+		if pc.notUseful() {
 			pc.logger.Println("conn is not useful anymore for both ends")
 			return nil
 		}
@@ -179,7 +174,7 @@ loop:
 		}()
 		//break from loops in not required
 		select {
-		case <-time.After(keepAliveInterval + 1*time.Minute): //lets be more resilient
+		case <-time.After(keepAliveInterval + time.Minute): //lets be forbearing
 			close(idle)
 		case res := <-readDone:
 			if res.err != nil {
@@ -209,7 +204,6 @@ loop:
 				pc.muPeerReqs.Lock()
 				if _, ok := pc.peerReqs[b]; ok {
 					delete(pc.peerReqs, b)
-					//pc.logger.Printf("canceled request for block %v\n", b)
 				} else {
 					latecomerCancels.Inc()
 				}
@@ -235,11 +229,11 @@ func (c *conn) wantBlocks() bool {
 }
 
 //returns true if its worth to keep the conn alive
-func (c *conn) useful() bool {
-	if !c.haveInfo() {
-		return true
+func (c *conn) notUseful() bool {
+	if !c.haveInfo {
+		return false
 	}
-	return !(c.peerSeeding() && c.amSeeding())
+	return c.peerSeeding() && c.amSeeding
 }
 
 func (c *conn) peerSeeding() bool {
@@ -304,6 +298,10 @@ func (pc *conn) parseJob(j job) (err error) {
 			pieceIndex: int(v),
 			ok:         correct,
 		}
+	case haveInfo:
+		pc.haveInfo = true
+	case seeding:
+		pc.amSeeding = true
 	}
 	return
 }
@@ -389,7 +387,7 @@ func (c *conn) encodeBitMap(bm bitmap.Bitmap) (bf peer_wire.BitField) {
 func (c *conn) decodeBitfield(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
 	var bfLen int
 	var bm bitmap.Bitmap
-	if c.haveInfo() {
+	if c.haveInfo {
 		numPieces := c.t.numPieces()
 		if !bf.Valid(numPieces) {
 			return nil, errors.New("bf length is not valid")
@@ -417,14 +415,6 @@ func isClosed(ch chan struct{}) bool {
 	}
 }
 
-func (c *conn) amSeeding() bool {
-	return isClosed(c.amSeedingCh)
-}
-
-func (c *conn) haveInfo() bool {
-	return isClosed(c.haveInfoCh)
-}
-
 /*//we should have metadata in order to call this
 func (pc *conn) peerBitFieldValid() bool {
 	return pc.peerBf.Valid(pc.t.tm.mi.Info.NumPieces())
@@ -446,7 +436,7 @@ func (pc *conn) onExtended(msg *peer_wire.Msg) (err error) {
 		case peer_wire.MetadataDataID:
 		case peer_wire.MetadataRejID:
 		case peer_wire.MetadataReqID:
-			if !pc.haveInfo() {
+			if !pc.haveInfo {
 				pc.sendMsg(&peer_wire.Msg{
 					Kind:       peer_wire.Extended,
 					ExtendedID: peer_wire.ExtMetadataID,
@@ -484,7 +474,7 @@ func (pc *conn) upload(msg *peer_wire.Msg) error {
 		defer pc.muPeerReqs.Unlock()
 		delete(pc.peerReqs, bl)
 	}()
-	if !pc.haveInfo() {
+	if !pc.haveInfo {
 		return errors.New("peer send requested and we dont have info dict")
 	}
 	if !pc.state.canUpload() {
@@ -535,7 +525,10 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	if ready, ok = pc.rq.deleteCompleted(bl); !ok {
 		//We didnt' request this piece, but maybe it is useful
 		pc.logger.Printf("received unexpected block %v\n", bl)
-		if !pc.t.pieces.valid(bl.pc) {
+		if !pc.haveInfo {
+			return errors.New("peer send piece while we dont have info")
+		}
+		if !pc.t.pieceValid(bl.pc) {
 			return errors.New("peer send piece doesn't exist")
 		}
 		//TODO: check if we have the particular block
@@ -545,8 +538,7 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		}
 		var length int
 		var err error
-		if length, err = pc.t.pieces.pcs[bl.pc].blockLenSafe(bl.off); err != nil ||
-			length != bl.len {
+		if length, err = pc.t.pieces.pcs[bl.pc].blockLenSafe(bl.off); err != nil {
 			switch {
 			case errors.Is(err, errDivOffset):
 				//peer gave us a useful block but with offset % blockSz != 0
@@ -557,10 +549,11 @@ func (pc *conn) onPieceMsg(msg *peer_wire.Msg) error {
 				return nil
 			case errors.Is(err, errLargeOffset):
 				return err
-			default: //second cond is false at if stmt
-				pc.logger.Println("length of piece msg is wrong")
-				return nil
 			}
+		}
+		if length != bl.len {
+			pc.logger.Println("length of piece msg is wrong")
+			return nil
 		}
 	}
 	if pc.state.canDownload() && (ready != block{}) {
