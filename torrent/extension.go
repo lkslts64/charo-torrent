@@ -18,8 +18,7 @@ func extensionHandshakeMsg(metaSz int64) *peer_wire.Msg {
 		ExtendedID: 0,
 		ExtendedMsg: struct {
 			ExtMap peer_wire.Extensions `bencode:"m"`
-			//if zero we omit
-			MetaSz int64 `bencode: "metadata_size" empty:"omit"`
+			MetaSz int64                `bencode:"metadata_size" empty:"omit"`
 		}{
 			ExtMap: extensions,
 			MetaSz: metaSz,

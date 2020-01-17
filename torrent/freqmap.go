@@ -7,6 +7,10 @@ import (
 
 type freqMap map[int64]int
 
+func newFreqMap() freqMap {
+	return make(map[int64]int)
+}
+
 func (f freqMap) add(n int64) {
 	var count int
 	var ok bool

@@ -35,6 +35,8 @@ func LoadMetainfoFile(fileName string) (*MetaInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load metainfo: %w", err)
 	}
+	//TODO: we find here the has but we must also the infoBytes for
+	//metadata extension. Why parse the file twice?
 	err = meta.Info.setInfoHash(data)
 	if err != nil {
 		return nil, fmt.Errorf("load metainfo: %w", err)
@@ -49,11 +51,6 @@ func (m *MetaInfo) Parse() error {
 	if err != nil {
 		return fmt.Errorf("metainfo parse: %w", err)
 	}
-	//currently support only http(s) trackers
-	//TODO: uncomment when we start supporting UDP trackers.
-	/*if !strings.HasPrefix(string(m.Announce), "http") {
-		return errors.New("metainfo parse:this is not an http tracker")
-	}*/
 	return nil
 }
 

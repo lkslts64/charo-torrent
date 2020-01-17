@@ -16,7 +16,7 @@ func TestRequestQueuer(t *testing.T) {
 	var ready bool
 	for i := 0; i <= maxOnFlight+pendingLen; i++ {
 		ready, ok = rq.queue(block{
-			pc: uint32(i),
+			pc: i,
 		})
 		switch {
 		case i < maxOnFlight:
@@ -30,28 +30,28 @@ func TestRequestQueuer(t *testing.T) {
 			assert.Equal(t, false, ready)
 		}
 	}
-	assert.Equal(t, pendingLen, len(rq.pending.blocks))
-	assert.Equal(t, maxOnFlight, len(rq.onFlight))
+	assert.Equal(t, true, rq.full())
 	var sendReady block
 	//delete one block from the onFlights ones
 	sendReady, ok = rq.deleteCompleted(block{
-		pc: uint32(8),
+		pc: 8,
 	})
 	assert.Equal(t, ok, true)
 	//ensure we will send the first block that exists in pending queue
 	assert.Equal(t, sendReady, block{
-		pc: 10,
+		pc: maxOnFlight,
 	})
 	sendReady, ok = rq.deleteCompleted(block{
-		pc: uint32(20),
+		pc: maxOnFlight + 5, //a piece that is not at onFlight
 	})
 	assert.Equal(t, false, ok)
 	assert.Equal(t, sendReady, block{})
 	ready, ok = rq.queue(block{
-		pc: uint32(1999),
+		pc: 1999,
 	})
 	assert.Equal(t, true, ok)
 	assert.Equal(t, false, ready)
 	blocks := rq.discardAll()
 	assert.Equal(t, maxOnFlight+pendingLen, len(blocks))
+	assert.Equal(t, true, rq.empty())
 }

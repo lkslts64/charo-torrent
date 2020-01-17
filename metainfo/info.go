@@ -54,7 +54,7 @@ func (info *InfoDict) setInfoHash(data []byte) error {
 }
 
 //Bytes returns the info dict in bencoded form.
-//`data` is the bytes of a .torrent file
+//`filename` is a .torrent file
 func (info *InfoDict) Bytes(filename string) ([]byte, error) {
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
