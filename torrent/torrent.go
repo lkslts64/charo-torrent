@@ -34,10 +34,6 @@ import (
 
 var maxConns = 55
 
-const maxUploadSlots = 4
-const optimisticSlots = 1
-
-//var blockSz = 1 << 14 //16KiB
 var maxRequestBlockSz = 1 << 14
 
 const metadataPieceSz = 1 << 14
@@ -146,28 +142,23 @@ func (t *Torrent) parseEvent(e event) {
 			if e.conn.state.amInterested {
 				e.conn.stats.stopDownloading()
 			}
-			//forward unsatisfied to other interested-unchoked peers
 		case peer_wire.Unchoke:
-			//update local state
 			e.conn.state.isChoking = false
 			e.conn.startDownloading()
-			//give this peer some requests
 		case peer_wire.Have:
 			e.conn.reviewInterestsOnHave(int(v.Index))
 			e.conn.peerBf.Set(int(v.Index), true)
 		}
 	case downloadedBlock:
+		e.conn.stats.onBlockDownload(v.len)
 		t.pieces.pcs[v.pc].markBlockComplete(e.conn, int(v.off))
-		//update interests
 	case uploadedBlock:
-		//add to stats
-	case pieceVerificationOk:
-		if v.ok {
-			if t.pieces.pieceVerified(v.pieceIndex) {
-				t.startSeeding()
-			}
-		} else {
-			t.pieces.pieceVerificationFailed(v.pieceIndex)
+		e.conn.stats.onBlockUpload(v.len)
+	case discardedRequests:
+		t.pieces.addDiscarded(v)
+	case pieceHashed:
+		if t.pieceHashed(v.pieceIndex, v.ok) {
+			t.startSeeding()
 		}
 	case wantBlocks:
 		t.pieces.dispatch(e.conn)
@@ -177,7 +168,7 @@ func (t *Torrent) parseEvent(e event) {
 		e.conn.reviewInterestsOnBitfield()
 	//before conn goroutine exits, it sends a dropConn event
 	case connDroped:
-		t.removeConn(e.conn)
+		t.droppedConn(e.conn)
 		t.choker.reviewUnchokedPeers()
 
 	}
@@ -186,24 +177,20 @@ func (t *Torrent) parseEvent(e event) {
 func (t *Torrent) startSeeding() {
 	t.logger.Printf("operating in seeding mode...")
 	t.seeding = true
+	t.broadcastCommand(seeding{})
 	for _, c := range t.conns {
-		c.sendJob(job{seeding{}})
+		c.notInterested()
 	}
 }
 
-/*func NewTorrent(filename string) (*Torrent, error) {
-	t, err := NewTorrentMeta(filename)
-	if err != nil {
-		return nil, err
+func (t *Torrent) pieceHashed(i int, correct bool) (allVerified bool) {
+	if correct {
+		t.onPieceDownload(i)
+		return t.pieces.pieceVerified(i)
 	}
-	return &Torrent{
-		tm:    t,
-		conns: make([]net.Conn, maxConns),
-		chans: make([]chan Event, maxConns),
-		actCh: make(chan interface{}, maxConns),
-	}, nil
-	return nil, nil
-}*/
+	t.pieces.pieceVerificationFailed(i)
+	return false
+}
 
 //this func is started in its own goroutine.
 //when we close eventCh of pconn, the goroutine
@@ -214,22 +201,17 @@ func (t *Torrent) aggregateEvents(ci *connInfo) {
 	}
 }
 
-/*careful when using this, we might 'range' over nil chan
-func (t *Torrent) aggregateEvents() {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	for i, conn := range t.pconns {
-		if conn != nil {
-			go t.addAggregated(i, conn)
-		}
-	}
-}*/
-
 //careful when using this, we might send over nil chan
-func (t *Torrent) broadcastJob(job interface{}) {
+func (t *Torrent) broadcastCommand(cmd interface{}) {
 	for _, ci := range t.conns {
-		ci.sendJob(job)
+		ci.sendCommand(cmd)
 	}
+}
+
+//TODO: make iter around t.conns and dont iterate twice over conns
+func (t *Torrent) onPieceDownload(i int) {
+	t.reviewInterestsOnPieceDownload(i)
+	t.sendHaves(i)
 }
 
 func (t *Torrent) reviewInterestsOnPieceDownload(i int) {
@@ -246,53 +228,79 @@ func (t *Torrent) reviewInterestsOnPieceDownload(i int) {
 	}
 }
 
+func (t *Torrent) sendHaves(i int) {
+	for _, c := range t.conns {
+		c.have(i)
+	}
+}
+
 func (t *Torrent) addConn(cc *connChansInfo) bool {
 	if len(t.conns) >= maxConns {
-		//TODO:send a drop msg to peer in order to signal him that he should exit conn mainLoop
+		close(cc.drop) //signal that conn should be dropped
 		return false
 	}
 	ci := &connInfo{
-		t:       t,
-		jobCh:   cc.jobCh,
-		eventCh: cc.eventCh,
-		state:   newConnState(),
-		stats:   newConnStats(),
+		t:         t,
+		commandCh: cc.commandCh,
+		eventCh:   cc.eventCh,
+		drop:      cc.drop,
+		state:     newConnState(),
+		stats:     newConnStats(),
 	}
 	t.conns = append(t.conns, ci)
 	//notify conn that we have metainfo or we are seeding by closing these chans
 	if t.haveInfo() {
-		ci.sendJob(haveInfo{})
+		ci.sendCommand(haveInfo{})
 	}
 	if t.seeding {
-		ci.sendJob(seeding{})
+		ci.sendCommand(seeding{})
 	}
 	//if we have some pieces, we should sent a bitfield
 	if t.pieces.ownedPieces.Len() > 0 {
-		ci.sendJob(t.pieces.ownedPieces.Copy())
+		ci.sendBitfield()
 	}
 	go t.aggregateEvents(ci)
 	return true
 }
 
-func (t *Torrent) removeConn(ci *connInfo) bool {
-	index := -1
+//we would like to drop the conn
+func (t *Torrent) punishConn(i int) {
+	close(t.conns[i].drop)
+	t.removeConn(t.conns[i], i)
+	//TODO: black list in some way?
+}
+
+//conn notified us that it was dropped
+func (t *Torrent) droppedConn(ci *connInfo) bool {
+	var (
+		i  int
+		ok bool
+	)
+	if i, ok = t.connIndex(ci); !ok {
+		panic("conn dissaperaed")
+	}
+	t.removeConn(ci, i)
+	return true
+}
+
+//bool is true if was found
+func (t *Torrent) connIndex(ci *connInfo) (int, bool) {
 	for i, cn := range t.conns {
 		if cn == ci {
-			index = i
-			break
+			return i, true
 		}
 	}
-	if index < 0 {
-		return false
-	}
-	t.conns[index] = nil //ensure is garbage collected (maybe not required)
+	return -1, false
+}
+
+//clear the fields that included the conn
+func (t *Torrent) removeConn(ci *connInfo, index int) {
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
 	if t.pieces != nil {
 		if _, ok := t.pieces.requestExpecters[ci]; ok {
 			delete(t.pieces.requestExpecters, ci)
 		}
 	}
-	return true
 }
 
 //TODO: maybe wrap these at the same func passing as arg the func (read/write)
@@ -361,7 +369,6 @@ func (t *Torrent) downloadedMetadata() bool {
 			return false
 		}
 	}
-	//setInfo
 	return true
 }
 
@@ -427,12 +434,10 @@ func (t *Torrent) gotInfo() {
 	t.pieces = newPieces(t)
 	t.storage = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
 	//notify conns that we have the info
-	for _, c := range t.conns {
-		c.sendJob(job{haveInfo{}})
-	}
+	t.broadcastCommand(haveInfo{})
 }
 
-func (t *Torrent) PieceLen(i uint32) (pieceLen int) {
+func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
 	numPieces := int(t.mi.Info.NumPieces())
 	//last piece case
 	if int(i) == numPieces-1 {
@@ -481,41 +486,15 @@ func (t *Torrent) haveInfo() bool {
 	return t.mi.Info != nil
 }
 
-/*func (t *Torrent) addConn(conn net.Conn) (int, error) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	if t.numConns >= maxConns {
-		return -1, errors.New("maxConns reached")
-	}
-	t.numConns++
-	//Fill one of the gaps of this slice
-	var index int
-	for i, c := range t.pconns {
-		if c.conn == nil {
-			c.conn = conn
-			index = i
-			return index, nil
-		}
-	}
-	panic("maxConns reached")
-}
-
-func (t *Torrent) removeConn(i int) {
-	t.connMu.Lock()
-	defer t.connMu.Unlock()
-	t.numConns--
-	t.pconns[i].conn = nil
-}*/
-
 //connInfo sends msgs to conn .It also holds
 //some informations like state,bitmap which also conn holds too -
 //we dont share, we communicate so we have some duplicate data-.
 type connInfo struct {
 	t *Torrent
 	//we communicate with conn with these channels - conn also has them
-	jobCh   chan interface{}
-	eventCh chan interface{}
-	//drop        chan struct{}
+	commandCh chan interface{}
+	eventCh   chan interface{}
+	drop      chan struct{}
 	//peer's bitmap
 	peerBf  bitmap.Bitmap //also conn has this
 	numWant int           //how many pieces are we interested to download from peer
@@ -523,13 +502,13 @@ type connInfo struct {
 	stats   connStats
 }
 
-func (cn *connInfo) sendJob(job interface{}) {
-	cn.jobCh <- job
+func (cn *connInfo) sendCommand(cmd interface{}) {
+	cn.commandCh <- cmd
 }
 
 func (cn *connInfo) choke() {
 	if !cn.state.amChoking {
-		cn.sendJob(&peer_wire.Msg{
+		cn.sendCommand(&peer_wire.Msg{
 			Kind: peer_wire.Choke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
@@ -538,7 +517,7 @@ func (cn *connInfo) choke() {
 
 func (cn *connInfo) unchoke() {
 	if cn.state.amChoking {
-		cn.sendJob(&peer_wire.Msg{
+		cn.sendCommand(&peer_wire.Msg{
 			Kind: peer_wire.Unchoke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
@@ -547,7 +526,7 @@ func (cn *connInfo) unchoke() {
 
 func (cn *connInfo) interested() {
 	if !cn.state.amInterested {
-		cn.sendJob(&peer_wire.Msg{
+		cn.sendCommand(&peer_wire.Msg{
 			Kind: peer_wire.Interested,
 		})
 		cn.state.amInterested = !cn.state.amInterested
@@ -557,7 +536,7 @@ func (cn *connInfo) interested() {
 
 func (cn *connInfo) notInterested() {
 	if cn.state.amInterested {
-		cn.sendJob(&peer_wire.Msg{
+		cn.sendCommand(&peer_wire.Msg{
 			Kind: peer_wire.NotInterested,
 		})
 		cn.state.amInterested = !cn.state.amInterested
@@ -571,14 +550,14 @@ func (cn *connInfo) have(i int) {
 	if !cn.t.pieces.ownedPieces.Get(i) {
 		panic("send have without having piece")
 	}
-	cn.sendJob(&peer_wire.Msg{
+	cn.sendCommand(&peer_wire.Msg{
 		Kind:  peer_wire.Have,
 		Index: uint32(i),
 	})
 }
 
 func (cn *connInfo) sendBitfield() {
-	cn.sendJob(cn.t.pieces.ownedPieces)
+	cn.sendCommand(cn.t.pieces.ownedPieces)
 }
 
 //manages if we are interested in peer after a sending us bitfield msg
@@ -629,8 +608,8 @@ func (cn *connInfo) startDownloading() {
 		//Set last piece msg the first time we get into `downloading` state.
 		//We didn't got any piece msg but we want to have an initial time to check
 		//if we are snubbed.
-		if cn.stats.lastPieceMsg.IsZero() {
-			cn.stats.lastPieceMsg = time.Now()
+		if cn.stats.lastReceivedPieceMsg.IsZero() {
+			cn.stats.lastReceivedPieceMsg = time.Now()
 		}
 	}
 }
@@ -653,4 +632,17 @@ func (cn *connInfo) peerSeeding() bool {
 		return false
 	}
 	return cn.peerBf.Len() == cn.t.numPieces()
+}
+
+func (cn *connInfo) rate() int {
+	safeDiv := func(bytes, dur int) int {
+		if dur == 0 {
+			return 0
+		}
+		return bytes / dur
+	}
+	if cn.t.seeding {
+		return safeDiv(cn.stats.uploadUseful, int(cn.durationUploading()))
+	}
+	return safeDiv(cn.stats.downloadUseful, int(cn.durationDownloading()))
 }
