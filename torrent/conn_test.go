@@ -64,9 +64,9 @@ func TestConnState(t *testing.T) {
 	(&peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
 	}).Write(w)
-	cn.jobCh.In() <- job{&peer_wire.Msg{
+	cn.commandCh <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
-	}}
+	}
 	//read here is mandatory, see net.Pipe() docs
 	w.Read(make([]byte, 100))
 	e := <-cn.eventCh
@@ -130,7 +130,7 @@ func TestPeerRequestAndCancel(t *testing.T) {
 			switch e.(type) {
 			case uploadedBlock:
 			default:
-				t.FailNow()
+				t.Fail()
 			}
 			count++
 			if count >= numPieces-2 {
@@ -184,9 +184,15 @@ func BenchmarkPeerPieceMsg(b *testing.B) {
 		assert.Equal(b, n, len(msgBytes))
 		<-cn.eventCh
 	}
-	close(tr.done) //signal to close conn
-	<-cn.eventCh   //conn dropped
-	<-cn.eventCh   //closed chan
+	close(tr.done)    //signal to close conn
+	e := <-cn.eventCh //conn dropped
+	switch e.(type) {
+	case connDroped:
+	default:
+		b.FailNow()
+	}
+	_, ok := <-cn.eventCh //closed chan
+	assert.Equal(b, false, ok)
 }
 
 func readForever(r io.Reader) {
@@ -208,7 +214,7 @@ func loadTorrentFile(w, r net.Conn, filename string) (*conn, *Torrent, error) {
 		return nil, nil, err
 	}
 	tr.logger = log.New(os.Stdout, "test_logger", log.LstdFlags)
-	cn.jobCh.In() <- job{haveInfo{}}
+	cn.commandCh <- haveInfo{}
 	go cn.mainLoop()
 	return cn, tr, nil
 }
@@ -217,9 +223,9 @@ func allowUpload(cn *conn, w net.Conn) {
 	(&peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}).Write(w)
-	cn.jobCh.In() <- job{&peer_wire.Msg{
+	cn.commandCh <- &peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
-	}}
+	}
 	<-cn.eventCh
 }
 
@@ -227,9 +233,9 @@ func allowDownload(cn *conn, w net.Conn) {
 	(&peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
 	}).Write(w)
-	cn.jobCh.In() <- job{&peer_wire.Msg{
+	cn.commandCh <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
-	}}
+	}
 	w.Read(make([]byte, 50))
 	<-cn.eventCh
 	//want blocks will be send also
