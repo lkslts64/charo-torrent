@@ -39,15 +39,12 @@ func newPieces(t *Torrent) *pieces {
 		pcs[i] = newPiece(t, i)
 	}
 	p := &pieces{
-		t:   t,
-		pcs: pcs,
+		t:                t,
+		pcs:              pcs,
+		requestExpecters: make(map[*connInfo]struct{}),
 	}
 	p.strategy = p.randomStrategy
 	return p
-}
-
-func (p *pieces) valid(i int) bool {
-	return i >= 0 && i < len(p.pcs)
 }
 
 //First dispatch blocks of pieces that have been already partially dispatched (if any and if
@@ -90,7 +87,7 @@ func (p *pieces) _dispatch(i int, cn *connInfo, blocksToDispatch int) (remaining
 	for _, bl := range unreqBlocks {
 		p.pcs[i].addBlockPending(int(bl.off))
 	}
-	cn.sendJob(unreqBlocks)
+	cn.sendCommand(unreqBlocks)
 	return
 }
 
@@ -99,6 +96,7 @@ func (p *pieces) randomStrategy(availablePieces []int) (pc int, ok bool) {
 	for _, i := range piecesPerm {
 		if p.pcs[i].allBlocksUnrequested() {
 			ok = true
+			pc = availablePieces[i]
 			return
 		}
 	}
@@ -141,8 +139,20 @@ func (p *pieces) pieceVerified(i int) bool {
 		p.strategy = p.rarestStrategy
 	}
 	p.ownedPieces.Set(i, true)
-	p.t.reviewInterestsOnPieceDownload(i)
 	return p.allVerified()
+}
+
+func (p *pieces) pieceVerificationFailed(i int) {
+	p.t.logger.Printf("piece verification for piece %d failed\n", i)
+	p.pcs[i].verificationFailed()
+	p.dispatchToExpecters()
+}
+
+//try to forward blocks to conns that wanted blocks in the past
+func (p *pieces) dispatchToExpecters() {
+	for c := range p.requestExpecters {
+		p.dispatch(c)
+	}
 }
 
 //return a slice containing how many blocks a piece has.
@@ -155,6 +165,14 @@ func (p *pieces) blocks() []int {
 	return ret
 }
 
+func (p *pieces) valid(i int) bool {
+	return i >= 0 && i < len(p.pcs)
+}
+
+func (p *pieces) isLast(i int) bool {
+	return i == len(p.pcs)-1
+}
+
 func (p *pieces) allVerified() bool {
 	for _, piece := range p.pcs {
 		if !piece.verified {
@@ -164,25 +182,17 @@ func (p *pieces) allVerified() bool {
 	return true
 }
 
-func (p *pieces) pieceVerificationFailed(i int) {
-	p.t.logger.Printf("piece verification for piece %d failed\n", i)
-	p.pcs[i].verificationFailed()
-	//try to forward blocks to conns that wanted blocks in the past
-	for c := range p.requestExpecters {
-		p.dispatch(c)
-	}
-}
-
 //these blocks should be at pending state.
 //delete them before adding to unrequested.
 //Usually, we should avoid a call to this func.
 //We should optimize and give another peer the
 //unsatisfied reqs instead of adding them and
-//popping them again
-func (p *pieces) addUnsatisfied(bls []block) {
+//forwarding them again
+func (p *pieces) addDiscarded(bls []block) {
 	for _, bl := range bls {
 		p.pcs[bl.pc].addBlockUnrequsted(int(bl.off))
 	}
+	p.dispatchToExpecters()
 }
 
 func (p *pieces) hasUnrequestedBlocks() bool {
@@ -233,7 +243,7 @@ type piece struct {
 }
 
 func newPiece(t *Torrent, i int) *piece {
-	pieceLen := t.PieceLen(uint32(i))
+	pieceLen := t.pieceLen(uint32(i))
 	lastBlockLen := t.blockRequestSize
 	var extra int
 	if lastBytes := pieceLen % t.blockRequestSize; lastBytes != 0 {
@@ -383,7 +393,7 @@ func (p *piece) sendVerificationJob() {
 	sort.Sort(byRate(_conns))
 	worse := _conns[len(_conns)-1]
 	hp := verifyPiece(p.index)
-	worse.sendJob(job{hp})
+	worse.sendCommand(hp)
 }
 
 func (p *piece) verificationFailed() {
