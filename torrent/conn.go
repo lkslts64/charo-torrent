@@ -11,16 +11,19 @@ import (
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
-	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
 const (
 	//the size could be t.reqq?
-	readChSize  = 250
-	jobChSize   = 50
+	readChSize = 250
+	//jobChSize   = maxConns * eventChSize * 10
 	eventChSize = 250
 )
+
+//jobs that we 'll get are proportional to events a conn emits.
+//this is upper bound on jobs to be produced - we can decrease it more
+var jobChSize = maxConns*eventChSize*(maxOnFlight+10) + 10
 
 const (
 	keepAliveInterval time.Duration = 2 * time.Minute
@@ -39,13 +42,13 @@ type conn struct {
 	exts peer_wire.Extensions
 	//main goroutine also has this state - needs to be synced between
 	//the two goroutines
-	state *connState
+	state connState
 	//chanel that we receive msgs to be sent (generally)
 	//jobCh chan job - infinite chan
 	//we want to avoid deadlocks between jobCh and eventCh.
 	//Also we dont want master to block until workers(peerConns)
 	//receive jobs (they are doing heavy I/O).
-	jobCh channels.Channel
+	jobCh chan interface{}
 	//channel that we send received msgs
 	eventCh        chan interface{}
 	keepAliveTimer *time.Timer
@@ -75,7 +78,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		logger:  log.New(os.Stdout, string(peerID), log.LstdFlags),
 		cn:      cn,
 		state:   newConnState(),
-		jobCh:   channels.NewInfiniteChannel(),
+		jobCh:   make(chan interface{}, jobChSize),
 		eventCh: make(chan interface{}, eventChSize),
 		rq:      newRequestQueuer(),
 		//drop:        make(chan struct{}),
@@ -121,20 +124,28 @@ func (pc *conn) mainLoop() error {
 	}
 	pc.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
 	for {
+		//prioritize jobs
 		select {
-		case act := <-pc.jobCh.Out():
+		case act := <-pc.jobCh:
 			//TODO:pass values to job ch as interface{}
 			//no need for job type wrapper
 			err = pc.parseJob(act.(job))
-		case <-pc.t.done:
-			return nil
-		case msg := <-readCh:
-			err = pc.parsePeerMsg(msg)
-		case err = <-readErrCh:
-		case <-idle:
-			err = errors.New("peer idle")
-		case <-pc.keepAliveTimer.C:
-			err = pc.sendKeepAlive()
+		default:
+			select {
+			case act := <-pc.jobCh:
+				//TODO:pass values to job ch as interface{}
+				//no need for job type wrapper
+				err = pc.parseJob(act.(job))
+			case <-pc.t.done:
+				return nil
+			case msg := <-readCh:
+				err = pc.parsePeerMsg(msg)
+			case err = <-readErrCh:
+			case <-idle:
+				err = errors.New("peer idle")
+			case <-pc.keepAliveTimer.C:
+				err = pc.sendKeepAlive()
+			}
 		}
 		if err != nil {
 			switch err = nilOnEOF(err); err {

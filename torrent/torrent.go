@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
-	"github.com/eapache/channels"
 	"github.com/lkslts64/charo-torrent/bencode"
 	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
@@ -52,7 +51,7 @@ type Torrent struct {
 	//size of len(pconns) * eventChSize is reasonable
 	events chan event
 
-	storage *storage.Storage
+	storage storage.Storage
 	//These are active conns
 	conns []*connInfo
 	//conn can send a mgs to this chan so master goroutine knows a new connection
@@ -109,6 +108,8 @@ func newTorrent(cl *Client) *Torrent {
 	return t
 }
 
+//jobs that we 'll send are proportional to the # of events we have received.
+//TODO:count max jobs we can send in an iteration (estimate < 10)
 func (t *Torrent) mainLoop() {
 	t.choker.startTicker()
 	defer t.choker.ticker.Stop()
@@ -119,9 +120,6 @@ func (t *Torrent) mainLoop() {
 		case cc := <-t.newConnCh: //we established a new connection
 			if !t.addConn(cc) {
 				t.logger.Println("rejected a connection with peer")
-			} else {
-				//TODO: check at paper if we should call this
-				t.choker.reviewUnchokedPeers()
 			}
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
@@ -171,6 +169,8 @@ func (t *Torrent) parseEvent(e event) {
 		} else {
 			t.pieces.pieceVerificationFailed(v.pieceIndex)
 		}
+	case wantBlocks:
+		t.pieces.dispatch(e.conn)
 	case metainfoSize:
 	case bitmap.Bitmap:
 		e.conn.peerBf = v
@@ -187,7 +187,7 @@ func (t *Torrent) startSeeding() {
 	t.logger.Printf("operating in seeding mode...")
 	t.seeding = true
 	for _, c := range t.conns {
-		close(c.amSeedingCh)
+		c.sendJob(job{seeding{}})
 	}
 }
 
@@ -227,8 +227,8 @@ func (t *Torrent) aggregateEvents() {
 
 //careful when using this, we might send over nil chan
 func (t *Torrent) broadcastJob(job interface{}) {
-	for _, conn := range t.conns {
-		conn.jobCh.In() <- job
+	for _, ci := range t.conns {
+		ci.sendJob(job)
 	}
 }
 
@@ -248,24 +248,23 @@ func (t *Torrent) reviewInterestsOnPieceDownload(i int) {
 
 func (t *Torrent) addConn(cc *connChansInfo) bool {
 	if len(t.conns) >= maxConns {
+		//TODO:send a drop msg to peer in order to signal him that he should exit conn mainLoop
 		return false
 	}
 	ci := &connInfo{
-		t:           t,
-		jobCh:       cc.jobCh,
-		eventCh:     cc.eventCh,
-		amSeedingCh: cc.amSeedingCh,
-		haveInfoCh:  cc.haveInfoCh,
-		state:       newConnState(),
-		stats:       newConnStats(),
+		t:       t,
+		jobCh:   cc.jobCh,
+		eventCh: cc.eventCh,
+		state:   newConnState(),
+		stats:   newConnStats(),
 	}
 	t.conns = append(t.conns, ci)
 	//notify conn that we have metainfo or we are seeding by closing these chans
 	if t.haveInfo() {
-		close(ci.amSeedingCh)
+		ci.sendJob(haveInfo{})
 	}
 	if t.seeding {
-		close(ci.haveInfoCh)
+		ci.sendJob(seeding{})
 	}
 	//if we have some pieces, we should sent a bitfield
 	if t.pieces.ownedPieces.Len() > 0 {
@@ -384,8 +383,10 @@ func (t *Torrent) writeMetadataPiece(b []byte, i int) error {
 	}
 	copy(t.infoRaw[i*metadataPieceSz:], b)
 	t.ownedMetadataPieces[i] = true
-	if t.downloadedMetadata() {
-		t.verifyInfoDict()
+	if t.downloadedMetadata() && t.verifyInfoDict() {
+		t.gotInfo()
+	} else {
+		//pick the max freq `infoSize`
 	}
 	return nil
 }
@@ -415,7 +416,6 @@ func (t *Torrent) verifyInfoDict() bool {
 	if err := bencode.Decode(t.infoRaw, t.mi.Info); err != nil {
 		t.logger.Fatal("cant decode info dict")
 	}
-	t.gotInfo()
 	return true
 }
 
@@ -425,10 +425,10 @@ func (t *Torrent) gotInfo() {
 	t.stats.Left = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
-	t.storage = storage.Open(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	t.storage = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
 	//notify conns that we have the info
 	for _, c := range t.conns {
-		close(c.haveInfoCh)
+		c.sendJob(job{haveInfo{}})
 	}
 }
 
@@ -441,6 +441,10 @@ func (t *Torrent) PieceLen(i uint32) (pieceLen int) {
 		pieceLen = t.mi.Info.PieceLen
 	}
 	return
+}
+
+func (t *Torrent) pieceValid(piece int) bool {
+	return piece >= 0 && piece < t.numPieces()
 }
 
 //call this when we get info
@@ -509,20 +513,18 @@ func (t *Torrent) removeConn(i int) {
 type connInfo struct {
 	t *Torrent
 	//we communicate with conn with these channels - conn also has them
-	jobCh       channels.Channel
-	eventCh     chan interface{}
-	amSeedingCh chan struct{}
-	haveInfoCh  chan struct{}
+	jobCh   chan interface{}
+	eventCh chan interface{}
 	//drop        chan struct{}
 	//peer's bitmap
 	peerBf  bitmap.Bitmap //also conn has this
 	numWant int           //how many pieces are we interested to download from peer
-	state   *connState    //also conn has this
-	stats   *connStats
+	state   connState     //also conn has this
+	stats   connStats
 }
 
 func (cn *connInfo) sendJob(job interface{}) {
-	cn.jobCh.In() <- job
+	cn.jobCh <- job
 }
 
 func (cn *connInfo) choke() {
