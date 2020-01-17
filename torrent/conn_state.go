@@ -7,8 +7,8 @@ type connState struct {
 	isChoking    bool
 }
 
-func newConnState() *connState {
-	return &connState{
+func newConnState() connState {
+	return connState{
 		amChoking: true,
 		isChoking: true,
 	}
