@@ -45,10 +45,11 @@ type conn struct {
 	//Also we dont want master to block until workers(peerConns)
 	//receive jobs (they are doing heavy I/O).
 	commandCh chan interface{}
-	//chan to signal that conn should be dropped
-	drop chan struct{}
 	//channel that we send received msgs
-	eventCh        chan interface{}
+	eventCh chan interface{}
+	//chans to signal that conn should be dropped
+	drop           chan struct{}
+	peerIdle       chan struct{}
 	keepAliveTimer *time.Timer
 	rq             *requestQueuer //front size = 10, back = 10
 	peerReqs       map[block]struct{}
@@ -78,6 +79,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		commandCh: make(chan interface{}, commandChSize),
 		eventCh:   make(chan interface{}, eventChSize),
 		drop:      make(chan struct{}),
+		peerIdle:  make(chan struct{}),
 		rq:        newRequestQueuer(),
 		peerReqs:  make(map[block]struct{}),
 	}
@@ -92,10 +94,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 
 func (c *conn) close() {
 	c.cn.Close()
-	//send event that we closed and after close chan - avoid leak goroutines
-	//TODO:handle this case, we dont want to receive from cmdCh we just want to exit
-	//maybe a new connDrop channel or SEND a conn droped in aggregateEvents in Torrent?
-	c.sendPeerEvent(connDroped{})
+	//close chan - avoid leak goroutines
 	close(c.eventCh)
 	c.logger.Println("closed connection")
 }
@@ -111,10 +110,10 @@ func (c *conn) mainLoop() error {
 	readCh := make(chan *peer_wire.Msg, readChSize)
 	readErrCh := make(chan error, 1)
 	//we need o quit chan in order to not leak readMsgs goroutine
-	quit, idle := make(chan struct{}), make(chan struct{})
+	quit := make(chan struct{})
 	defer c.close()
 	defer close(quit)
-	go c.readMsgs(readCh, idle, quit, readErrCh)
+	go c.readMsgs(readCh, quit, readErrCh)
 	nilOnEOF := func(err error) error {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil
@@ -133,7 +132,7 @@ func (c *conn) mainLoop() error {
 			return nil
 		case <-c.drop:
 			return nil
-		case <-idle:
+		case <-c.peerIdle:
 			err = errors.New("peer idle")
 			return nil
 		case <-c.keepAliveTimer.C:
@@ -165,7 +164,7 @@ func (c *conn) mainLoop() error {
 
 //read msgs from remote peer
 //run on seperate goroutine
-func (c *conn) readMsgs(readCh chan<- *peer_wire.Msg, idle, quit chan struct{},
+func (c *conn) readMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 	errCh chan error) {
 	var msg *peer_wire.Msg
 	var err error
@@ -181,7 +180,7 @@ loop:
 		//break from loops in not required
 		select {
 		case <-time.After(keepAliveInterval + time.Minute): //lets be forbearing
-			close(idle)
+			close(c.peerIdle)
 		case res := <-readDone:
 			if res.err != nil {
 				errCh <- res.err
@@ -404,9 +403,9 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 			case <-c.drop:
 				err = io.EOF
 			//TODO:should we have idle chan inside struct conn?
-			/*case <-idle:
-			err = errors.New("peer idle")
-			return nil*/
+			case <-c.peerIdle:
+				err = errors.New("peer idle")
+				return nil
 			case <-c.keepAliveTimer.C:
 				err = c.sendKeepAlive()
 			}
