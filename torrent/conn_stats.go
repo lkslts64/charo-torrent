@@ -46,7 +46,7 @@ func (cs *connStats) uploadLimitsReached() bool {
 }
 
 func (cs *connStats) isSnubbed() bool {
-	return cs.uploadLimitsReached() || time.Since(cs.lastReceivedPieceMsg) >= time.Minute
+	return cs.uploadLimitsReached() || (!cs.lastReceivedPieceMsg.IsZero() && time.Since(cs.lastReceivedPieceMsg) >= time.Minute)
 }
 
 func (cs *connStats) malliciousness() int {
