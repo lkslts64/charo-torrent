@@ -11,13 +11,13 @@ import (
 func TestChoker(t *testing.T) {
 	conns := []*connInfo{}
 	//create conns by ascending download rate order.
-	numConns := 55
+	numConns := maxConns
 	for i := 0; i < numConns; i++ {
 		ci := &connInfo{
 			t: &Torrent{
 				mi: &metainfo.MetaInfo{},
 			},
-			commandCh: make(chan interface{}, 1),
+			commandCh: make(chan interface{}, 50), //ensure we have length
 			state: connState{
 				isInterested: true,
 				amChoking:    true,
@@ -50,17 +50,32 @@ func TestChoker(t *testing.T) {
 		assertion := i <= len(conns)-1-maxUploadSlots == c.state.amChoking
 		if !assertion {
 			if onceFlag || !extraOptimistic {
-				t.FailNow()
+				t.Fail()
 			}
 			onceFlag = true
 		}
 	}
-	//Test choker when there is no peer interested
-	for i := 0; i < numConns; i++ {
-		chk.t.conns[i].state.isInterested = false
-	}
+	testNumOfUnchokes(t, chk, numConns, numConns)
+	testNumOfUnchokes(t, chk, 0, maxUploadSlots+optimisticSlots)
+	testNumOfUnchokes(t, chk, numConns-2, numConns)
+}
+
+func testNumOfUnchokes(t *testing.T, chk *choker, numNotInterested, expectedUnchoked int) {
+	resetConns(chk, numNotInterested)
 	chk.reviewUnchokedPeers()
-	for i := 0; i < numConns; i++ {
-		assert.Equal(t, false, chk.t.conns[i].state.amChoking)
+	unchoked := 0
+	for _, c := range chk.t.conns {
+		if !c.state.amChoking {
+			unchoked++
+		}
+	}
+	assert.Equal(t, unchoked, expectedUnchoked)
+}
+
+func resetConns(chk *choker, numNotInterested int) {
+	chk.currRound = 0
+	for i, c := range chk.t.conns {
+		c.state.isInterested = i >= numNotInterested
+		c.state.amChoking = true
 	}
 }

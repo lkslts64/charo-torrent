@@ -72,7 +72,7 @@ func (c *choker) reviewUnchokedPeers() {
 	bestPeers, optimisticCandidates := []*connInfo{}, []*connInfo{}
 	for _, conn := range c.t.conns {
 		if conn.peerSeeding() {
-			continue
+			conn.choke()
 		}
 		if conn.isSnubbed() || !conn.state.isInterested {
 			optimisticCandidates = append(optimisticCandidates, conn)
