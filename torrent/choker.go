@@ -60,60 +60,65 @@ func (br byRate) Swap(i, j int) {
 
 //reviewUnchokedPeers algorithm similar to the one used at mainline client
 func (c *choker) reviewUnchokedPeers() {
+	defer func() {
+		c.currRound++
+	}()
 	if len(c.t.conns) == 0 {
 		return
 	}
 	if c.currRound%5 == 0 {
 		c.pickOptimisticUnchoke()
 	}
-	if c.optimistic != nil {
-		c.optimistic.unchoke()
-	}
-	bestPeers := []*connInfo{}
-	optimisticCandidates := []*connInfo{}
+	bestPeers, optimisticCandidates := []*connInfo{}, []*connInfo{}
 	for _, conn := range c.t.conns {
-		if c.optimistic != nil && conn == c.optimistic {
+		if conn.peerSeeding() {
 			continue
 		}
-		if conn.isSnubbed() || !conn.state.isInterested || conn.peerSeeding() {
+		if conn.isSnubbed() || !conn.state.isInterested {
 			optimisticCandidates = append(optimisticCandidates, conn)
-			continue
+		} else {
+			bestPeers = append(bestPeers, conn)
 		}
-		bestPeers = append(bestPeers, conn)
 	}
 	sort.Sort(byRate(bestPeers))
 	uploadSlots := int(math.Min(maxUploadSlots, float64(len(bestPeers))))
 	optimisticCandidates = append(optimisticCandidates, bestPeers[uploadSlots:]...)
-	//peers that have best upload rates
+	//peers that have best upload rates (optimistic may belong to bestPeers)
 	bestPeers = bestPeers[:uploadSlots]
 	for _, conn := range bestPeers {
 		conn.unchoke()
 	}
-	numOptimistics := int(math.Max(optimisticSlots, float64(maxUploadSlots-uploadSlots)))
+	numOptimistics := optimisticSlots + (maxUploadSlots - uploadSlots)
 	var optimisticCount int
-	//unchoke optimistics in random order (only if bestPeers are not sufficient)
-	//and choke the remaining ones.
+	if containsConn(optimisticCandidates, c.optimistic) { //optimistic belongs to optimisticCandidates.
+		c.optimistic.unchoke()
+		optimisticCount++
+	}
+	//unchoke optimistics in random order and choke the remaining ones.
 	indices := rand.Perm(len(optimisticCandidates))
 	for _, i := range indices {
-		if optimisticCandidates[i].peerSeeding() {
-			optimisticCandidates[i].choke()
-		} else if optimisticCount >= numOptimistics {
+		//we've already handled this case
+		if c.optimistic != nil && c.optimistic == optimisticCandidates[i] {
+			continue
+		}
+		if optimisticCount >= numOptimistics {
 			optimisticCandidates[i].choke()
 		} else {
+			//we'll get here only if bestPeers are not sufficient or if
+			//optimistic belonged in bestPeers
 			optimisticCandidates[i].unchoke()
 			if optimisticCandidates[i].state.isInterested {
 				optimisticCount++
 			}
 		}
 	}
-	c.currRound++
 }
 
-func connsindex(conns []*connInfo, cand *connInfo) (int, bool) {
-	for i, c := range conns {
+func containsConn(conns []*connInfo, cand *connInfo) bool {
+	for _, c := range conns {
 		if c == cand {
-			return i, true
+			return true
 		}
 	}
-	return -1, false
+	return false
 }
