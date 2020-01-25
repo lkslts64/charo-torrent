@@ -63,8 +63,6 @@ var random_encode_tests = []random_encode_test{
 	{struct {
 		A string `empty:"omit"`
 	}{A: ""}, "de"},
-	/*{bigIntFromString("62208002200000000000"), "i62208002200000000000e"},
-	{*bigIntFromString("62208002200000000000"), "i62208002200000000000e"},*/
 }
 
 func TestEncode(t *testing.T) {
