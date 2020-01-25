@@ -47,8 +47,8 @@ type conn struct {
 	commandCh chan interface{}
 	//channel that we send received msgs
 	eventCh chan interface{}
-	//chans to signal that conn should be dropped
-	drop           chan struct{}
+	//chans to signal that conn should is dropped
+	dropped        chan struct{}
 	peerIdle       chan struct{}
 	keepAliveTimer *time.Timer
 	rq             *requestQueuer //front size = 10, back = 10
@@ -78,7 +78,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		state:     newConnState(),
 		commandCh: make(chan interface{}, commandChSize),
 		eventCh:   make(chan interface{}, eventChSize),
-		drop:      make(chan struct{}),
+		dropped:   make(chan struct{}),
 		peerIdle:  make(chan struct{}),
 		rq:        newRequestQueuer(),
 		peerReqs:  make(map[block]struct{}),
@@ -87,7 +87,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 	t.newConnCh <- &connChansInfo{
 		c.commandCh,
 		c.eventCh,
-		c.drop,
+		c.dropped,
 	}
 	return c
 }
@@ -96,6 +96,8 @@ func (c *conn) close() {
 	c.cn.Close()
 	//close chan - avoid leak goroutines
 	close(c.eventCh)
+	//notify Torrent that conn closed
+	close(c.dropped)
 	c.logger.Println("closed connection")
 }
 
@@ -129,8 +131,6 @@ func (c *conn) mainLoop() error {
 			err = c.parsePeerMsg(msg)
 		case err = <-readErrCh:
 		case <-c.t.done:
-			return nil
-		case <-c.drop:
 			return nil
 		case <-c.peerIdle:
 			err = errors.New("peer idle")
@@ -309,6 +309,8 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		c.haveInfo = true
 	case seeding:
 		c.amSeeding = true
+	case drop:
+		err = io.EOF
 	}
 	return
 }
@@ -400,9 +402,6 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 			//pretend we lost connection
 			case <-c.t.done:
 				err = io.EOF
-			case <-c.drop:
-				err = io.EOF
-			//TODO:should we have idle chan inside struct conn?
 			case <-c.peerIdle:
 				err = errors.New("peer idle")
 				return nil

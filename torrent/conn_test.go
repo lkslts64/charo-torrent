@@ -184,13 +184,7 @@ func BenchmarkPeerPieceMsg(b *testing.B) {
 		assert.Equal(b, n, len(msgBytes))
 		<-cn.eventCh
 	}
-	close(tr.done)    //signal to close conn
-	e := <-cn.eventCh //conn dropped
-	switch e.(type) {
-	case connDroped:
-	default:
-		b.FailNow()
-	}
+	close(tr.done)        //signal to close conn
 	_, ok := <-cn.eventCh //closed chan
 	assert.Equal(b, false, ok)
 }
