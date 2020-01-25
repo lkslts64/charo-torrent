@@ -30,9 +30,9 @@ func (h *HandShake) Do(
 	//check if we are initiator or recipients
 	switch {
 	case h.InfoHash != [20]byte{}:
-		err = h.Receipt(conn, ihashes)
-	default:
 		err = h.Initiate(conn)
+	default:
+		err = h.Receipt(conn, ihashes)
 	}
 	return err
 }
