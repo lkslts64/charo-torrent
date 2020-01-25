@@ -38,9 +38,10 @@ func TestStorage(t *testing.T) {
 	for i := range blocks {
 		blocks[i] = info.PieceLen / blockSize
 	}
-	s := OpenFileStorage(&metainfo.MetaInfo{
+	s, seeding := OpenFileStorage(&metainfo.MetaInfo{
 		Info: info,
 	}, td, blocks, log.New(os.Stdout, "storage", log.LstdFlags))
+	assert.False(t, seeding)
 	piece := 1
 	testParallelWrites(t, s, blockSize, piece)
 	//try to read one block before verification
