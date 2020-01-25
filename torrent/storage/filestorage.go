@@ -31,9 +31,9 @@ type FileStorage struct {
 }
 
 //OpenFileStorage initializes the storage.`blocks` is a slice containing how many
-//blocks each piece has. Surely we can find `blocks` from metainfo but is expensive.
-//if returns true it means all files are complete.
-func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) (*FileStorage, bool) {
+//blocks each piece has. if returns true it means we are ready for seeding
+func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) (fs *FileStorage, seed bool) {
+	//Surely we can find `blocks` from metainfo but is expensive.
 	pieces := make([]*piece, mi.Info.NumPieces())
 	for i := 0; i < len(pieces); i++ {
 		pieces[i] = &piece{
@@ -41,27 +41,33 @@ func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger
 			dirtyBlocks: make(map[int64]struct{}),
 		}
 	}
-	s := &FileStorage{
+	fs = &FileStorage{
 		logger: logger,
 		mi:     mi,
 		dir:    baseDir,
 		pieces: pieces,
 	}
-	return s, s.allFilesComplete()
+	seed = fs.dataComplete() && fs.dataVerified()
+	return
 }
 
-//TODO: this is a very careless way to find if all files are present when loaded
-//and so we should try to verify them.
-func (s *FileStorage) allFilesComplete() bool {
+//check that all files have the required size
+func (s *FileStorage) dataComplete() bool {
 	for _, fi := range s.mi.Info.FilesInfo() {
 		s, err := os.Stat(s.fileInfoName(fi))
 		if err != nil || s.Size() < int64(fi.Len) {
 			return false
 		}
 	}
-	for _, piece := range s.pieces {
-		for i := 0; i < piece.blocks; i++ {
-			piece.reserveOffset(int64(i)) //reserve dummy blocks
+	return true
+}
+
+//check that all pieces are verified
+func (s *FileStorage) dataVerified() bool {
+	//TODO:maybe do this concurently
+	for i := range s.pieces {
+		if !s.hashPiece(i, s.mi.Info.PieceLength(i)) {
+			return false
 		}
 	}
 	return true
@@ -206,7 +212,7 @@ var ErrNotReadyForVerification = errors.New("storage: not all piece's blocks are
 
 //HashPiece hashes `pieceIndex` whose length is `len` and returns if
 //the hash was the expected.
-func (s *FileStorage) HashPiece(pieceIndex int, len int) (correct bool) {
+func (s *FileStorage) HashPiece(pieceIndex, len int) (correct bool) {
 	piece := s.pieces[pieceIndex]
 	if piece.isVerified() {
 		s.logger.Fatal("storage: piece already verified")
@@ -214,7 +220,12 @@ func (s *FileStorage) HashPiece(pieceIndex int, len int) (correct bool) {
 	if !piece.readyForVerification() {
 		s.logger.Fatal(ErrNotReadyForVerification)
 	}
+	return s.hashPiece(pieceIndex, len)
+}
+
+func (s *FileStorage) hashPiece(pieceIndex, len int) (correct bool) {
 	defer func() {
+		piece := s.pieces[pieceIndex]
 		if correct {
 			piece.markComplete()
 		} else {
@@ -234,6 +245,7 @@ func (s *FileStorage) HashPiece(pieceIndex int, len int) (correct bool) {
 		s.logger.Printf("error hasing piece %d\n", pieceIndex)
 	}
 	return
+
 }
 
 func compareHashes(a, b []byte) bool {

@@ -132,18 +132,16 @@ func (p *pieces) rarestStrategy(availablePieces []int) (pc int, ok bool) {
 	return
 }
 
-func (p *pieces) pieceVerified(i int) bool {
+func (p *pieces) pieceSuccesfullyVerified(i int) {
 	p.pcs[i].verificationSuccess()
 	//change strategy after completion of first block
 	if p.ownedPieces.Len() == 0 {
 		p.strategy = p.rarestStrategy
 	}
 	p.ownedPieces.Set(i, true)
-	return p.allVerified()
 }
 
 func (p *pieces) pieceVerificationFailed(i int) {
-	p.t.logger.Printf("piece verification for piece %d failed\n", i)
 	p.pcs[i].verificationFailed()
 	p.dispatchToExpecters()
 }

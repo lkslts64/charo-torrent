@@ -121,6 +121,8 @@ func (t *Torrent) mainLoop() {
 		case cc := <-t.newConnCh: //we established a new connection
 			if !t.addConn(cc) {
 				t.logger.Println("rejected a connection with peer")
+			} else {
+				t.choker.reviewUnchokedPeers()
 			}
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
@@ -162,7 +164,8 @@ func (t *Torrent) parseEvent(e event) {
 	case discardedRequests:
 		t.pieces.addDiscarded(v)
 	case pieceHashed:
-		if t.pieceHashed(v.pieceIndex, v.ok) {
+		t.pieceHashed(v.pieceIndex, v.ok)
+		if t.pieces.allVerified() {
 			t.startSeeding()
 		}
 	case wantBlocks:
@@ -186,13 +189,13 @@ func (t *Torrent) startSeeding() {
 	close(t.downloadedAll)
 }
 
-func (t *Torrent) pieceHashed(i int, correct bool) (allVerified bool) {
+func (t *Torrent) pieceHashed(i int, correct bool) {
 	if correct {
 		t.onPieceDownload(i)
-		return t.pieces.pieceVerified(i)
+		t.pieces.pieceSuccesfullyVerified(i)
+	} else {
+		t.pieces.pieceVerificationFailed(i)
 	}
-	t.pieces.pieceVerificationFailed(i)
-	return false
 }
 
 //this func is started in its own goroutine.
@@ -315,7 +318,7 @@ func (t *Torrent) removeConn(ci *connInfo, index int) {
 func (t *Torrent) writeBlock(data []byte, piece, begin int) error {
 	off := int64(piece*t.mi.Info.PieceLen + begin)
 	n, err := t.storage.WriteBlock(data, off)
-	if n != t.blockRequestSize {
+	if n != len(data) {
 		if errors.Is(err, storage.ErrAlreadyWritten) {
 			//TODO: if not in endgame mode, then panic.
 			t.logger.Printf("attempted to write same block twice")
@@ -440,12 +443,16 @@ func (t *Torrent) gotInfo() {
 	t.stats.Left = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
-	var allComplete bool
-	t.storage, allComplete = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
-	if allComplete {
-		if t.pieces.verifyAll() {
-			t.startSeeding()
+	var seeding bool
+	t.storage, seeding = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	if seeding {
+		//mark all bocks completed and do all apropriate things when a piece
+		//verification is succesfull
+		for i, p := range t.pieces.pcs {
+			p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
+			p.t.pieceHashed(i, true)
 		}
+		t.startSeeding()
 	}
 	//notify conns that we have the info
 	t.broadcastCommand(haveInfo{})
