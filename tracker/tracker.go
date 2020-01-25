@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -58,6 +59,10 @@ type Peer struct {
 	ID   []byte `bencode:"peer id"`
 	IP   net.IP `bencode:"ip"`
 	Port uint16 `bencode:"port"`
+}
+
+func (p *Peer) String() string {
+	return p.IP.String() + ":" + strconv.FormatUint(uint64(p.Port), 10)
 }
 
 type cheapPeers []byte
