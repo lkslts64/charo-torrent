@@ -73,7 +73,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		cl: t.cl,
 		t:  t,
 		//TODO:change logger output to a file
-		logger:    log.New(os.Stdout, string(peerID), log.LstdFlags),
+		logger:    log.New(os.Stdout, fmt.Sprintf("%x", peerID), log.LstdFlags),
 		cn:        cn,
 		state:     newConnState(),
 		commandCh: make(chan interface{}, commandChSize),
@@ -301,6 +301,12 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		})
 	case verifyPiece:
 		correct := c.t.storage.HashPiece(int(v), c.t.pieceLen(uint32(v)))
+		c.logger.Printf("piece #%d verification %s", v, func(correct bool) string {
+			if correct {
+				return "successful"
+			}
+			return "failed"
+		}(correct))
 		err = c.sendPeerEvent(pieceHashed{
 			pieceIndex: int(v),
 			ok:         correct,
@@ -602,7 +608,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		c.sendMsg(ready.reqMsg())
 	}
 	if err := c.t.writeBlock(msg.Block, bl.pc, bl.off); err != nil {
-		return nil
+		return err
 	}
 	return c.sendPeerEvent(downloadedBlock(bl))
 }
