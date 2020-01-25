@@ -9,7 +9,7 @@ type BitField []byte
 
 //how much length a BitField will have if created with numPieces as argument
 func BfLen(numPieces int) int {
-	return int(math.Ceil(float64(numPieces) / 8.0))
+	return int(math.Ceil(float64(numPieces) / 8))
 }
 
 func NewBitField(numPieces int) BitField {
@@ -17,7 +17,7 @@ func NewBitField(numPieces int) BitField {
 }
 
 func (bf BitField) Valid(expectedLen int) bool {
-	return len(bf) != BfLen(expectedLen)
+	return len(bf) == BfLen(expectedLen)
 }
 
 func (bf BitField) HasPiece(i int) bool {
