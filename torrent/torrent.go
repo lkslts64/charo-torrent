@@ -445,6 +445,7 @@ func (t *Torrent) gotInfo() {
 	t.pieces = newPieces(t)
 	var seeding bool
 	t.storage, seeding = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	t.broadcastCommand(haveInfo{})
 	if seeding {
 		//mark all bocks completed and do all apropriate things when a piece
 		//verification is succesfull
@@ -455,7 +456,6 @@ func (t *Torrent) gotInfo() {
 		t.startSeeding()
 	}
 	//notify conns that we have the info
-	t.broadcastCommand(haveInfo{})
 }
 
 func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
