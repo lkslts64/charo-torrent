@@ -1,23 +1,32 @@
 package torrent
 
 import (
-	"math/rand"
+	"errors"
+	"io/ioutil"
+	"log"
 	"net"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/lkslts64/charo-torrent/tracker"
 )
 
 const clientID = "CH"
 const version = "0001"
 
+var reserved [8]byte
+
 //Client manages multiple torrents
 type Client struct {
+	config *Config
 	peerID [20]byte
+	logger *log.Logger
 	//torrents []Torrent
 	//conns    []net.Conn
-	torrents []*Torrent
+	torrents map[[20]byte]*Torrent
 	//torrents map[[20]byte]Torrent
 	//a set of info_hashes that clients is
 	//responsible for - easy access
@@ -26,11 +35,76 @@ type Client struct {
 	//TODO:it is dupicate
 	infoHashes map[[20]byte]struct{}
 	//extensionsSupported map[string]int
-
-	port int16
+	listener net.Listener
+	port     int16
 }
 
-func NewClient(sources []string) (*Client, error) {
+type Config struct {
+	maxOnFlightReqs int //max outstanding requests we allowed for a peer to have
+	maxConns        int
+	maxUploadSlots  int
+	optimisticSlots int
+	//directory to store the data
+	baseDir string
+}
+
+func NewClient(cfg *Config) (*Client, error) {
+	var err error
+	if cfg == nil {
+		cfg, err = defaultConfig()
+		if err != nil {
+			return nil, err
+		}
+	}
+	cl := &Client{
+		peerID:     newPeerID(),
+		config:     cfg,
+		logger:     log.New(os.Stdout, "client", log.LstdFlags),
+		infoHashes: make(map[[20]byte]struct{}),
+		torrents:   make(map[[20]byte]*Torrent),
+	}
+	cl.listen()
+	go cl.accept()
+	return cl, nil
+}
+
+func defaultConfig() (*Config, error) {
+	tdir, err := ioutil.TempDir(os.TempDir(), "")
+	if err != nil {
+		return nil, err
+	}
+	return &Config{
+		maxOnFlightReqs: 250,
+		maxConns:        55,
+		maxUploadSlots:  4,
+		optimisticSlots: 1,
+		baseDir:         tdir,
+	}, nil
+}
+
+//NewTorrentFromFile creates a torrent based on a .torrent file
+func (cl *Client) NewTorrentFromFile(filename string) (*Torrent, error) {
+	t := newTorrent(cl)
+	var err error
+	if t.mi, err = metainfo.LoadMetainfoFile(filename); err != nil {
+		return nil, err
+	}
+	cl.infoHashes[t.mi.Info.Hash] = struct{}{}
+	cl.torrents[t.mi.Info.Hash] = t
+	//TODO: find another way of getting the info bytes, it is expensive
+	//to read and decode the file twice
+	if t.infoRaw, err = t.mi.Info.Bytes(filename); err != nil {
+		return nil, err
+	}
+	t.gotInfo()
+	if t.trackerURL, err = tracker.NewTrackerURL(t.mi.Announce); err != nil {
+		return nil, err
+	}
+	go t.mainLoop()
+	return t, nil
+}
+
+/*func NewClient(sources []string) (*Client, error) {
 	var err error
 	var peerID [20]byte
 	rand.Read(peerID[:])
@@ -43,7 +117,7 @@ func NewClient(sources []string) (*Client, error) {
 	}
 	infoHashes := make(map[[20]byte]struct{})
 	for _, t := range torrents {
-		infoHashes[t.tm.meta.Info.Hash] = struct{}{}
+		infoHashes[t.tm.mi.Info.Hash] = struct{}{}
 	}
 	return &Client{
 		peerID:     peerID,
@@ -52,45 +126,92 @@ func NewClient(sources []string) (*Client, error) {
 	}, nil
 
 }
+*/
 
 //6881-6889
-func (c *Client) listen() error {
+func (cl *Client) listen() error {
 	var i int16
 	var err error
-	var ln net.Listener
+	//var ln net.Listener
 	for i = 6881; i < 6890; i++ {
-		ln, err = net.Listen("tcp", ":"+strconv.Itoa(int(i)))
+		cl.listener, err = net.Listen("tcp", ":"+strconv.Itoa(int(i)))
 		if err == nil {
-			break
+			cl.port = i
+			return nil
 		}
 	}
-	c.port = i
+	return errors.New("could not find port to listen")
+}
+
+func (cl *Client) accept() error {
 	for {
-		conn, err := ln.Accept()
+		conn, err := cl.listener.Accept()
 		if err != nil {
 			//TODO: handle different
-			return err
+			cl.logger.Printf("error accepting conn")
+			continue
 		}
-		go c.handleConn(conn)
+		go cl.handleConn(conn)
 	}
 }
 
-func (c *Client) handleConn(conn net.Conn) {
+func (cl *Client) handleConn(tcpConn net.Conn) {
 	hs := &peer_wire.HandShake{
-		Reserved: [8]byte{5: 0x01}, //support extension proto
-		//InfoHash: [20]byte{},
-		PeerID: c.peerID,
+		Reserved: reserved,
+		PeerID:   cl.peerID,
 	}
-	err := hs.Receipt(conn,c.infoHashes)
+	err := cl.handshake(tcpConn, hs)
 	if err != nil {
-		conn.Close()
+		return
 	}
-	var index int
-	for i, t := range c.torrents {
-		if t.tm.meta.Info.Hash == hs.InfoHash {
-			index = i
-			break
-		}
+	var (
+		t  *Torrent
+		ok bool
+	)
+	if t, ok = cl.torrents[hs.InfoHash]; !ok {
+		panic("we checked that we have this torrent")
 	}
+	cl.startConn(t, tcpConn)
+}
 
+func (cl *Client) connectToPeer(address string, t *Torrent) {
+	tcpConn, err := net.Dial("tcp", address)
+	if err != nil {
+		cl.logger.Printf("cannot dial peer: %s", err)
+	}
+	err = cl.handshake(tcpConn, &peer_wire.HandShake{
+		Reserved: reserved,
+		PeerID:   cl.peerID,
+		InfoHash: t.mi.Info.Hash,
+	})
+	if err != nil {
+		return
+	}
+	tcpConn.SetDeadline(time.Time{})
+	cl.startConn(t, tcpConn)
+}
+
+func (cl *Client) startConn(t *Torrent, tcpConn net.Conn) {
+	newConn(t, tcpConn, cl.peerID[:]).mainLoop()
+}
+
+func (cl *Client) connectToPeers(t *Torrent, peers ...tracker.Peer) {
+	for _, peer := range peers {
+		go cl.connectToPeer(peer.String(), t)
+	}
+}
+
+func (cl *Client) addr() string {
+	return cl.listener.Addr().String()
+}
+
+func (cl *Client) handshake(tcpConn net.Conn, hs *peer_wire.HandShake) error {
+	//dont wait more than 30 secs for handshake
+	tcpConn.SetDeadline(time.Now().Add(30 * time.Second))
+	err := hs.Do(tcpConn, cl.infoHashes)
+	if err != nil {
+		cl.logger.Println(err)
+		tcpConn.Close()
+	}
+	return err
 }
