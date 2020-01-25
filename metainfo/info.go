@@ -108,3 +108,14 @@ func (info *InfoDict) FilesInfo() []File {
 	}
 	return info.Files
 }
+
+func (info *InfoDict) PieceLength(i int) int {
+	if i == info.NumPieces()-1 {
+		return info.TotalLength() % info.PieceLen
+	}
+	return info.PieceLen
+}
+
+func (info *InfoDict) PieceOffset(i int) int64 {
+	return int64(info.PieceLen * i)
+}
