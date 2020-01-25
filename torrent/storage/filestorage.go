@@ -31,8 +31,9 @@ type FileStorage struct {
 }
 
 //OpenFileStorage initializes the storage.`blocks` is a slice containing how many
-//blocks each piece has. Surely we can find `blocks` by metainfo but is expensive.
-func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) *FileStorage {
+//blocks each piece has. Surely we can find `blocks` from metainfo but is expensive.
+//if returns true it means all files are complete.
+func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) (*FileStorage, bool) {
 	pieces := make([]*piece, mi.Info.NumPieces())
 	for i := 0; i < len(pieces); i++ {
 		pieces[i] = &piece{
@@ -40,12 +41,30 @@ func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger
 			dirtyBlocks: make(map[int64]struct{}),
 		}
 	}
-	return &FileStorage{
+	s := &FileStorage{
 		logger: logger,
 		mi:     mi,
 		dir:    baseDir,
 		pieces: pieces,
 	}
+	return s, s.allFilesComplete()
+}
+
+//TODO: this is a very careless way to find if all files are present when loaded
+//and so we should try to verify them.
+func (s *FileStorage) allFilesComplete() bool {
+	for _, fi := range s.mi.Info.FilesInfo() {
+		s, err := os.Stat(s.fileInfoName(fi))
+		if err != nil || s.Size() < int64(fi.Len) {
+			return false
+		}
+	}
+	for _, piece := range s.pieces {
+		for i := 0; i < piece.blocks; i++ {
+			piece.reserveOffset(int64(i)) //reserve dummy blocks
+		}
+	}
+	return true
 }
 
 // Returns EOF on short or missing file.

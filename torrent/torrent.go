@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -67,7 +68,8 @@ type Torrent struct {
 	blockRequestSize int
 
 	//surely we 'll need this
-	done chan struct{}
+	done          chan struct{}
+	downloadedAll chan struct{}
 
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
@@ -88,17 +90,20 @@ type Torrent struct {
 	//length of data to be downloaded
 	length int
 
-	stats *TorrentStats
+	stats TorrentStats
 }
 
 func newTorrent(cl *Client) *Torrent {
 	t := &Torrent{
-		cl:           cl,
-		reqq:         250, //libtorent also has this default
-		done:         make(chan struct{}),
-		events:       make(chan event, maxConns*eventChSize),
-		newConnCh:    make(chan *connChansInfo, maxConns),
-		infoSizeFreq: newFreqMap(),
+		cl:            cl,
+		reqq:          250, //libtorent also has this default
+		done:          make(chan struct{}),
+		events:        make(chan event, maxConns*eventChSize),
+		newConnCh:     make(chan *connChansInfo, maxConns),
+		downloadedAll: make(chan struct{}),
+		infoSizeFreq:  newFreqMap(),
+		stats:         TorrentStats{},
+		logger:        log.New(os.Stdout, "torrent", log.LstdFlags),
 	}
 	t.choker = newChoker(t)
 	return t
@@ -166,11 +171,8 @@ func (t *Torrent) parseEvent(e event) {
 	case bitmap.Bitmap:
 		e.conn.peerBf = v
 		e.conn.reviewInterestsOnBitfield()
-	//before conn goroutine exits, it sends a dropConn event
 	case connDroped:
 		t.droppedConn(e.conn)
-		t.choker.reviewUnchokedPeers()
-
 	}
 }
 
@@ -181,6 +183,7 @@ func (t *Torrent) startSeeding() {
 	for _, c := range t.conns {
 		c.notInterested()
 	}
+	close(t.downloadedAll)
 }
 
 func (t *Torrent) pieceHashed(i int, correct bool) (allVerified bool) {
@@ -193,16 +196,13 @@ func (t *Torrent) pieceHashed(i int, correct bool) (allVerified bool) {
 }
 
 //this func is started in its own goroutine.
-//when we close eventCh of pconn, the goroutine
+//when we close eventCh of conn, the goroutine
 //exits
 func (t *Torrent) aggregateEvents(ci *connInfo) {
-	//if eventCh closes means that connections has been droped
-	defer func() {
-		t.events <- event{ci, connDroped{}}
-	}()
 	for e := range ci.eventCh {
 		t.events <- event{ci, e}
 	}
+	t.events <- event{ci, connDroped{}}
 }
 
 //careful when using this, we might send over nil chan
@@ -240,14 +240,15 @@ func (t *Torrent) sendHaves(i int) {
 
 func (t *Torrent) addConn(cc *connChansInfo) bool {
 	if len(t.conns) >= maxConns {
-		close(cc.drop) //signal that conn should be dropped
+		cc.commandCh <- drop{}
+		//close(cc.drop) //signal that conn should be dropped
 		return false
 	}
 	ci := &connInfo{
 		t:         t,
 		commandCh: cc.commandCh,
 		eventCh:   cc.eventCh,
-		drop:      cc.drop,
+		dropped:   cc.dropped,
 		state:     newConnState(),
 		stats:     newConnStats(),
 	}
@@ -269,21 +270,24 @@ func (t *Torrent) addConn(cc *connChansInfo) bool {
 
 //we would like to drop the conn
 func (t *Torrent) punishConn(i int) {
-	close(t.conns[i].drop)
+	t.conns[i].sendCommand(drop{})
 	t.removeConn(t.conns[i], i)
+	t.choker.reviewUnchokedPeers()
 	//TODO: black list in some way?
 }
 
 //conn notified us that it was dropped
+//returns false if we have already dropped it.
 func (t *Torrent) droppedConn(ci *connInfo) bool {
 	var (
 		i  int
 		ok bool
 	)
 	if i, ok = t.connIndex(ci); !ok {
-		panic("conn dissaperaed")
+		return false
 	}
 	t.removeConn(ci, i)
+	t.choker.reviewUnchokedPeers()
 	return true
 }
 
@@ -436,7 +440,13 @@ func (t *Torrent) gotInfo() {
 	t.stats.Left = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
-	t.storage = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	var allComplete bool
+	t.storage, allComplete = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	if allComplete {
+		if t.pieces.verifyAll() {
+			t.startSeeding()
+		}
+	}
 	//notify conns that we have the info
 	t.broadcastCommand(haveInfo{})
 }
