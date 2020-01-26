@@ -16,9 +16,9 @@ import (
 func TestPieces(t *testing.T) {
 	tr := newTestTorrent(300, 50*(1<<14)+245, 1<<13, 1<<14) //random
 	p := newPieces(tr)
-	pc, ok := p.randomStrategy([]int{423, 43, 53})
+	pc, ok := p.randomStrategy([]int{299, 43, 53})
 	assert.Equal(t, true, ok)
-	assert.Equal(t, true, pc == 423 || pc == 43 || pc == 53)
+	assert.Equal(t, true, pc == 299 || pc == 43 || pc == 53)
 	chSize := 1 << 12
 	ci := &connInfo{
 		commandCh: make(chan interface{}, chSize), //make chan big enough

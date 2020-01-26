@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"sort"
 
@@ -83,6 +84,12 @@ func (p *pieces) dispatch(cn *connInfo) {
 //try to give peerConn `blocksToDispatch` blocks
 func (p *pieces) _dispatch(i int, cn *connInfo, blocksToDispatch int) (remaining int) {
 	unreqBlocks := p.pcs[i].unrequestedBlocksSlc(blocksToDispatch)
+	if blocksToDispatch == 0 {
+		panic("blocksToDispatch == 0")
+	}
+	if len(unreqBlocks) == 0 {
+		panic(fmt.Sprintf("attempt to dispatch from totally requested piece %d,owned pieces: %d", i, p.ownedPieces.Len()))
+	}
 	remaining = blocksToDispatch - len(unreqBlocks)
 	for _, bl := range unreqBlocks {
 		p.pcs[i].addBlockPending(int(bl.off))
@@ -94,7 +101,7 @@ func (p *pieces) _dispatch(i int, cn *connInfo, blocksToDispatch int) (remaining
 func (p *pieces) randomStrategy(availablePieces []int) (pc int, ok bool) {
 	piecesPerm := rand.Perm(len(availablePieces))
 	for _, i := range piecesPerm {
-		if p.pcs[i].allBlocksUnrequested() {
+		if p.pcs[availablePieces[i]].allBlocksUnrequested() {
 			ok = true
 			pc = availablePieces[i]
 			return
