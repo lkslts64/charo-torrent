@@ -153,7 +153,7 @@ func (c *conn) mainLoop() error {
 				return err
 			}
 			c.waitingBlocks = maxOnFlight
-			c.logger.Println("want blocks send")
+			c.logger.Println("want blocks (i.e requests) send")
 		}
 		if c.notUseful() {
 			c.logger.Println("conn is not useful anymore for both ends")
@@ -283,11 +283,13 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		}
 		err = c.sendMsg(v)
 	case []block:
+		c.logger.Printf("got %d requests\n", len(v))
 		c.waitingBlocks -= len(v)
 		var ok, ready bool
 		for _, bl := range v {
-			if ok, ready = c.rq.queue(bl); !ok {
-				panic("received blocks but can't queue them")
+			if ready, ok = c.rq.queue(bl); !ok {
+				c.logger.Fatalf("received blocks but can't queue them. request queuer has %d onFlight and %d pending\n", len(c.rq.onFlight), len(c.rq.pending.blocks))
+				//panic("received blocks but can't queue them")
 			}
 			if ready {
 				c.sendMsg(bl.reqMsg())
