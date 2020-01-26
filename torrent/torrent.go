@@ -70,6 +70,8 @@ type Torrent struct {
 	//surely we 'll need this
 	done          chan struct{}
 	downloadedAll chan struct{}
+	//for displaying the state of torrent and conns
+	displayCh chan chan struct{}
 
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
@@ -90,7 +92,7 @@ type Torrent struct {
 	//length of data to be downloaded
 	length int
 
-	stats TorrentStats
+	stats Stats
 }
 
 func newTorrent(cl *Client) *Torrent {
@@ -101,8 +103,9 @@ func newTorrent(cl *Client) *Torrent {
 		events:        make(chan event, maxConns*eventChSize),
 		newConnCh:     make(chan *connChansInfo, maxConns),
 		downloadedAll: make(chan struct{}),
+		displayCh:     make(chan chan struct{}),
 		infoSizeFreq:  newFreqMap(),
-		stats:         TorrentStats{},
+		stats:         Stats{},
 		logger:        log.New(os.Stdout, "torrent", log.LstdFlags),
 	}
 	t.choker = newChoker(t)
@@ -126,6 +129,12 @@ func (t *Torrent) mainLoop() {
 			}
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
+		//TODO: write info at a writer.
+		case doneDisplaying := <-t.displayCh:
+			for _, c := range t.conns {
+				t.logger.Println(c.String())
+			}
+			close(doneDisplaying)
 		}
 	}
 }
@@ -164,6 +173,7 @@ func (t *Torrent) parseEvent(e event) {
 	case discardedRequests:
 		t.pieces.addDiscarded(v)
 	case pieceHashed:
+		e.conn.stats.onPieceHashed()
 		t.pieceHashed(v.pieceIndex, v.ok)
 		if t.pieces.allVerified() {
 			t.startSeeding()
@@ -177,6 +187,14 @@ func (t *Torrent) parseEvent(e event) {
 	case connDroped:
 		t.droppedConn(e.conn)
 	}
+}
+
+//TODO: change this to WriteStats(w *io.Writer)
+func (t *Torrent) DisplayStats() {
+	//send a chan and wait till the stats are printed i.e the chan is closed by torrent.mainLoop
+	ch := make(chan struct{})
+	t.displayCh <- ch
+	<-ch
 }
 
 func (t *Torrent) startSeeding() {
