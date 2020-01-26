@@ -17,7 +17,7 @@ import (
 const (
 	//the size could be t.reqq?
 	readChSize    = 250
-	eventChSize   = 20
+	eventChSize   = 10
 	commandChSize = eventChSize
 )
 
@@ -289,7 +289,6 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		for _, bl := range v {
 			if ready, ok = c.rq.queue(bl); !ok {
 				c.logger.Fatalf("received blocks but can't queue them. request queuer has %d onFlight and %d pending\n", len(c.rq.onFlight), len(c.rq.pending.blocks))
-				//panic("received blocks but can't queue them")
 			}
 			if ready {
 				c.sendMsg(bl.reqMsg())
@@ -301,6 +300,7 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			Kind: peer_wire.Bitfield,
 			Bf:   c.encodeBitMap(c.myBf),
 		})
+		c.logger.Printf("send bitifeld with length %d\n", c.myBf.Len())
 	case verifyPiece:
 		correct := c.t.storage.HashPiece(int(v), c.t.pieceLen(uint32(v)))
 		c.logger.Printf("piece #%d verification %s", v, func(correct bool) string {
@@ -383,6 +383,7 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		}
 		c.peerBf = *tmp
 		err = c.sendPeerEvent(c.peerBf.Copy())
+		c.logger.Printf("got bitfield with length %d\n", c.peerBf.Len())
 	case peer_wire.Extended:
 		c.onExtended(msg)
 	default:
@@ -429,22 +430,16 @@ func (c *conn) encodeBitMap(bm bitmap.Bitmap) (bf peer_wire.BitField) {
 		bf.SetPiece(piece)
 		return true
 	})
+	c.logger.Printf("encoded bitfield with bits set %d", bf.BitsSet())
 	return
 }
 
 func (c *conn) decodeBitfield(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
-	var bfLen int
 	var bm bitmap.Bitmap
-	if c.haveInfo {
-		numPieces := c.t.numPieces()
-		if !bf.Valid(numPieces) {
-			return nil, errors.New("bf length is not valid")
-		}
-		bfLen = peer_wire.BfLen(numPieces)
-	} else {
-		bfLen = len(bf) * 8
+	if c.haveInfo && !bf.Valid(c.t.numPieces()) {
+		return nil, errors.New("bf length is not valid")
 	}
-	for i := 0; i < bfLen; i++ {
+	for i := 0; i < len(bf)*8; i++ {
 		if bf.HasPiece(i) {
 			bm.Set(i, true)
 		}
