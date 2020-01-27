@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -81,7 +82,7 @@ func (cn *connInfo) have(i int) {
 }
 
 func (cn *connInfo) sendBitfield() {
-	cn.sendCommand(cn.t.pieces.ownedPieces)
+	cn.sendCommand(cn.t.pieces.ownedPieces.Copy())
 }
 
 //manages if we are interested in peer after a sending us bitfield msg
@@ -166,7 +167,18 @@ func (cn *connInfo) rate() float64 {
 		return bytes / dur
 	}
 	if cn.t.seeding {
-		return safeDiv(float64(cn.stats.uploadUseful), float64(cn.durationUploading()))
+		return safeDiv(float64(cn.stats.uploadUsefulBytes), float64(cn.durationUploading()))
 	}
-	return safeDiv(float64(cn.stats.downloadUseful), float64(cn.durationDownloading()))
+	return safeDiv(float64(cn.stats.downloadUsefulBytes), float64(cn.durationDownloading()))
+}
+
+func (cn *connInfo) String() string {
+	return fmt.Sprintf(`peer seeding: %t
+	client interested in %d pieces which peer offers
+	downloading for %s
+	uploading for %s
+	`,
+		cn.peerSeeding(),
+		cn.numWant, cn.durationDownloading().String(),
+		cn.durationUploading().String()) + cn.state.String() + cn.stats.String()
 }

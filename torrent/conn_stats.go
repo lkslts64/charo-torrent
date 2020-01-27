@@ -1,10 +1,18 @@
 package torrent
 
-import "time"
+import (
+	"fmt"
+	"github.com/dustin/go-humanize"
+	"time"
+)
 
 type connStats struct {
-	uploadUseful   int
-	downloadUseful int
+	uploadUsefulBytes   int //TODO:uint64
+	downloadUsefulBytes int //TODO:uint64
+	blocksDownloaded    int
+	blocksUploaded      int
+	//how many pieces this conn has verified (we send verifications jobs to conns).
+	verifications int
 	//initally it holds the time that we first got in `downloading` state
 	lastReceivedPieceMsg time.Time
 	//last time we were interested and peer was unchoking
@@ -32,23 +40,42 @@ func (cs *connStats) stopUploading() {
 }
 
 func (cs *connStats) onBlockDownload(len int) {
-	cs.downloadUseful += len
+	cs.downloadUsefulBytes += len
+	cs.blocksDownloaded++
 	cs.lastReceivedPieceMsg = time.Now()
 }
 
 func (cs *connStats) onBlockUpload(len int) {
-	cs.uploadUseful += len
+	cs.blocksUploaded++
+	cs.uploadUsefulBytes += len
 }
 
+func (cs *connStats) onPieceHashed() {
+	cs.verifications++
+}
+
+//Deprecated
 func (cs *connStats) uploadLimitsReached() bool {
 	//if we have uploaded 200KiB more than downloaded (anacrolix has 100)
-	return cs.uploadUseful-cs.downloadUseful > (1<<10)*200
+	return cs.uploadUsefulBytes-cs.downloadUsefulBytes > (1<<10)*200
 }
 
 func (cs *connStats) isSnubbed() bool {
-	return cs.uploadLimitsReached() || (!cs.lastReceivedPieceMsg.IsZero() && time.Since(cs.lastReceivedPieceMsg) >= time.Minute)
+	return (!cs.lastReceivedPieceMsg.IsZero() && time.Since(cs.lastReceivedPieceMsg) >= time.Minute)
 }
 
 func (cs *connStats) malliciousness() int {
 	return cs.badPiecesContributions - cs.goodPiecesContributions
+}
+
+func (cs *connStats) String() string {
+	return fmt.Sprintf(`bytes downloaded: %s
+	bytes uploaded: %s
+	blocks downloaded: %d 
+	blocks uploaded: %d
+	#verifications: %d`, humanize.Bytes(uint64(cs.downloadUsefulBytes)),
+		humanize.Bytes(uint64(cs.uploadUsefulBytes)),
+		cs.blocksDownloaded,
+		cs.blocksUploaded,
+		cs.verifications)
 }
