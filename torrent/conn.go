@@ -53,12 +53,12 @@ type conn struct {
 	keepAliveTimer *time.Timer
 	rq             *requestQueuer //front size = 10, back = 10
 	peerReqs       map[block]struct{}
+	muPeerReqs     sync.Mutex
 	haveInfo       bool
 	amSeeding      bool
 	//An integer, the number of outstanding request messages this peer supports
 	//without dropping any. The default in in libtorrent is 250.
-	peerReqq   int
-	muPeerReqs sync.Mutex
+	peerReqq int
 	//how many blocks we are waiting to be forwarded to us
 	waitingBlocks int
 	//TODO: we 'll need this later.
@@ -130,7 +130,7 @@ func (c *conn) mainLoop() error {
 		case msg := <-readCh:
 			err = c.parsePeerMsg(msg)
 		case err = <-readErrCh:
-		case <-c.t.done:
+		case <-c.t.drop:
 			return nil
 		case <-c.peerIdle:
 			err = errors.New("peer idle")
@@ -153,7 +153,7 @@ func (c *conn) mainLoop() error {
 				return err
 			}
 			c.waitingBlocks = maxOnFlight
-			c.logger.Println("want blocks (i.e requests) send")
+			//c.logger.Println("want blocks (i.e requests) send")
 		}
 		if c.notUseful() {
 			c.logger.Println("conn is not useful anymore for both ends")
@@ -266,6 +266,9 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			c.state.amInterested = false
 		case peer_wire.Choke:
 			c.state.amChoking = true
+			c.muPeerReqs.Lock()
+			c.peerReqs = make(map[block]struct{})
+			c.muPeerReqs.Unlock()
 		case peer_wire.Unchoke:
 			c.state.amChoking = false
 		case peer_wire.Have:
@@ -283,17 +286,27 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		}
 		err = c.sendMsg(v)
 	case []block:
-		c.logger.Printf("got %d requests\n", len(v))
+		//c.logger.Printf("got %d requests\n", len(v))
+		if !c.state.canDownload() {
+			err = c.sendPeerEvent(discardedRequests(v))
+			return
+		}
 		c.waitingBlocks -= len(v)
 		var ok, ready bool
+		unQueued := []block{}
 		for _, bl := range v {
 			if ready, ok = c.rq.queue(bl); !ok {
-				c.logger.Fatalf("received blocks but can't queue them. request queuer has %d onFlight and %d pending\n", len(c.rq.onFlight), len(c.rq.pending.blocks))
+				unQueued = append(unQueued, bl)
+				c.logger.Printf("received blocks but can't queue them. request queuer has %d onFlight and %d pending\n", len(c.rq.onFlight), len(c.rq.pending.blocks))
 			}
 			if ready {
 				c.sendMsg(bl.reqMsg())
 			}
 		}
+		if len(unQueued) > 0 {
+			err = c.sendPeerEvent(discardedRequests(unQueued))
+		}
+		return
 	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
 		c.myBf = v
 		c.sendMsg(&peer_wire.Msg{
@@ -303,12 +316,12 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		c.logger.Printf("send bitifeld with length %d\n", c.myBf.Len())
 	case verifyPiece:
 		correct := c.t.storage.HashPiece(int(v), c.t.pieceLen(uint32(v)))
-		c.logger.Printf("piece #%d verification %s", v, func(correct bool) string {
+		/*c.logger.Printf("piece #%d verification %s", v, func(correct bool) string {
 			if correct {
 				return "successful"
 			}
 			return "failed"
-		}(correct))
+		}(correct))*/
 		err = c.sendPeerEvent(pieceHashed{
 			pieceIndex: int(v),
 			ok:         correct,
@@ -409,7 +422,7 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 			case c.eventCh <- e:
 				return nil
 			//pretend we lost connection
-			case <-c.t.done:
+			case <-c.t.drop:
 				err = io.EOF
 			case <-c.peerIdle:
 				err = errors.New("peer idle")
@@ -546,6 +559,9 @@ func (c *conn) upload(msg *peer_wire.Msg) error {
 	if err := c.t.readBlock(data, bl.pc, bl.off); err != nil {
 		return nil
 	}
+	if c.state.amChoking {
+		panic("send block while choking")
+	}
 	c.sendMsg(&peer_wire.Msg{
 		Kind:  peer_wire.Piece,
 		Index: msg.Index,
@@ -567,8 +583,13 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	var ready block
 	var ok bool
 	bl := reqMsgToBlock(msg.Request())
+	if c.state.isChoking {
+		panic("received block when choked")
+	}
 	if ready, ok = c.rq.deleteCompleted(bl); !ok {
 		//We didnt' request this piece, but maybe it is useful
+		//panic("unexpected block")
+		return nil
 		c.logger.Printf("received unexpected block %v\n", bl)
 		if !c.haveInfo {
 			return errors.New("peer send piece while we dont have info")
