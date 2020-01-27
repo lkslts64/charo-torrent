@@ -1,15 +1,29 @@
 package torrent
 
-import "github.com/lkslts64/charo-torrent/peer_wire"
+import (
+	"github.com/lkslts64/charo-torrent/peer_wire"
+)
 
 //messages passed to channels
 type msgID int
 
-//jobs can be sent by orchestrator to peer conns
-type job struct {
-	id  jobID
+//jobs can be sent by master to peer conns
+//take a look at conn.go at parseJob func to see
+//what values a command can hold.
+//
+//TODO:maybe change this struct to and a `type` field that
+//identifies the command type (e.g block,bitmap,Msg)
+/*type command struct {
 	val interface{}
-}
+}*/
+
+type haveInfo struct{}
+
+type seeding struct{}
+
+type drop struct{}
+
+type verifyPiece int
 
 type jobID int8
 
@@ -26,7 +40,7 @@ const (
 	request     = jobID(peer_wire.Request)
 	cancel      = jobID(peer_wire.Cancel)
 	metadataExt = iota + 1
-	piece
+	gotMetadata
 )
 
 type eventID int8
@@ -47,7 +61,38 @@ const (
 	piece2
 )
 
-type event struct {
-	id  eventID
-	val interface{}
+//a wrapper for the channels a conn has.
+//
+//Conn sends this struct to master at a special channel as the first message to bootstrap
+//the communication between the two.Initially, master doesn't know about the conn's channs.
+type connChansInfo struct {
+	commandCh chan interface{}
+	eventCh   chan interface{}
+	dropped   chan struct{}
 }
+
+type event struct {
+	//which conn produced this event
+	conn *connInfo
+	val  interface{}
+}
+
+type pieceHashed struct {
+	pieceIndex int
+	ok         bool
+}
+
+type discardedRequests []block
+
+//signals that a block was downloaded
+type downloadedBlock block
+
+//signals that a block was uploaded
+type uploadedBlock block
+
+//signals that a conn was dropped
+type connDroped struct{}
+
+//signals that a conn has space to request some blokcs i.e request queue length
+//is not full.
+type wantBlocks struct{}
