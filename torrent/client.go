@@ -36,7 +36,9 @@ type Client struct {
 	infoHashes map[[20]byte]struct{}
 	//extensionsSupported map[string]int
 	listener net.Listener
-	port     int16
+	//when this channel closes, all Torrents and conns that the client is managing will close.
+	close chan chan struct{}
+	port  int16
 }
 
 type Config struct {
@@ -63,9 +65,27 @@ func NewClient(cfg *Config) (*Client, error) {
 		infoHashes: make(map[[20]byte]struct{}),
 		torrents:   make(map[[20]byte]*Torrent),
 	}
-	cl.listen()
+	if err = cl.listen(); err != nil {
+		return nil, err
+	}
 	go cl.accept()
 	return cl, nil
+}
+
+//drops all torrents that client manages
+func (cl *Client) Close() {
+	chanArr := []chan struct{}{}
+	for range cl.torrents {
+		chanArr = append(chanArr, make(chan struct{}, 1))
+	}
+	//signal all torents to close
+	for i, t := range cl.Torrents() {
+		t.close <- chanArr[i]
+	}
+	//wait until all torrents actually close
+	for i := 0; i < len(cl.torrents); i++ {
+		<-chanArr[i]
+	}
 }
 
 func defaultConfig() (*Config, error) {
@@ -104,6 +124,14 @@ func (cl *Client) NewTorrentFromFile(filename string) (*Torrent, error) {
 	return t, nil
 }
 
+func (cl *Client) Torrents() []*Torrent {
+	ts := []*Torrent{}
+	for _, t := range cl.torrents {
+		ts = append(ts, t)
+	}
+	return ts
+}
+
 /*func NewClient(sources []string) (*Client, error) {
 	var err error
 	var peerID [20]byte
@@ -134,13 +162,18 @@ func (cl *Client) listen() error {
 	var err error
 	//var ln net.Listener
 	for i = 6881; i < 6890; i++ {
-		cl.listener, err = net.Listen("tcp", ":"+strconv.Itoa(int(i)))
+		//we dont support IPv6
+		cl.listener, err = net.Listen("tcp4", ":"+strconv.Itoa(int(i)))
 		if err == nil {
 			cl.port = i
 			return nil
 		}
 	}
-	return errors.New("could not find port to listen")
+	//if none of the BT ports was avaialable, try other ones.
+	if cl.listener, err = net.Listen("tcp4", ":"); err != nil {
+		return errors.New("could not find port to listen")
+	}
+	return nil
 }
 
 func (cl *Client) accept() error {
@@ -185,6 +218,7 @@ func (cl *Client) connectToPeer(address string, t *Torrent) {
 		InfoHash: t.mi.Info.Hash,
 	})
 	if err != nil {
+		cl.logger.Println(err)
 		return
 	}
 	tcpConn.SetDeadline(time.Time{})
@@ -195,9 +229,9 @@ func (cl *Client) startConn(t *Torrent, tcpConn net.Conn) {
 	newConn(t, tcpConn, cl.peerID[:]).mainLoop()
 }
 
-func (cl *Client) connectToPeers(t *Torrent, peers ...tracker.Peer) {
-	for _, peer := range peers {
-		go cl.connectToPeer(peer.String(), t)
+func (cl *Client) connectToPeers(t *Torrent, addresses ...string) {
+	for _, addr := range addresses {
+		go cl.connectToPeer(addr, t)
 	}
 }
 
