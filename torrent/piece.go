@@ -359,28 +359,42 @@ func (p *piece) isPartialyRequested() bool {
 	return p.hasUnrequestedBlocks() && p.hasPendingBlocks()
 }
 
-func changeBlockState(curr, new *bitmap.Bitmap, off int) {
+func changeBlockState(p *piece, curr, new *bitmap.Bitmap, off int) {
 	if !curr.Get(off) {
-		panic("piece: exepcted to find block here")
+		panic(fmt.Sprintf("piece: exepcted to find block here.Instead it is in %s", p.blockState(off)))
 	}
 	curr.Set(off, false)
 	if new.Get(off) {
-		panic("piece: didn't expect to find block here")
+		panic(fmt.Sprintf("piece: didn't expect to find block here. Instead it is in %s", p.blockState(off)))
 	}
 	new.Set(off, true)
 }
 
+func (p *piece) blockState(off int) string {
+	switch {
+	case p.unrequestedBlocks.Get(off):
+		return "unrequested"
+	case p.pendingBlocks.Get(off):
+		return "pending"
+	case p.completeBlocks.Get(off):
+		return "completed"
+	default:
+		return "nowhere"
+	}
+
+}
+
 //assume block was in pending before
 func (p *piece) addBlockUnrequsted(off int) {
-	changeBlockState(&p.pendingBlocks, &p.unrequestedBlocks, off)
+	changeBlockState(p, &p.pendingBlocks, &p.unrequestedBlocks, off)
 }
 
 func (p *piece) addBlockPending(off int) {
-	changeBlockState(&p.unrequestedBlocks, &p.pendingBlocks, off)
+	changeBlockState(p, &p.unrequestedBlocks, &p.pendingBlocks, off)
 }
 
 func (p *piece) markBlockComplete(ci *connInfo, off int) {
-	changeBlockState(&p.pendingBlocks, &p.completeBlocks, off)
+	changeBlockState(p, &p.pendingBlocks, &p.completeBlocks, off)
 	p.contributors = append(p.contributors, ci)
 	if p.complete() {
 		p.sendVerificationJob()
