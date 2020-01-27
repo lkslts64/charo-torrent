@@ -68,7 +68,11 @@ type Torrent struct {
 	blockRequestSize int
 
 	//surely we 'll need this
-	done          chan struct{}
+	done chan struct{}
+	//client sends to this chan when client.Close is called
+	close chan chan struct{}
+	//when close,signals all conns to be dropped
+	drop          chan struct{}
 	downloadedAll chan struct{}
 	//for displaying the state of torrent and conns
 	displayCh chan chan struct{}
@@ -103,7 +107,9 @@ func newTorrent(cl *Client) *Torrent {
 		events:        make(chan event, maxConns*eventChSize),
 		newConnCh:     make(chan *connChansInfo, maxConns),
 		downloadedAll: make(chan struct{}),
+		drop:          make(chan struct{}),
 		displayCh:     make(chan chan struct{}),
+		close:         make(chan chan struct{}),
 		infoSizeFreq:  newFreqMap(),
 		stats:         Stats{},
 		logger:        log.New(os.Stdout, "torrent", log.LstdFlags),
@@ -131,10 +137,22 @@ func (t *Torrent) mainLoop() {
 			t.choker.reviewUnchokedPeers()
 		//TODO: write info at a writer.
 		case doneDisplaying := <-t.displayCh:
+			t.logger.Println(t.stats.String())
+			/*for _, c := range t.conns {
+				t.logger.Println(c.String())
+			}*/
+			close(doneDisplaying)
+		case doneClosing := <-t.close:
+			close(t.drop) //signal conns to close
+			//wait until all conns close and then close `doneClosing`.
 			for _, c := range t.conns {
+				<-c.dropped
+				//TODO:logging when conn closes is bad. find another way to log dropped conns
+				//stats.Maybe hold a droppedConns slice, or maybe dont care about droppedConns?
 				t.logger.Println(c.String())
 			}
-			close(doneDisplaying)
+			close(doneClosing)
+			return
 		}
 	}
 }
@@ -166,10 +184,9 @@ func (t *Torrent) parseEvent(e event) {
 			e.conn.peerBf.Set(int(v.Index), true)
 		}
 	case downloadedBlock:
-		e.conn.stats.onBlockDownload(v.len)
-		t.pieces.pcs[v.pc].markBlockComplete(e.conn, int(v.off))
+		t.blockDownloaded(e.conn, block(v))
 	case uploadedBlock:
-		e.conn.stats.onBlockUpload(v.len)
+		t.blockUploaded(e.conn, block(v))
 	case discardedRequests:
 		t.pieces.addDiscarded(v)
 	case pieceHashed:
@@ -195,6 +212,17 @@ func (t *Torrent) DisplayStats() {
 	ch := make(chan struct{})
 	t.displayCh <- ch
 	<-ch
+}
+
+func (t *Torrent) blockDownloaded(c *connInfo, b block) {
+	c.stats.onBlockDownload(b.len)
+	t.stats.blockDownloaded(b.len)
+	t.pieces.pcs[b.pc].markBlockComplete(c, int(b.off))
+}
+
+func (t *Torrent) blockUploaded(c *connInfo, b block) {
+	c.stats.onBlockUpload(b.len)
+	t.stats.blockUploaded(b.len)
 }
 
 func (t *Torrent) startSeeding() {
@@ -324,6 +352,7 @@ func (t *Torrent) connIndex(ci *connInfo) (int, bool) {
 
 //clear the fields that included the conn
 func (t *Torrent) removeConn(ci *connInfo, index int) {
+	t.logger.Println(ci)
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
 	if t.pieces != nil {
 		if _, ok := t.pieces.requestExpecters[ci]; ok {
@@ -458,7 +487,7 @@ func (t *Torrent) verifyInfoDict() bool {
 //TODO:open storage & create pieces etc.
 func (t *Torrent) gotInfo() {
 	t.length = t.mi.Info.TotalLength()
-	t.stats.Left = t.length
+	t.stats.BytesLeft = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
 	var seeding bool
@@ -471,6 +500,7 @@ func (t *Torrent) gotInfo() {
 			p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
 			p.t.pieceHashed(i, true)
 		}
+		t.stats.BytesLeft, t.stats.BytesDownloaded = t.stats.BytesDownloaded, t.stats.BytesLeft
 		t.startSeeding()
 	}
 	//notify conns that we have the info
@@ -505,9 +535,9 @@ func (t *Torrent) announceTracker(event tracker.Event) (*tracker.AnnounceResp, e
 	req := tracker.AnnounceReq{
 		InfoHash:   t.mi.Info.Hash,
 		PeerID:     peerID,
-		Downloaded: int64(t.stats.Downloaded),
-		Left:       int64(t.stats.Left),
-		Uploaded:   int64(t.stats.Uploaded),
+		Downloaded: int64(t.stats.BytesDownloaded),
+		Left:       int64(t.stats.BytesLeft),
+		Uploaded:   int64(t.stats.BytesUploaded),
 		Event:      event,
 		Numwant:    -1,
 		Port:       t.cl.port,
