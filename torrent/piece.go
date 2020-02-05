@@ -2,162 +2,217 @@ package torrent
 
 import (
 	"errors"
-	"fmt"
 	"math/rand"
 	"sort"
+	"sync"
 
+	"github.com/RoaringBitmap/roaring"
 	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
-//The strategy for piece picking.In order for a piece to be picked, all piece's blocks
+//The strategy for piece picking. In order for a piece to be picked, all piece's blocks
 //should be unrequested.Selects a piece for a conn to download.
 //'ok' set to false means no piece in peerPieces has all blocks unrequested,
 //so we cant pick any.
-type requestStrategy func(availablePieces []int) (pc int, ok bool)
+//
+//The elemnts in the provided slice will be rearranged according to the strategy in use.
+type requestStrategy func(pieces []int)
 
 //TODO:reconsider how we store pcs - maybe a map would be better?
 //and store them depending on their state (dispatched,unrequested etc).
 type pieces struct {
-	t   *Torrent
-	pcs []*piece
+	t *Torrent
+	//every conn can call getRequests and discardRequests.This mutex protects the fields
+	//that these methods access.
+	mu                 sync.Mutex
+	pcs                []*piece
+	unrequested        bitmap.Bitmap
+	partiallyRequested bitmap.Bitmap
 	//random until we get the first piece, rarest onwards
-	strategy requestStrategy
-	//cache of downloaded pieces - dont ask db every time
+	//TODO:maybe pick one by one? insteadof sorting or permute every time?
+	strategy    requestStrategy
 	ownedPieces bitmap.Bitmap
-	//conns that want requests but we couldn't give them when they asked us.
-	//we need in case we did't have anything unrequested but something happened
-	// (e.g a piece verification failed or we droped a piece) and we need to forward requests
-	//again.
-	//when a conn is dropped, it is removed from here too.
-	requestExpecters map[*connInfo]struct{}
 }
 
+//TODO:add allVerified boolean at constructor parameter
 func newPieces(t *Torrent) *pieces {
 	numPieces := int(t.numPieces())
+	//TODO:shuffle pieces
 	pcs := make([]*piece, numPieces)
 	for i := 0; i < numPieces; i++ {
 		pcs[i] = newPiece(t, i)
 	}
+	var (
+		unrequested bitmap.Bitmap
+	)
+	unrequested.AddRange(0, t.numPieces())
 	p := &pieces{
-		t:                t,
-		pcs:              pcs,
-		requestExpecters: make(map[*connInfo]struct{}),
+		t:                  t,
+		pcs:                pcs,
+		unrequested:        unrequested,
+		partiallyRequested: bitmap.Bitmap{RB: roaring.NewBitmap()},
 	}
-	p.strategy = p.randomStrategy
+	p.strategy = shuffle
 	return p
 }
 
-//First dispatch blocks of pieces that have been already partially dispatched (if any and if
-//peer behind `cn` has the pieces).These blocks have priority because if we have one block
-//from a piece, then we want the rest blocks of this piece sooner that the others in order to
-//start uploading sooner.
-//Dispatch `maxOnFlight` blocks to connection
-func (p *pieces) dispatch(cn *connInfo) {
-	//availablePieces := bitmap.Flip(cn.peerBf, 0, p.t.numPieces()).ToSortedSlice()
-	availablePieces := cn.peerBf.ToSortedSlice()
-	remaining := maxOnFlight
-	for _, i := range availablePieces {
-		if p.pcs[i].isPartialyRequested() {
-			if remaining = p._dispatch(i, cn, remaining); remaining == 0 {
-				return
-			}
-		}
-	}
-	var (
-		pc int
-		ok bool
-	)
-	for {
-		if pc, ok = p.strategy(availablePieces); !ok {
-			//we didn't manage to give conn as much requests as wanted.
-			//Howerver,we might give in the future
-			p.requestExpecters[cn] = struct{}{}
-			return
-		}
-		if remaining = p._dispatch(pc, cn, remaining); remaining == 0 {
-			return
-		}
-	}
+func (p *pieces) onHave(i int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pcs[i].rarity++
 }
 
-//try to give peerConn `blocksToDispatch` blocks
-func (p *pieces) _dispatch(i int, cn *connInfo, blocksToDispatch int) (remaining int) {
-	unreqBlocks := p.pcs[i].unrequestedBlocksSlc(blocksToDispatch)
-	if blocksToDispatch == 0 {
-		panic("blocksToDispatch == 0")
-	}
-	if len(unreqBlocks) == 0 {
-		panic(fmt.Sprintf("attempt to dispatch from totally requested piece %d,owned pieces: %d", i, p.ownedPieces.Len()))
-	}
-	remaining = blocksToDispatch - len(unreqBlocks)
-	for _, bl := range unreqBlocks {
-		p.pcs[i].addBlockPending(int(bl.off))
-	}
-	cn.sendCommand(unreqBlocks)
-	return
+func (p *pieces) onBitfield(bm bitmap.Bitmap) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	bm.IterTyped(func(piece int) bool {
+		p.pcs[piece].rarity++
+		return true
+	})
 }
 
-func (p *pieces) randomStrategy(availablePieces []int) (pc int, ok bool) {
-	piecesPerm := rand.Perm(len(availablePieces))
-	for _, i := range piecesPerm {
-		if p.pcs[availablePieces[i]].allBlocksUnrequested() {
-			ok = true
-			pc = availablePieces[i]
-			return
-		}
-	}
-	return
-}
-
-func (p *pieces) rarestStrategy(availablePieces []int) (pc int, ok bool) {
-	conns := p.t.conns
-	fmap := make(freqMap)
-	unrequestedPieces := []int{}
-	for _, i := range availablePieces {
-		if p.pcs[i].allBlocksUnrequested() {
-			fmap.initKey(int64(i))
-			unrequestedPieces = append(unrequestedPieces, i)
-		}
-	}
-	if len(unrequestedPieces) == 0 {
+func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	//first fill with blocks that we already have requested and if they
+	//are not sufficient, fill with the fully unrequested ones.
+	pieces := bitmap.Bitmap{RB: roaring.And(peerPieces.RB, p.partiallyRequested.RB)}.ToSortedSlice()
+	if n = p.fillWithRequests(pieces, requests); n == len(requests) {
+		//got as many requests as asked for
 		return
 	}
-	for _, c := range conns {
-		//seeders can't help to determine the rarest piece
-		if c.peerSeeding() {
-			continue
+	pieces = bitmap.Bitmap{RB: roaring.And(peerPieces.RB, p.unrequested.RB)}.ToSortedSlice()
+	//prioritize piece picking by our current strategy
+	p.strategy(pieces)
+	n += p.fillWithRequests(pieces, requests[n:])
+	return
+}
+
+//fills the provided slice with requests. Returns how many were filled.
+func (p *pieces) fillWithRequests(pieces []int, requests []block) (n int) {
+	var unreq []block
+	total, _n := len(requests), 0
+	for _, i := range pieces {
+		piece := p.pcs[i]
+		unreq = piece.unrequestedBlocksSlc(len(requests))
+		for _, b := range unreq {
+			p.addBlockPending(b.pc, b.off)
 		}
-		for _, i := range unrequestedPieces {
-			if c.peerBf.Get(i) {
-				fmap.add(int64(i))
-			}
+		_n = copy(requests, unreq)
+		n += _n
+		if n > total {
+			panic("read requests")
+		}
+		if n == total {
+			//got as many requests as asked for
+			return
+		}
+		requests = requests[_n:]
+	}
+	return
+}
+
+//pick the rarest pieces first.
+//store results in pieces arg.
+func (p *pieces) sortByRarity(pieces []int) {
+	unreq := make([]*piece, len(pieces))
+	for i := 0; i < len(unreq); i++ {
+		unreq[i] = p.pcs[pieces[i]]
+	}
+	sort.Slice(unreq, func(i, j int) bool {
+		return unreq[i].rarity < unreq[j].rarity
+	})
+	for i, p := range unreq {
+		pieces[i] = p.index
+	}
+}
+
+//pick randomly
+func shuffle(pieces []int) {
+	_pieces := make([]int, len(pieces))
+	copy(_pieces, pieces)
+	perm := rand.Perm(len(pieces))
+	for i, randPieceIndex := range perm {
+		pieces[i] = _pieces[randPieceIndex]
+	}
+}
+
+/*
+// Insertion sort
+func insertionSort(data Interface, a, b int) {
+	for i := a + 1; i < b; i++ {
+		for j := i; j > a && data.Less(j, j-1); j-- {
+			data.Swap(j, j-1)
 		}
 	}
-	pc = int(fmap.pickRandom(fmap[fmap.min()]))
-	ok = true
-	return
+}
+*/
+
+func (p *pieces) discardRequests(requests []block) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, req := range requests {
+		p.addBlockUnrequsted(req.pc, req.off)
+	}
+}
+
+func (p *pieces) markBlockComplete(i int, off int, ci *connInfo) {
+	piece := p.pcs[i]
+	p.mu.Lock()
+	piece.markBlockComplete(ci, off)
+	p.reviewPieceState(i)
+	p.mu.Unlock()
+	if piece.complete() {
+		p.t.queuePieceForHashing(i)
+	}
+}
+
+func (p *pieces) addBlockUnrequsted(i, off int) {
+	piece := p.pcs[i]
+	if piece.addBlockUnrequsted(off) {
+		p.reviewPieceState(i)
+	}
+}
+
+func (p *pieces) addBlockPending(i, off int) {
+	piece := p.pcs[i]
+	if piece.addBlockPending(off) {
+		p.reviewPieceState(i)
+	}
+}
+
+func (p *pieces) reviewPieceState(i int) {
+	var partially, unrequested bool
+	switch piece := p.pcs[i]; {
+	case piece.allBlocksUnrequested():
+		unrequested = true
+	case piece.isPartialyRequested():
+		partially = true
+	default:
+	}
+	p.unrequested.Set(i, unrequested)
+	p.partiallyRequested.Set(i, partially)
 }
 
 func (p *pieces) pieceSuccesfullyVerified(i int) {
 	p.pcs[i].verificationSuccess()
 	//change strategy after completion of first block
 	if p.ownedPieces.Len() == 0 {
-		p.strategy = p.rarestStrategy
+		func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.strategy = p.sortByRarity
+		}()
 	}
 	p.ownedPieces.Set(i, true)
 }
 
 func (p *pieces) pieceVerificationFailed(i int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.pcs[i].verificationFailed()
-	p.dispatchToExpecters()
-}
-
-//try to forward blocks to conns that wanted blocks in the past
-func (p *pieces) dispatchToExpecters() {
-	for c := range p.requestExpecters {
-		p.dispatch(c)
-	}
+	p.reviewPieceState(i)
 }
 
 //return a slice containing how many blocks a piece has.
@@ -185,19 +240,6 @@ func (p *pieces) allVerified() bool {
 		}
 	}
 	return true
-}
-
-//these blocks should be at pending state.
-//delete them before adding to unrequested.
-//Usually, we should avoid a call to this func.
-//We should optimize and give another peer the
-//unsatisfied reqs instead of adding them and
-//forwarding them again
-func (p *pieces) addDiscarded(bls []block) {
-	for _, bl := range bls {
-		p.pcs[bl.pc].addBlockUnrequsted(int(bl.off))
-	}
-	p.dispatchToExpecters()
 }
 
 func (p *pieces) hasUnrequestedBlocks() bool {
@@ -235,6 +277,7 @@ type piece struct {
 	//num of blocks
 	blocks       int
 	lastBlockLen int
+	rarity       int
 	//keeps track of which blocks are not requested for download
 	unrequestedBlocks bitmap.Bitmap
 	//keeps track of which blocks are pending for download
@@ -314,15 +357,6 @@ func (p *piece) toBlock(off int) block {
 		len: p.blockLen(off),
 	}
 }
-
-/*func (p *piece) unrequestedToBlockQueue() *blockQueue {
-	bq := newBlockQueue(p.blocks) //don't limit length of queue
-	for off := range p.unrequestedBlocks.ToSortedSlice() {
-		bq.push(p.toBlock(off))
-	}
-	return bq
-}*/
-
 func (p *piece) unrequestedBlocksSlc(limit int) (blocks []block) {
 	count := 0
 	p.unrequestedBlocks.IterTyped(func(off int) bool {
@@ -336,83 +370,62 @@ func (p *piece) unrequestedBlocksSlc(limit int) (blocks []block) {
 	return
 }
 
-/*func (p *Piece) addBlockDownloaded(bl *block) {
-	if _, ok := p.pendingBlocks[bl.off]; ok {
-		panic("block already downloaded")
-	}
-	p.downloadedBlocks[bl.off] = struct{}{}
-}*/
-
 func (p *piece) allBlocksUnrequested() bool {
 	return p.unrequestedBlocks.Len() == p.blocks
-}
-
-func (p *piece) hasPendingBlocks() bool {
-	return p.pendingBlocks.Len() > 0
 }
 
 func (p *piece) hasUnrequestedBlocks() bool {
 	return p.unrequestedBlocks.Len() > 0
 }
-
-func (p *piece) isPartialyRequested() bool {
-	return p.hasUnrequestedBlocks() && p.hasPendingBlocks()
+func (p *piece) hasPendingBlocks() bool {
+	return p.pendingBlocks.Len() > 0
 }
 
-func changeBlockState(p *piece, curr, new *bitmap.Bitmap, off int) {
-	if !curr.Get(off) {
-		panic(fmt.Sprintf("piece: exepcted to find block here.Instead it is in %s", p.blockState(off)))
-	}
+func (p *piece) hasCompletedBlocks() bool {
+	return p.completeBlocks.Len() > 0
+}
+
+func (p *piece) isPartialyRequested() bool {
+	return p.hasUnrequestedBlocks() && (p.hasPendingBlocks() || p.hasCompletedBlocks())
+}
+
+func changeBlockState(curr, new *bitmap.Bitmap, off int) {
 	curr.Set(off, false)
-	if new.Get(off) {
-		panic(fmt.Sprintf("piece: didn't expect to find block here. Instead it is in %s", p.blockState(off)))
-	}
 	new.Set(off, true)
 }
 
-func (p *piece) blockState(off int) string {
-	switch {
-	case p.unrequestedBlocks.Get(off):
-		return "unrequested"
-	case p.pendingBlocks.Get(off):
-		return "pending"
-	case p.completeBlocks.Get(off):
-		return "completed"
-	default:
-		return "nowhere"
-	}
-
-}
-
 //assume block was in pending before
-func (p *piece) addBlockUnrequsted(off int) {
-	changeBlockState(p, &p.pendingBlocks, &p.unrequestedBlocks, off)
-}
-
-func (p *piece) addBlockPending(off int) {
-	changeBlockState(p, &p.unrequestedBlocks, &p.pendingBlocks, off)
-}
-
-func (p *piece) markBlockComplete(ci *connInfo, off int) {
-	changeBlockState(p, &p.pendingBlocks, &p.completeBlocks, off)
-	p.contributors = append(p.contributors, ci)
-	if p.complete() {
-		p.sendVerificationJob()
+//returns whether we modified state
+func (p *piece) addBlockUnrequsted(off int) bool {
+	//if another conn got the block, there is nothing to do.
+	if !p.completeBlocks.Get(off) {
+		changeBlockState(&p.pendingBlocks, &p.unrequestedBlocks, off)
+		return true
 	}
+	return false
+}
+
+//returns whether we modified state
+func (p *piece) addBlockPending(off int) bool {
+	//if another conn got the block, there is nothing to do.
+	if !p.completeBlocks.Get(off) {
+		changeBlockState(&p.unrequestedBlocks, &p.pendingBlocks, off)
+		return true
+	}
+	return false
+}
+
+//TODO: assert some things
+func (p *piece) markBlockComplete(ci *connInfo, off int) {
+	p.completeBlocks.Set(off, true)
+	p.pendingBlocks.Set(off, false)
+	//offset could be in unrequested if we received an unexpected block
+	p.unrequestedBlocks.Set(off, false)
+	p.contributors = append(p.contributors, ci)
 }
 
 func (p *piece) complete() bool {
-	return p.completeBlocks.Len() == int(p.blocks)
-}
-
-func (p *piece) sendVerificationJob() {
-	//give the conn with the worst download rate the verification job
-	_conns := make([]*connInfo, len(p.t.conns))
-	copy(_conns, p.t.conns)
-	sort.Sort(byRate(_conns))
-	worse := _conns[len(_conns)-1]
-	hp := verifyPiece(p.index)
-	worse.sendCommand(hp)
+	return p.completeBlocks.Len() == p.blocks
 }
 
 func (p *piece) verificationFailed() {
@@ -427,6 +440,9 @@ func (p *piece) verificationFailed() {
 }
 
 func (p *piece) verificationSuccess() {
+	if p.verified {
+		panic("already verified")
+	}
 	p.verified = true
 	for _, c := range p.contributors {
 		c.stats.goodPiecesContributions++

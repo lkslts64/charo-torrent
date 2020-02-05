@@ -2,10 +2,10 @@ package torrent
 
 import (
 	"log"
-	"math/rand"
 	"os"
 	"testing"
 
+	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,7 +13,7 @@ import (
 
 //TODO:maybe create a benchmark for the dispatching time
 
-func TestPieces(t *testing.T) {
+/*func TestPieces(t *testing.T) {
 	tr := newTestTorrent(300, 50*(1<<14)+245, 1<<13, 1<<14) //random
 	p := newPieces(tr)
 	pc, ok := p.randomStrategy([]int{299, 43, 53})
@@ -65,19 +65,50 @@ func TestPieces(t *testing.T) {
 	default:
 		t.Fail()
 	}
+}*/
+
+func TestPieces(t *testing.T) {
+	tr := newTestTorrent(300, 10*(1<<14)+245, 1<<13, 1<<14)
+	p := newPieces(tr)
+	var bm bitmap.Bitmap
+	bm.Add(1, 29, 30)
+	reqs := make([]block, maxOnFlight)
+	n := p.getRequests(bm, reqs)
+	reqs = reqs[:n]
+	assert.EqualValues(t, maxOnFlight, n)
+	for _, req := range reqs {
+		assert.True(t, p.pcs[req.pc].pendingBlocks.Get(req.off))
+		assert.True(t, req.pc == 1 || req.pc == 29 || req.pc == 30)
+	}
+	//based on blocks per piece
+	assert.Equal(t, tr.numPieces()-1, p.partiallyRequested.Len()+p.unrequested.Len())
+	assert.Equal(t, 1, p.partiallyRequested.Len())
+	assert.Equal(t, tr.numPieces()-2, p.unrequested.Len())
+	p.discardRequests(reqs)
+	for _, p := range p.pcs {
+		assert.True(t, p.allBlocksUnrequested())
+	}
+	assert.Equal(t, 0, p.partiallyRequested.Len())
+	assert.Equal(t, tr.numPieces(), p.unrequested.Len())
 }
 
 func TestRarestStrategy(t *testing.T) {
 	tr := newTestTorrent(40, 1*(1<<14)+1, 5*1<<12, 1<<13) //random
 	p := newPieces(tr)
-	ci, ci2, ci3 := &connInfo{t: tr}, &connInfo{t: tr}, &connInfo{t: tr}
+	for i, piece := range p.pcs {
+		piece.rarity = len(p.pcs) - i
+	}
+	//ci, ci2, ci3 := &connInfo{t: tr}, &connInfo{t: tr}, &connInfo{t: tr}
 	//peers ci & c2 have pieces {0,1} so piece 2 is the rarest
-	ci.peerBf.Add(0, 1)
-	ci2.peerBf.Add(0, 1)
-	tr.conns = append(tr.conns, ci, ci2, ci3)
-	pc, ok := p.rarestStrategy([]int{0, 1, 2})
-	assert.Equal(t, true, ok)
-	assert.Equal(t, 2, pc)
+	//ci.peerBf.Add(0, 1)
+	//ci2.peerBf.Add(0, 1)
+	//tr.conns = append(tr.conns, ci, ci2, ci3)
+	pieces := []int{0, 1, 2}
+	p.sortByRarity(pieces)
+	//assert.Equal(t, true, ok)
+	assert.Equal(t, 2, pieces[0])
+	assert.Equal(t, 1, pieces[1])
+	assert.Equal(t, 0, pieces[2])
 }
 
 func TestPiece(t *testing.T) {
