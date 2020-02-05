@@ -10,8 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RoaringBitmap/roaring"
 	"github.com/anacrolix/missinggo/bitmap"
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/lkslts64/charo-torrent/torrent/storage"
 )
 
 const (
@@ -51,16 +53,17 @@ type conn struct {
 	dropped        chan struct{}
 	peerIdle       chan struct{}
 	keepAliveTimer *time.Timer
-	rq             *requestQueuer //front size = 10, back = 10
 	peerReqs       map[block]struct{}
+	onFlightReqs   map[block]struct{}
 	muPeerReqs     sync.Mutex
 	haveInfo       bool
 	amSeeding      bool
+
+	//
+	debugVerifications int
 	//An integer, the number of outstanding request messages this peer supports
 	//without dropping any. The default in in libtorrent is 250.
 	peerReqq int
-	//how many blocks we are waiting to be forwarded to us
-	waitingBlocks int
 	//TODO: we 'll need this later.
 	peerBf bitmap.Bitmap
 	myBf   bitmap.Bitmap
@@ -73,15 +76,16 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		cl: t.cl,
 		t:  t,
 		//TODO:change logger output to a file
-		logger:    log.New(os.Stdout, fmt.Sprintf("%x", peerID), log.LstdFlags),
-		cn:        cn,
-		state:     newConnState(),
-		commandCh: make(chan interface{}, commandChSize),
-		eventCh:   make(chan interface{}, eventChSize),
-		dropped:   make(chan struct{}),
-		peerIdle:  make(chan struct{}),
-		rq:        newRequestQueuer(),
-		peerReqs:  make(map[block]struct{}),
+		logger:       log.New(os.Stdout, fmt.Sprintf("%x", peerID), log.LstdFlags),
+		cn:           cn,
+		state:        newConnState(),
+		commandCh:    make(chan interface{}, commandChSize),
+		eventCh:      make(chan interface{}, eventChSize),
+		dropped:      make(chan struct{}),
+		peerIdle:     make(chan struct{}),
+		onFlightReqs: make(map[block]struct{}),
+		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
+		peerReqs:     make(map[block]struct{}),
 	}
 	//inform others about the new conn
 	t.newConnCh <- &connChansInfo{
@@ -95,6 +99,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 func (c *conn) close() {
 	c.cn.Close()
 	//close chan - avoid leak goroutines
+	c.discardBlocks()
 	close(c.eventCh)
 	//notify Torrent that conn closed
 	close(c.dropped)
@@ -123,6 +128,8 @@ func (c *conn) mainLoop() error {
 		return err
 	}
 	c.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
+	debugTick := time.NewTicker(2 * time.Second)
+	defer debugTick.Stop()
 	for {
 		select {
 		case cmd := <-c.commandCh:
@@ -137,6 +144,10 @@ func (c *conn) mainLoop() error {
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
+		case <-debugTick.C:
+			if len(c.onFlightReqs) > 0 {
+				c.logger.Printf("onFlight: %d canDownload: %t\n", len(c.onFlightReqs), c.state.canDownload())
+			}
 		}
 		if err != nil {
 			switch err = nilOnEOF(err); err {
@@ -147,18 +158,11 @@ func (c *conn) mainLoop() error {
 			}
 			return err
 		}
-		if c.wantBlocks() {
-			err = c.sendPeerEvent(wantBlocks{})
-			if err != nil {
-				return err
-			}
-			c.waitingBlocks = maxOnFlight
-			//c.logger.Println("want blocks (i.e requests) send")
-		}
 		if c.notUseful() {
 			c.logger.Println("conn is not useful anymore for both ends")
 			return nil
 		}
+		//c.sendRequests()
 	}
 }
 
@@ -196,8 +200,9 @@ loop:
 				//our buffer is full.
 				switch _, ok := c.peerReqs[b]; {
 				case ok:
-					c.logger.Printf("peer send duplicate request for block %v\n", b)
+					duplicateRequestsReceived.Inc()
 				case len(c.peerReqs) >= c.t.reqq:
+					//should we drop?
 					c.logger.Print("peer requests buffer is full\n")
 				default: //all good
 					c.peerReqs[b] = struct{}{}
@@ -230,7 +235,29 @@ loop:
 }
 
 func (c *conn) wantBlocks() bool {
-	return c.state.canDownload() && c.waitingBlocks == 0 && c.rq.needMore()
+	return c.haveInfo && c.state.canDownload() && len(c.onFlightReqs) < maxOnFlight/2
+}
+
+func (c *conn) sendRequests() {
+	if c.wantBlocks() {
+		requests := make([]block, maxOnFlight)
+		n := c.t.pieces.getRequests(c.peerBf, requests)
+		if n == 0 {
+			if (requests[0] != block{}) {
+				panic("send requests")
+			}
+			nonUsefulRequestReads.Inc()
+			return
+		}
+		requests = requests[:n]
+		for _, req := range requests {
+			if _, ok := c.onFlightReqs[req]; ok {
+				continue
+			}
+			c.onFlightReqs[req] = struct{}{}
+			c.sendMsg(req.reqMsg())
+		}
+	}
 }
 
 //returns true if its worth to keep the conn alive
@@ -262,8 +289,14 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		switch v.Kind {
 		case peer_wire.Interested:
 			c.state.amInterested = true
+			defer c.sendRequests()
+			//c.sendRequests()
 		case peer_wire.NotInterested:
 			c.state.amInterested = false
+			lostBlocksDueToSync.Add(uint64(len(c.onFlightReqs)))
+			//due to inconsistent states between Torrent and conn we may have onFlightReqs
+			//which we'll be lost (hopefully I think this doesn't happen too much)
+			c.discardBlocks()
 		case peer_wire.Choke:
 			c.state.amChoking = true
 			c.muPeerReqs.Lock()
@@ -285,36 +318,14 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			}
 		}
 		err = c.sendMsg(v)
-	case []block:
-		//c.logger.Printf("got %d requests\n", len(v))
-		if !c.state.canDownload() {
-			err = c.sendPeerEvent(discardedRequests(v))
-			return
-		}
-		c.waitingBlocks -= len(v)
-		var ok, ready bool
-		unQueued := []block{}
-		for _, bl := range v {
-			if ready, ok = c.rq.queue(bl); !ok {
-				unQueued = append(unQueued, bl)
-				c.logger.Printf("received blocks but can't queue them. request queuer has %d onFlight and %d pending\n", len(c.rq.onFlight), len(c.rq.pending.blocks))
-			}
-			if ready {
-				c.sendMsg(bl.reqMsg())
-			}
-		}
-		if len(unQueued) > 0 {
-			err = c.sendPeerEvent(discardedRequests(unQueued))
-		}
-		return
 	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
 		c.myBf = v
 		c.sendMsg(&peer_wire.Msg{
 			Kind: peer_wire.Bitfield,
 			Bf:   c.encodeBitMap(c.myBf),
 		})
-		c.logger.Printf("send bitifeld with length %d\n", c.myBf.Len())
 	case verifyPiece:
+		//c.logger.Printf("going to verify piece #%d\n", v)
 		correct := c.t.storage.HashPiece(int(v), c.t.pieceLen(uint32(v)))
 		/*c.logger.Printf("piece #%d verification %s", v, func(correct bool) string {
 			if correct {
@@ -326,6 +337,8 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			pieceIndex: int(v),
 			ok:         correct,
 		})
+	case requestsAvailable:
+		c.sendRequests()
 	case haveInfo:
 		c.haveInfo = true
 	case seeding:
@@ -357,33 +370,37 @@ func (c *conn) sendMsg(msg *peer_wire.Msg) error {
 }
 
 func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
-	stateChange := func(currState, futureState bool) (bool, error) {
-		if currState == futureState {
-			return futureState, nil
+	stateChange := func(currState *bool, futureState bool) error {
+		if *currState == futureState {
+			return nil
 		}
-		return futureState, c.sendPeerEvent(msg)
+		*currState = futureState
+		return c.sendPeerEvent(msg)
 	}
 	switch msg.Kind {
 	case peer_wire.KeepAlive, peer_wire.Port:
 	case peer_wire.Interested:
-		c.state.isInterested, err = stateChange(c.state.isInterested, true)
+		err = stateChange(&c.state.isInterested, true)
 	case peer_wire.NotInterested:
-		c.state.isInterested, err = stateChange(c.state.isInterested, false)
+		err = stateChange(&c.state.isInterested, false)
 	case peer_wire.Choke:
-		c.state.isChoking, err = stateChange(c.state.isChoking, true)
-		err = c.discardBlocks()
+		c.discardBlocks()
+		err = stateChange(&c.state.isChoking, true)
 	case peer_wire.Unchoke:
-		c.state.isChoking, err = stateChange(c.state.isChoking, false)
+		err = stateChange(&c.state.isChoking, false)
+		c.sendRequests()
 	case peer_wire.Piece:
 		err = c.onPieceMsg(msg)
 	case peer_wire.Request:
 		err = c.upload(msg)
 	case peer_wire.Have:
 		if c.peerBf.Get(int(msg.Index)) {
-			c.logger.Printf("peer send duplicate Have msg of piece %d\n", msg.Index)
+			//c.logger.Printf("peer send duplicate Have msg of piece %d\n", msg.Index)
+			err = errors.New("peer send duplicate Have msg of piece")
 			return
 		}
 		c.peerBf.Set(int(msg.Index), true)
+		c.t.pieces.onHave(int(msg.Index))
 		err = c.sendPeerEvent(msg)
 	case peer_wire.Bitfield:
 		if !c.peerBf.IsEmpty() {
@@ -395,8 +412,8 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 			return
 		}
 		c.peerBf = *tmp
+		c.t.pieces.onBitfield(c.peerBf)
 		err = c.sendPeerEvent(c.peerBf.Copy())
-		c.logger.Printf("got bitfield with length %d\n", c.peerBf.Len())
 	case peer_wire.Extended:
 		c.onExtended(msg)
 	default:
@@ -443,7 +460,6 @@ func (c *conn) encodeBitMap(bm bitmap.Bitmap) (bf peer_wire.BitField) {
 		bf.SetPiece(piece)
 		return true
 	})
-	c.logger.Printf("encoded bitfield with bits set %d", bf.BitsSet())
 	return
 }
 
@@ -470,11 +486,6 @@ func isClosed(ch chan struct{}) bool {
 		return false
 	}
 }
-
-/*//we should have metadata in order to call this
-func (pc *conn) peerBitFieldValid() bool {
-	return pc.peerBf.Valid(pc.t.tm.mi.Info.NumPieces())
-}*/
 
 type metainfoSize int64
 
@@ -513,12 +524,16 @@ func (c *conn) onExtended(msg *peer_wire.Msg) (err error) {
 	return nil
 }
 
-func (c *conn) discardBlocks() (err error) {
-	if !c.rq.empty() {
-		unsatisfiedRequests := c.rq.discardAll()
-		err = c.sendPeerEvent(discardedRequests(unsatisfiedRequests))
+func (c *conn) discardBlocks() {
+	if len(c.onFlightReqs) > 0 {
+		unsatisfiedRequests := []block{}
+		for req := range c.onFlightReqs {
+			unsatisfiedRequests = append(unsatisfiedRequests, req)
+		}
+		c.t.pieces.discardRequests(unsatisfiedRequests)
+		c.onFlightReqs = make(map[block]struct{})
+		c.sendPeerEvent(discardedRequests{})
 	}
-	return
 }
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
@@ -559,9 +574,6 @@ func (c *conn) upload(msg *peer_wire.Msg) error {
 	if err := c.t.readBlock(data, bl.pc, bl.off); err != nil {
 		return nil
 	}
-	if c.state.amChoking {
-		panic("send block while choking")
-	}
 	c.sendMsg(&peer_wire.Msg{
 		Kind:  peer_wire.Piece,
 		Index: msg.Index,
@@ -580,17 +592,13 @@ func (c *conn) isCanceled(b block) bool {
 
 //store block and send another request if request queuer permits it.
 func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
-	var ready block
+	//var ready block
 	var ok bool
 	bl := reqMsgToBlock(msg.Request())
-	if c.state.isChoking {
-		panic("received block when choked")
-	}
-	if ready, ok = c.rq.deleteCompleted(bl); !ok {
-		//We didnt' request this piece, but maybe it is useful
-		//panic("unexpected block")
-		return nil
-		c.logger.Printf("received unexpected block %v\n", bl)
+	if _, ok = c.onFlightReqs[bl]; !ok {
+		//remote peer send us a block that doesn't exists in onFlight requests.
+		//we may have requested it previously and discard it, but remote peer didn't,
+		//maybe because of network inconsistencies (latency).
 		if !c.haveInfo {
 			return errors.New("peer send piece while we dont have info")
 		}
@@ -607,7 +615,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		if length, err = c.t.pieces.pcs[bl.pc].blockLenSafe(bl.off); err != nil {
 			switch {
 			case errors.Is(err, errDivOffset):
-				//peer gave us a useful block but with offset % blockSz != 0
+				//peer gave us a useful block but with a not prefered offset.
 				//We dont punish him but we dont save to storage also, we dont
 				//want to mix our block offsets (we have precomputed which blocks
 				//to ask for).
@@ -622,10 +630,17 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 			return nil
 		}
 	}
-	if c.state.canDownload() && (ready != block{}) {
-		c.sendMsg(ready.reqMsg())
+	if ok {
+		delete(c.onFlightReqs, bl)
+		c.sendRequests()
 	}
 	if err := c.t.writeBlock(msg.Block, bl.pc, bl.off); err != nil {
+		if errors.Is(err, storage.ErrAlreadyWritten) {
+			//propably another conn got the same block
+			duplicateBlocksReceived.Inc()
+			return nil
+		}
+		c.t.logger.Fatalf("storage write err %s\n", err)
 		return err
 	}
 	return c.sendPeerEvent(downloadedBlock(bl))
