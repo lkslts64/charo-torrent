@@ -1,0 +1,63 @@
+As I 'm starting to realize what the protocol does, I keep loving it more and more. 
+
+So why the protocol is different from others (e.g Tendermint) ?
+
+Key concept: 3 phase commit.
+Partial-synchronous protocol.
+
+
+So the important question:
+
+Q:Why HotStuff doesn't need to be synchronous? 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A:At Two-phase HotStuff when a node N is locked, no other node knows at what QC N is locked on. The new (correct) leader can propose something very different if he 
+doesn't take the QC that N is locked on (N's QC wont be at first n-f QC's).That's why in Tendermint there is a delay so N can deliver his QC 
+to the leader if network is not asynchronous. If network is anysc, then eventually it will become sync.
+ Instead, in Three-phase HotStuff, the (correct) leader is obliged
+to make a proposal from N's QC because f+1 correct nodes send him a prepareQC = N's QC which is the highest. If it's not the highest then N will give up the lock
+anyways. 
+
+So we omit the synchronisity because we know that if one replica is locked, other replicas will know where he is locked and they will help him (for sure) by 
+proposing the QC that he is locked on. 
+
+Q: Bug withing Chained HotStuff or it's just me?
+
+A: In the paper, it is mentioned that we can have liveness when two consecutive leaders are correct. I can show that this is not the case:
+
+1) Assume that we have 2 consecutives leaders, that produce nodes N1 and N2 , where N2.parent = N1 and N2.justify  = N1 .
+2)Then it comes to play a faulty leader that proposes a node N3 so N3.justify = N1 and N3.parent = N2 (proposes a node conflicting with N2) . 
+3)Then we have again 2 correct consecutives leaders and propose N4 and N5 that extend N3 (faulty's proposal) .
+4) just to step (2) ad infinitum.
+
+NO PROGRESS IS MADE beceause we can never have a Two-Chain ( condition: b''.parent = b' ^ b'.parent = b in HotStuff implmentation).
+UPDATE: I was wrong!!!
+All replicas proposes nodes that dont have a QC. In order a node to get a QC, the next leader should propose a node that extends the previousldy proposed one.
+Also if a faulty replica proposes a node at : QChigh > NodeHeight > Block then a correct leader will reject it because it always proposes nodes extendidng QChigh 
+(pseudocode impementation)
+1)So, there should be two consecutives faulty replicas in order to create two conflicting QCs. 
+2) After step 1, the tree will look like this:
+
+			QC1
+			|  \
+			|   \
+			|    \
+			|     \
+			QC2    \
+					QC3
+					|
+					|
+					|
+					|
+				   proposed node(not QCed yet)
+3) if two consecutive correct leaders come after liveness is guaranted.
+
+I can't think of any Byzantine tactic that will compromise liveness. There is only the above that eventually wont compromise it because byzantines are < 1/3 of all
+replicas. The above needs for every correct replia a faulty one and liveness is not compromised (every 2 correct replicas a node will be decided instead of every 1) .
+But if Byzantines follow this tactic they can include no commands at the commited nodes and liveness will be compromised for a little time (f+1 honest nodes will be 
+commited instead of 2f+1). Again we made the assumption that faulty nodes select their election slot. If this is not the case, the probability that this will happen 
+is very small.
+
+
+
+
