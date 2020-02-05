@@ -75,8 +75,11 @@ type Torrent struct {
 	drop          chan struct{}
 	downloadedAll chan struct{}
 	//for displaying the state of torrent and conns
-	displayCh chan chan struct{}
-
+	displayCh             chan chan struct{}
+	discarded             chan struct{}
+	pieceQueuedHashingCh  chan int
+	pieceHashedCh         chan pieceHashed
+	queuedForVerification map[int]struct{}
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
 	//whole mi.Info part.
@@ -92,27 +95,29 @@ type Torrent struct {
 	infoSizeFreq freqMap
 
 	trackerURL tracker.TrackerURL
-
 	//length of data to be downloaded
 	length int
 
-	stats Stats
+	stats          Stats
+	eventsReceived int
+	commandsSent   int
 }
 
 func newTorrent(cl *Client) *Torrent {
 	t := &Torrent{
-		cl:            cl,
-		reqq:          250, //libtorent also has this default
-		done:          make(chan struct{}),
-		events:        make(chan event, maxConns*eventChSize),
-		newConnCh:     make(chan *connChansInfo, maxConns),
-		downloadedAll: make(chan struct{}),
-		drop:          make(chan struct{}),
-		displayCh:     make(chan chan struct{}),
-		close:         make(chan chan struct{}),
-		infoSizeFreq:  newFreqMap(),
-		stats:         Stats{},
-		logger:        log.New(os.Stdout, "torrent", log.LstdFlags),
+		cl:                    cl,
+		reqq:                  250, //libtorent also has this default
+		done:                  make(chan struct{}),
+		events:                make(chan event, maxConns*eventChSize),
+		newConnCh:             make(chan *connChansInfo, maxConns),
+		downloadedAll:         make(chan struct{}),
+		drop:                  make(chan struct{}),
+		displayCh:             make(chan chan struct{}),
+		close:                 make(chan chan struct{}),
+		queuedForVerification: make(map[int]struct{}),
+		infoSizeFreq:          newFreqMap(),
+		stats:                 Stats{},
+		logger:                log.New(os.Stdout, "torrent", log.LstdFlags),
 	}
 	t.choker = newChoker(t)
 	return t
@@ -127,6 +132,12 @@ func (t *Torrent) mainLoop() {
 		select {
 		case e := <-t.events:
 			t.parseEvent(e)
+			t.eventsReceived++
+		case res := <-t.pieceHashedCh:
+			t.pieceHashed(res.pieceIndex, res.ok)
+			if t.pieces.allVerified() {
+				t.startSeeding()
+			}
 		case cc := <-t.newConnCh: //we established a new connection
 			if !t.addConn(cc) {
 				t.logger.Println("rejected a connection with peer")
@@ -137,10 +148,15 @@ func (t *Torrent) mainLoop() {
 			t.choker.reviewUnchokedPeers()
 		//TODO: write info at a writer.
 		case doneDisplaying := <-t.displayCh:
-			t.logger.Println(t.stats.String())
-			/*for _, c := range t.conns {
-				t.logger.Println(c.String())
-			}*/
+			t.logger.Printf("----TORRENT--------------%p\n", t)
+			t.logger.Printf("all verified: %t", t.pieces.allVerified())
+			for _, p := range t.pieces.pcs {
+				if !p.verified {
+					t.logger.Printf("unrequested %d,pending %d,complete %d,total %d\n", p.unrequestedBlocks.Len(),
+						p.pendingBlocks.Len(), p.completeBlocks.Len(), p.blocks)
+				}
+			}
+			t.logger.Printf("----END--------------\n")
 			close(doneDisplaying)
 		case doneClosing := <-t.close:
 			close(t.drop) //signal conns to close
@@ -180,29 +196,27 @@ func (t *Torrent) parseEvent(e event) {
 			e.conn.state.isChoking = false
 			e.conn.startDownloading()
 		case peer_wire.Have:
-			e.conn.reviewInterestsOnHave(int(v.Index))
 			e.conn.peerBf.Set(int(v.Index), true)
+			e.conn.reviewInterestsOnHave(int(v.Index))
 		}
 	case downloadedBlock:
 		t.blockDownloaded(e.conn, block(v))
 	case uploadedBlock:
 		t.blockUploaded(e.conn, block(v))
-	case discardedRequests:
-		t.pieces.addDiscarded(v)
 	case pieceHashed:
 		e.conn.stats.onPieceHashed()
 		t.pieceHashed(v.pieceIndex, v.ok)
 		if t.pieces.allVerified() {
 			t.startSeeding()
 		}
-	case wantBlocks:
-		t.pieces.dispatch(e.conn)
 	case metainfoSize:
 	case bitmap.Bitmap:
 		e.conn.peerBf = v
 		e.conn.reviewInterestsOnBitfield()
 	case connDroped:
 		t.droppedConn(e.conn)
+	case discardedRequests:
+		t.broadcastCommand(requestsAvailable{})
 	}
 }
 
@@ -217,7 +231,8 @@ func (t *Torrent) DisplayStats() {
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
 	c.stats.onBlockDownload(b.len)
 	t.stats.blockDownloaded(b.len)
-	t.pieces.pcs[b.pc].markBlockComplete(c, int(b.off))
+	//t.pieces.pcs[b.pc].markBlockComplete(c, int(b.off))
+	t.pieces.markBlockComplete(b.pc, b.off, c)
 }
 
 func (t *Torrent) blockUploaded(c *connInfo, b block) {
@@ -235,10 +250,24 @@ func (t *Torrent) startSeeding() {
 	close(t.downloadedAll)
 }
 
+func (t *Torrent) queuePieceForHashing(i int) {
+	if _, ok := t.queuedForVerification[i]; ok || t.pieces.pcs[i].verified {
+		//piece is already queued or verified
+		return
+	}
+	t.queuedForVerification[i] = struct{}{}
+	select {
+	case t.pieceQueuedHashingCh <- i:
+	default:
+		panic("queue piece hash: should not block")
+	}
+}
+
 func (t *Torrent) pieceHashed(i int, correct bool) {
+	delete(t.queuedForVerification, i)
 	if correct {
-		t.onPieceDownload(i)
 		t.pieces.pieceSuccesfullyVerified(i)
+		t.onPieceDownload(i)
 	} else {
 		t.pieces.pieceVerificationFailed(i)
 	}
@@ -352,30 +381,13 @@ func (t *Torrent) connIndex(ci *connInfo) (int, bool) {
 
 //clear the fields that included the conn
 func (t *Torrent) removeConn(ci *connInfo, index int) {
-	t.logger.Println(ci)
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
-	if t.pieces != nil {
-		if _, ok := t.pieces.requestExpecters[ci]; ok {
-			delete(t.pieces.requestExpecters, ci)
-		}
-	}
 }
 
 //TODO: maybe wrap these at the same func passing as arg the func (read/write)
 func (t *Torrent) writeBlock(data []byte, piece, begin int) error {
 	off := int64(piece*t.mi.Info.PieceLen + begin)
-	n, err := t.storage.WriteBlock(data, off)
-	if n != len(data) {
-		if errors.Is(err, storage.ErrAlreadyWritten) {
-			//TODO: if not in endgame mode, then panic.
-			t.logger.Printf("attempted to write same block twice")
-			return nil
-		}
-		t.logger.Printf("coudn't write whole block from storage, written only %d bytes\n", n)
-	}
-	if err != nil {
-		t.logger.Printf("storage write err %s\n", err)
-	}
+	_, err := t.storage.WriteBlock(data, off)
 	return err
 }
 
@@ -490,6 +502,10 @@ func (t *Torrent) gotInfo() {
 	t.stats.BytesLeft = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
+	t.pieceQueuedHashingCh = make(chan int, t.numPieces())
+	t.pieceHashedCh = make(chan pieceHashed, t.numPieces())
+	ph := pieceHasher{t: t}
+	go ph.Run()
 	var seeding bool
 	t.storage, seeding = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
 	t.broadcastCommand(haveInfo{})
@@ -503,7 +519,6 @@ func (t *Torrent) gotInfo() {
 		t.stats.BytesLeft, t.stats.BytesDownloaded = t.stats.BytesDownloaded, t.stats.BytesLeft
 		t.startSeeding()
 	}
-	//notify conns that we have the info
 }
 
 func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
