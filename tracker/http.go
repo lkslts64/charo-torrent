@@ -62,24 +62,6 @@ func (r *httpAnnounceResponse) parse() error {
 		if err != nil {
 			return err
 		}
-		/*var numPeers int
-		var ip net.IP
-		if numPeers = len(r.CheapPeers); numPeers%6 != 0 {
-			return errors.New(fmt.Sprintf("cheapPeers length is not divided exactly by 6.Instead it has length %d", numPeers))
-		}
-		r.Peers = make([]Peer, numPeers/6)
-		j := 0
-		for i := 0; i < numPeers; i += 6 {
-			j = i / 6
-			if ip = net.IP([]byte(r.CheapPeers[i : i+4])).To16(); ip == nil {
-				return errors.New("cheapPeers ip parse")
-			}
-			r.Peers[j].IP = ip
-			port, err := strconv.Atoi(r.CheapPeers[i+4 : i+6])
-			if err != nil {
-				return fmt.Errorf("cheapPeers port parse: %w", err)
-			}
-			r.Peers[j].Port = port*/
 	} else {
 		return errors.New("Both Peers and CheapPeers fields are empty")
 	}
