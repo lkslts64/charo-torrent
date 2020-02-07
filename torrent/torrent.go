@@ -1,15 +1,19 @@
 package torrent
 
 import (
-	"context"
 	"crypto/sha1"
 	"errors"
+	"fmt"
+	"io"
 	"log"
-	"os"
+	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
+	"github.com/dustin/go-humanize"
 	"github.com/lkslts64/charo-torrent/bencode"
 	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
@@ -39,6 +43,10 @@ var maxRequestBlockSz = 1 << 14
 
 const metadataPieceSz = 1 << 14
 
+//If we only have less than `wantPeersThreshold` connected peers
+//we actively form new connections
+const wantPeersThreshold = 30
+
 //Torrent
 type Torrent struct {
 	cl     *Client
@@ -65,8 +73,14 @@ type Torrent struct {
 	//without dropping any. The default in in libtorrent is 250.
 	reqq int
 
-	blockRequestSize int
-
+	blockRequestSize              int
+	trackerAnnouncerTimer         *time.Timer
+	canAnnounce                   bool
+	trackerAnnouncerResponseCh    chan trackerAnnouncerResponse
+	trackerAnnouncerSubmitEventCh chan trackerAnnouncerEvent
+	lastAnnounceResp              *tracker.AnnounceResp
+	numAnnounces                  int
+	numAnnouncesSend              int
 	//surely we 'll need this
 	done chan struct{}
 	//client sends to this chan when client.Close is called
@@ -75,7 +89,7 @@ type Torrent struct {
 	drop          chan struct{}
 	downloadedAll chan struct{}
 	//for displaying the state of torrent and conns
-	displayCh             chan chan struct{}
+	displayCh             chan chan []byte
 	discarded             chan struct{}
 	pieceQueuedHashingCh  chan int
 	pieceHashedCh         chan pieceHashed
@@ -94,7 +108,6 @@ type Torrent struct {
 	//frequency map of infoSizes we have received
 	infoSizeFreq freqMap
 
-	trackerURL tracker.TrackerURL
 	//length of data to be downloaded
 	length int
 
@@ -105,29 +118,41 @@ type Torrent struct {
 
 func newTorrent(cl *Client) *Torrent {
 	t := &Torrent{
-		cl:                    cl,
-		reqq:                  250, //libtorent also has this default
-		done:                  make(chan struct{}),
-		events:                make(chan event, maxConns*eventChSize),
-		newConnCh:             make(chan *connChansInfo, maxConns),
-		downloadedAll:         make(chan struct{}),
-		drop:                  make(chan struct{}),
-		displayCh:             make(chan chan struct{}),
-		close:                 make(chan chan struct{}),
-		queuedForVerification: make(map[int]struct{}),
-		infoSizeFreq:          newFreqMap(),
-		stats:                 Stats{},
-		logger:                log.New(os.Stdout, "torrent", log.LstdFlags),
+		cl:                            cl,
+		reqq:                          250, //libtorent also has this default
+		done:                          make(chan struct{}),
+		events:                        make(chan event, maxConns*eventChSize),
+		newConnCh:                     make(chan *connChansInfo, maxConns),
+		downloadedAll:                 make(chan struct{}),
+		drop:                          make(chan struct{}),
+		displayCh:                     make(chan chan []byte),
+		close:                         make(chan chan struct{}),
+		trackerAnnouncerSubmitEventCh: cl.announcer.trackerAnnouncerSubmitEventCh,
+		trackerAnnouncerResponseCh:    make(chan trackerAnnouncerResponse, 1),
+		trackerAnnouncerTimer:         newExpiredTimer(),
+		queuedForVerification:         make(map[int]struct{}),
+		infoSizeFreq:                  newFreqMap(),
+		stats:                         Stats{},
+		logger:                        log.New(cl.logWriter, "torrent", log.LstdFlags),
 	}
 	t.choker = newChoker(t)
 	return t
 }
 
+func (t *Torrent) Download() <-chan struct{} {
+	go t.mainLoop()
+	return t.downloadedAll
+}
+
 //jobs that we 'll send are proportional to the # of events we have received.
 //TODO:count max jobs we can send in an iteration (estimate < 10)
 func (t *Torrent) mainLoop() {
+	//if we dont announce tracker.Started event then we won't announce anything at all
+	//throughout the lifetime of the Torrent.
+	t.sendAnnounceEvent(tracker.Started)
 	t.choker.startTicker()
 	defer t.choker.ticker.Stop()
+	defer t.trackerAnnouncerTimer.Stop()
 	for {
 		select {
 		case e := <-t.events:
@@ -135,7 +160,8 @@ func (t *Torrent) mainLoop() {
 			t.eventsReceived++
 		case res := <-t.pieceHashedCh:
 			t.pieceHashed(res.pieceIndex, res.ok)
-			if t.pieces.allVerified() {
+			if res.ok && t.pieces.allVerified() {
+				t.sendAnnounceEvent(tracker.Completed)
 				t.startSeeding()
 			}
 		case cc := <-t.newConnCh: //we established a new connection
@@ -146,30 +172,34 @@ func (t *Torrent) mainLoop() {
 			}
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
-		//TODO: write info at a writer.
-		case doneDisplaying := <-t.displayCh:
-			t.logger.Printf("----TORRENT--------------%p\n", t)
-			t.logger.Printf("all verified: %t", t.pieces.allVerified())
-			for _, p := range t.pieces.pcs {
-				if !p.verified {
-					t.logger.Printf("unrequested %d,pending %d,complete %d,total %d\n", p.unrequestedBlocks.Len(),
-						p.pendingBlocks.Len(), p.completeBlocks.Len(), p.blocks)
-				}
+		case tresp := <-t.trackerAnnouncerResponseCh:
+			t.trackerAnnounced(tresp)
+		case <-t.trackerAnnouncerTimer.C:
+			t.canAnnounce = true
+			if t.wantPeers() {
+				t.sendAnnounceEvent(tracker.None)
 			}
-			t.logger.Printf("----END--------------\n")
-			close(doneDisplaying)
+		case statusBytesCh := <-t.displayCh:
+			var b strings.Builder
+			t.writeStatus(&b)
+			statusBytesCh <- []byte(b.String())
 		case doneClosing := <-t.close:
-			close(t.drop) //signal conns to close
-			//wait until all conns close and then close `doneClosing`.
-			for _, c := range t.conns {
-				<-c.dropped
-				//TODO:logging when conn closes is bad. find another way to log dropped conns
-				//stats.Maybe hold a droppedConns slice, or maybe dont care about droppedConns?
-				t.logger.Println(c.String())
-			}
+			t.Close()
 			close(doneClosing)
 			return
 		}
+	}
+}
+
+//Close closes all connections with peers that were associated with this Torrent.
+func (t *Torrent) Close() {
+	close(t.drop) //signal conns to close
+	//wait until all conns close and then close `doneClosing`.
+	for _, c := range t.conns {
+		<-c.dropped
+		//TODO:logging when conn closes is bad. find another way to log dropped conns
+		//stats.Maybe hold a droppedConns slice, or maybe dont care about droppedConns?
+		//t.logger.Println(c.String())
 	}
 }
 
@@ -217,15 +247,95 @@ func (t *Torrent) parseEvent(e event) {
 		t.droppedConn(e.conn)
 	case discardedRequests:
 		t.broadcastCommand(requestsAvailable{})
+	case net.Addr:
+		e.conn.addr = v.String()
+	}
+}
+
+func (t *Torrent) wantPeers() bool {
+	return len(t.conns) < wantPeersThreshold
+}
+
+func (t *Torrent) sendAnnounceEvent(event tracker.Event) {
+	if !t.cl.config.DisableTrackers {
+		t.trackerAnnouncerSubmitEventCh <- trackerAnnouncerEvent{t, event, t.stats}
+		t.numAnnouncesSend++
+		t.canAnnounce = false
+	}
+}
+
+func (t *Torrent) trackerAnnounced(tresp trackerAnnouncerResponse) {
+	t.numAnnounces++
+	if tresp.err != nil {
+		t.logger.Printf("tracker error: %s\n", tresp.err)
+		//announce after one minute if tracker send error
+		t.resetNextAnnounce(60)
+		return
+	}
+	addrsNotConnected := []string{}
+	//TODO: whot told us that trackers won't give us duplicate peers?
+nextPeer:
+	for _, peer := range tresp.resp.Peers {
+		for _, ci := range t.conns {
+			if ci.addr == peer.String() {
+				continue nextPeer
+			}
+		}
+		addrsNotConnected = append(addrsNotConnected, peer.String())
+	}
+	t.cl.connectToPeers(t, addrsNotConnected...)
+	t.resetNextAnnounce(tresp.resp.Interval)
+	t.lastAnnounceResp = tresp.resp
+}
+
+func (t *Torrent) resetNextAnnounce(interval int32) {
+	nextAnnounce := time.Duration(interval) * time.Second
+	if t.trackerAnnouncerTimer == nil {
+		t.trackerAnnouncerTimer = time.NewTimer(nextAnnounce)
+	} else {
+		select {
+		case <-t.trackerAnnouncerTimer.C:
+			//panic("not drained chan")
+		default:
+		}
+		if t.trackerAnnouncerTimer.Stop() {
+			panic("announce before tracker specified interval")
+		}
+		t.trackerAnnouncerTimer.Reset(nextAnnounce)
 	}
 }
 
 //TODO: change this to WriteStats(w *io.Writer)
-func (t *Torrent) DisplayStats() {
-	//send a chan and wait till the stats are printed i.e the chan is closed by torrent.mainLoop
-	ch := make(chan struct{})
+func (t *Torrent) WriteStatus(w io.Writer) {
+	//send a signal to mainLoop to fill a status buffer and send it back to us
+	ch := make(chan []byte)
 	t.displayCh <- ch
-	<-ch
+	b := <-ch
+	w.Write(b)
+}
+
+func (t *Torrent) writeStatus(b *strings.Builder) {
+	if t.haveInfo() {
+		b.WriteString(fmt.Sprintf("Name: %s\n", t.mi.Info.Name))
+	}
+	b.WriteString("Tracker: " + t.mi.Announce + "\tAnnounce: " + func() string {
+		if t.lastAnnounceResp != nil {
+			return "OK"
+		}
+		return "Not Available"
+	}() + "\t#AnnouncesSend: " + strconv.Itoa(t.numAnnouncesSend) + "\n")
+	if t.lastAnnounceResp != nil {
+		b.WriteString(fmt.Sprintf("Seeders: %d\tLeechers: %d\tInterval: %d(secs)\n", t.lastAnnounceResp.Seeders, t.lastAnnounceResp.Seeders, t.lastAnnounceResp.Interval))
+	}
+	b.WriteString(fmt.Sprintf("Mode: %s\n", func() string {
+		if t.seeding {
+			return "seeding"
+		}
+		return "downloading"
+	}()))
+	b.WriteString(fmt.Sprintf("Downloaded: %s\tUploaded: %s\tRemaining: %s\n", humanize.Bytes(uint64(t.stats.BytesDownloaded)),
+		humanize.Bytes(uint64(t.stats.BytesUploaded)), humanize.Bytes(uint64(t.stats.BytesLeft))))
+	b.WriteString(fmt.Sprintf("Connected to %d peers", len(t.conns)))
 }
 
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
@@ -241,7 +351,7 @@ func (t *Torrent) blockUploaded(c *connInfo, b block) {
 }
 
 func (t *Torrent) startSeeding() {
-	t.logger.Printf("operating in seeding mode...")
+	//t.logger.Printf("operating in seeding mode...")
 	t.seeding = true
 	t.broadcastCommand(seeding{})
 	for _, c := range t.conns {
@@ -292,6 +402,7 @@ func (t *Torrent) broadcastCommand(cmd interface{}) {
 
 //TODO: make iter around t.conns and dont iterate twice over conns
 func (t *Torrent) onPieceDownload(i int) {
+	t.stats.onPieceDownload(t.pieceLen(uint32(i)))
 	t.reviewInterestsOnPieceDownload(i)
 	t.sendHaves(i)
 }
@@ -347,7 +458,7 @@ func (t *Torrent) addConn(cc *connChansInfo) bool {
 }
 
 //we would like to drop the conn
-func (t *Torrent) punishConn(i int) {
+func (t *Torrent) punishPeer(i int) {
 	t.conns[i].sendCommand(drop{})
 	t.removeConn(t.conns[i], i)
 	t.choker.reviewUnchokedPeers()
@@ -379,9 +490,20 @@ func (t *Torrent) connIndex(ci *connInfo) (int, bool) {
 	return -1, false
 }
 
+func (t *Torrent) connsIter(f func(ci *connInfo) bool) {
+	for _, ci := range t.conns {
+		if !f(ci) {
+			break
+		}
+	}
+}
+
 //clear the fields that included the conn
 func (t *Torrent) removeConn(ci *connInfo, index int) {
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
+	if t.canAnnounce && t.wantPeers() {
+		t.sendAnnounceEvent(tracker.None)
+	}
 }
 
 //TODO: maybe wrap these at the same func passing as arg the func (read/write)
@@ -507,7 +629,7 @@ func (t *Torrent) gotInfo() {
 	ph := pieceHasher{t: t}
 	go ph.Run()
 	var seeding bool
-	t.storage, seeding = storage.OpenFileStorage(t.mi, t.cl.config.baseDir, t.pieces.blocks(), t.logger)
+	t.storage, seeding = storage.OpenFileStorage(t.mi, t.cl.config.BaseDir, t.pieces.blocks(), t.logger)
 	t.broadcastCommand(haveInfo{})
 	if seeding {
 		//mark all bocks completed and do all apropriate things when a piece
@@ -516,7 +638,6 @@ func (t *Torrent) gotInfo() {
 			p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
 			p.t.pieceHashed(i, true)
 		}
-		t.stats.BytesLeft, t.stats.BytesDownloaded = t.stats.BytesDownloaded, t.stats.BytesLeft
 		t.startSeeding()
 	}
 }
@@ -544,27 +665,13 @@ func (t *Torrent) blockSize() int {
 	return maxRequestBlockSz
 }
 
-func (t *Torrent) announceTracker(event tracker.Event) (*tracker.AnnounceResp, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	req := tracker.AnnounceReq{
-		InfoHash:   t.mi.Info.Hash,
-		PeerID:     peerID,
-		Downloaded: int64(t.stats.BytesDownloaded),
-		Left:       int64(t.stats.BytesLeft),
-		Uploaded:   int64(t.stats.BytesUploaded),
-		Event:      event,
-		Numwant:    -1,
-		Port:       t.cl.port,
-	}
-	return t.trackerURL.Announce(ctx, req)
-}
-
+/*
 func (t *Torrent) scrapeTracker() (*tracker.ScrapeResp, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	return t.trackerURL.Scrape(ctx, t.mi.Info.Hash)
 }
+*/
 
 func (t *Torrent) haveInfo() bool {
 	return t.mi.Info != nil
