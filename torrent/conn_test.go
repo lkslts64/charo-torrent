@@ -83,19 +83,16 @@ func TestConnState(t *testing.T) {
 type dummyStorage struct{}
 
 func (ds dummyStorage) ReadBlock(b []byte, off int64) (n int, err error) {
-	//time.Sleep(1 * time.Millisecond)
 	n = len(b)
 	return
 }
 
 func (ds dummyStorage) WriteBlock(b []byte, off int64) (n int, err error) {
-	//time.Sleep(1 * time.Millisecond)
 	n = len(b)
 	return
 }
 
 func (ds dummyStorage) HashPiece(pieceIndex int, len int) (correct bool) {
-	//time.Sleep(1 * time.Millisecond)
 	correct = true
 	return
 }
@@ -172,21 +169,15 @@ func BenchmarkPeerPieceMsg(b *testing.B) {
 	}
 	msgBytes, err := msg.EncodeBinary()
 	require.NoError(b, err)
-	bl := block{
-		len: 1 << 14,
-	}
 	b.SetBytes(int64(len(msg.Block)))
 	var n int
+	//send unexpected blocks to conn
 	for i := 0; i < b.N; i++ {
-		cn.rq.queue(bl)
 		n, err = w.Write(msgBytes)
 		require.NoError(b, err)
 		assert.Equal(b, n, len(msgBytes))
 		<-cn.eventCh
 	}
-	close(tr.done)        //signal to close conn
-	_, ok := <-cn.eventCh //closed chan
-	assert.Equal(b, false, ok)
 }
 
 func readForever(r io.Reader) {
@@ -200,9 +191,12 @@ func readForever(r io.Reader) {
 }
 
 func loadTorrentFile(w, r net.Conn, filename string) (*conn, *Torrent, error) {
-	tr := newTorrent(&Client{})
+	cl, err := NewClient(nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	tr := newTorrent(cl)
 	cn := newConn(tr, r, make([]byte, 20))
-	var err error
 	tr.mi, err = metainfo.LoadMetainfoFile(filename)
 	if err != nil {
 		return nil, nil, err
@@ -231,7 +225,5 @@ func allowDownload(cn *conn, w net.Conn) {
 		Kind: peer_wire.Interested,
 	}
 	w.Read(make([]byte, 50))
-	<-cn.eventCh
-	//want blocks will be send also
 	<-cn.eventCh
 }
