@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/lkslts64/charo-torrent/tracker"
 )
 
 //messages passed to channels
@@ -61,6 +62,18 @@ const (
 	piece2
 )
 
+type trackerAnnouncerEvent struct {
+	//which Torrent submited the event
+	t     *Torrent
+	event tracker.Event
+	stats Stats
+}
+
+type trackerAnnouncerResponse struct {
+	resp *tracker.AnnounceResp
+	err  error
+}
+
 //a wrapper for the channels a conn has.
 //
 //Conn sends this struct to master at a special channel as the first message to bootstrap
@@ -82,7 +95,7 @@ type pieceHashed struct {
 	ok         bool
 }
 
-type discardedRequests []block
+//type discardedRequests []block
 
 //signals that a block was downloaded
 type downloadedBlock block
@@ -96,3 +109,9 @@ type connDroped struct{}
 //signals that a conn has space to request some blokcs i.e request queue length
 //is not full.
 type wantBlocks struct{}
+
+//when a conn discards requests, we use this event to notify other conns that
+//some blocks are available for requesting.
+type requestsAvailable struct{}
+
+type discardedRequests struct{}
