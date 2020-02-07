@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"errors"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -21,9 +22,10 @@ var reserved [8]byte
 
 //Client manages multiple torrents
 type Client struct {
-	config *Config
-	peerID [20]byte
-	logger *log.Logger
+	config    *Config
+	peerID    [20]byte
+	logger    *log.Logger
+	logWriter io.Writer
 	//torrents []Torrent
 	//conns    []net.Conn
 	torrents map[[20]byte]*Torrent
@@ -37,17 +39,18 @@ type Client struct {
 	//extensionsSupported map[string]int
 	listener net.Listener
 	//when this channel closes, all Torrents and conns that the client is managing will close.
-	close chan chan struct{}
-	port  int16
+	//close                   chan chan struct{}
+	announcer               *trackerAnnouncer
+	trackerAnnouncerCloseCh chan chan struct{}
+	port                    int16
 }
 
 type Config struct {
-	maxOnFlightReqs int //max outstanding requests we allowed for a peer to have
-	maxConns        int
-	maxUploadSlots  int
-	optimisticSlots int
+	MaxOnFlightReqs int //max outstanding requests we allowed for a peer to have
+	MaxConns        int
+	DisableTrackers bool
 	//directory to store the data
-	baseDir string
+	BaseDir string
 }
 
 func NewClient(cfg *Config) (*Client, error) {
@@ -58,10 +61,17 @@ func NewClient(cfg *Config) (*Client, error) {
 			return nil, err
 		}
 	}
+	//TODO: maybe overwrite log file instead of creating a new one
+	//logFile, err := ioutil.TempFile("", "charo.log")
+	logFile, err := os.Create(os.TempDir() + "/charo.log")
+	if err != nil {
+		return nil, err
+	}
 	cl := &Client{
 		peerID:     newPeerID(),
 		config:     cfg,
-		logger:     log.New(os.Stdout, "client", log.LstdFlags),
+		logWriter:  logFile,
+		logger:     log.New(logFile, "client", log.LstdFlags),
 		infoHashes: make(map[[20]byte]struct{}),
 		torrents:   make(map[[20]byte]*Torrent),
 	}
@@ -69,6 +79,14 @@ func NewClient(cfg *Config) (*Client, error) {
 		return nil, err
 	}
 	go cl.accept()
+	cl.announcer = &trackerAnnouncer{
+		cl:                            cl,
+		trackerAnnouncerSubmitEventCh: make(chan trackerAnnouncerEvent, 5),
+		trackers:                      make(map[string]tracker.TrackerURL),
+	}
+	if !cl.config.DisableTrackers {
+		go cl.announcer.run()
+	}
 	return cl, nil
 }
 
@@ -94,12 +112,18 @@ func defaultConfig() (*Config, error) {
 		return nil, err
 	}
 	return &Config{
-		maxOnFlightReqs: 250,
-		maxConns:        55,
-		maxUploadSlots:  4,
-		optimisticSlots: 1,
-		baseDir:         tdir,
+		MaxOnFlightReqs: 250,
+		MaxConns:        55,
+		BaseDir:         tdir,
 	}, nil
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		MaxOnFlightReqs: 250,
+		MaxConns:        55,
+		BaseDir:         "./",
+	}
 }
 
 //NewTorrentFromFile creates a torrent based on a .torrent file
@@ -117,10 +141,7 @@ func (cl *Client) NewTorrentFromFile(filename string) (*Torrent, error) {
 		return nil, err
 	}
 	t.gotInfo()
-	if t.trackerURL, err = tracker.NewTrackerURL(t.mi.Announce); err != nil {
-		return nil, err
-	}
-	go t.mainLoop()
+	//go t.mainLoop()
 	return t, nil
 }
 
@@ -204,14 +225,20 @@ func (cl *Client) handleConn(tcpConn net.Conn) {
 	if t, ok = cl.torrents[hs.InfoHash]; !ok {
 		panic("we checked that we have this torrent")
 	}
-	cl.startConn(t, tcpConn)
+	err = newConn(t, tcpConn, cl.peerID[:]).mainLoop()
+	if err != nil {
+		cl.logger.Println(err)
+	}
 }
 
+//TODO: store the remote addr and pop when finish
 func (cl *Client) connectToPeer(address string, t *Torrent) {
 	tcpConn, err := net.Dial("tcp", address)
 	if err != nil {
 		cl.logger.Printf("cannot dial peer: %s", err)
+		return
 	}
+	defer tcpConn.Close()
 	err = cl.handshake(tcpConn, &peer_wire.HandShake{
 		Reserved: reserved,
 		PeerID:   cl.peerID,
@@ -221,12 +248,10 @@ func (cl *Client) connectToPeer(address string, t *Torrent) {
 		cl.logger.Println(err)
 		return
 	}
-	tcpConn.SetDeadline(time.Time{})
-	cl.startConn(t, tcpConn)
-}
-
-func (cl *Client) startConn(t *Torrent, tcpConn net.Conn) {
-	newConn(t, tcpConn, cl.peerID[:]).mainLoop()
+	err = newConn(t, tcpConn, cl.peerID[:]).mainLoop()
+	if err != nil {
+		cl.logger.Println(err)
+	}
 }
 
 func (cl *Client) connectToPeers(t *Torrent, addresses ...string) {
@@ -240,12 +265,12 @@ func (cl *Client) addr() string {
 }
 
 func (cl *Client) handshake(tcpConn net.Conn, hs *peer_wire.HandShake) error {
-	//dont wait more than 30 secs for handshake
-	tcpConn.SetDeadline(time.Now().Add(30 * time.Second))
+	//dont wait more than 5 secs for handshake
+	tcpConn.SetDeadline(time.Now().Add(5 * time.Second))
+	defer tcpConn.SetDeadline(time.Time{})
 	err := hs.Do(tcpConn, cl.infoHashes)
 	if err != nil {
 		cl.logger.Println(err)
-		tcpConn.Close()
 	}
 	return err
 }

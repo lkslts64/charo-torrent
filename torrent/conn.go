@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -73,10 +72,9 @@ type conn struct {
 //just wraps a msg with an error
 func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 	c := &conn{
-		cl: t.cl,
-		t:  t,
-		//TODO:change logger output to a file
-		logger:       log.New(os.Stdout, fmt.Sprintf("%x", peerID), log.LstdFlags),
+		cl:           t.cl,
+		t:            t,
+		logger:       log.New(t.cl.logWriter, fmt.Sprintf("%x", peerID), log.LstdFlags),
 		cn:           cn,
 		state:        newConnState(),
 		commandCh:    make(chan interface{}, commandChSize),
@@ -87,23 +85,22 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
 		peerReqs:     make(map[block]struct{}),
 	}
-	//inform others about the new conn
+	//inform Torrent about the new conn
 	t.newConnCh <- &connChansInfo{
 		c.commandCh,
 		c.eventCh,
 		c.dropped,
 	}
+	c.eventCh <- c.cn.RemoteAddr()
 	return c
 }
 
 func (c *conn) close() {
-	c.cn.Close()
-	//close chan - avoid leak goroutines
 	c.discardBlocks()
+	//close chan - avoid leak goroutines
 	close(c.eventCh)
 	//notify Torrent that conn closed
 	close(c.dropped)
-	c.logger.Println("closed connection")
 }
 
 type readResult struct {
@@ -118,15 +115,12 @@ func (c *conn) mainLoop() error {
 	readErrCh := make(chan error, 1)
 	//we need o quit chan in order to not leak readMsgs goroutine
 	quit := make(chan struct{})
-	defer c.close()
-	defer close(quit)
+	defer func() {
+		c.close()
+		close(quit)
+		err = nilOnEOF(err)
+	}()
 	go c.readMsgs(readCh, quit, readErrCh)
-	nilOnEOF := func(err error) error {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil
-		}
-		return err
-	}
 	c.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
 	debugTick := time.NewTicker(2 * time.Second)
 	defer debugTick.Stop()
@@ -144,26 +138,22 @@ func (c *conn) mainLoop() error {
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
-		case <-debugTick.C:
+			/*case <-debugTick.C:
 			if len(c.onFlightReqs) > 0 {
 				c.logger.Printf("onFlight: %d canDownload: %t\n", len(c.onFlightReqs), c.state.canDownload())
-			}
+			}*/
 		}
 		if err != nil {
-			switch err = nilOnEOF(err); err {
-			case nil:
-				c.logger.Println("lost connection with peer")
-			default:
-				c.logger.Println(err)
-			}
 			return err
 		}
-		if c.notUseful() {
-			c.logger.Println("conn is not useful anymore for both ends")
-			return nil
-		}
-		//c.sendRequests()
 	}
+}
+
+func nilOnEOF(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil
+	}
+	return err
 }
 
 //read msgs from remote peer
@@ -240,7 +230,7 @@ func (c *conn) wantBlocks() bool {
 
 func (c *conn) sendRequests() {
 	if c.wantBlocks() {
-		requests := make([]block, maxOnFlight)
+		requests := make([]block, maxOnFlight-len(c.onFlightReqs))
 		n := c.t.pieces.getRequests(c.peerBf, requests)
 		if n == 0 {
 			if (requests[0] != block{}) {
@@ -343,6 +333,10 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		c.haveInfo = true
 	case seeding:
 		c.amSeeding = true
+		if c.notUseful() {
+			//c.logger.Println("conn is not useful anymore for both ends")
+			err = io.EOF
+		}
 	case drop:
 		err = io.EOF
 	}
