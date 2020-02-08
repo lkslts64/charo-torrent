@@ -50,7 +50,6 @@ type conn struct {
 	eventCh chan interface{}
 	//chans to signal that conn should is dropped
 	dropped        chan struct{}
-	peerIdle       chan struct{}
 	keepAliveTimer *time.Timer
 	peerReqs       map[block]struct{}
 	onFlightReqs   map[block]struct{}
@@ -80,7 +79,6 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		commandCh:    make(chan interface{}, commandChSize),
 		eventCh:      make(chan interface{}, eventChSize),
 		dropped:      make(chan struct{}),
-		peerIdle:     make(chan struct{}),
 		onFlightReqs: make(map[block]struct{}),
 		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
 		peerReqs:     make(map[block]struct{}),
@@ -116,11 +114,11 @@ func (c *conn) mainLoop() error {
 	//we need o quit chan in order to not leak readMsgs goroutine
 	quit := make(chan struct{})
 	defer func() {
-		c.close()
 		close(quit)
+		c.close()
 		err = nilOnEOF(err)
 	}()
-	go c.readMsgs(readCh, quit, readErrCh)
+	go c.readPeerMsgs(readCh, quit, readErrCh)
 	c.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
 	debugTick := time.NewTicker(2 * time.Second)
 	defer debugTick.Stop()
@@ -132,9 +130,6 @@ func (c *conn) mainLoop() error {
 			err = c.parsePeerMsg(msg)
 		case err = <-readErrCh:
 		case <-c.t.drop:
-			return nil
-		case <-c.peerIdle:
-			err = errors.New("peer idle")
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
@@ -158,68 +153,53 @@ func nilOnEOF(err error) error {
 
 //read msgs from remote peer
 //run on seperate goroutine
-func (c *conn) readMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
+func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 	errCh chan error) {
-	var msg *peer_wire.Msg
-	var err error
-	readDone := make(chan readResult)
-loop:
 	for {
-		//we won't block on read forever cause conn will close
-		//if main goroutine exits
-		go func() {
-			msg, err = peer_wire.Read(c.cn)
-			readDone <- readResult{msg, err}
-		}()
+		c.cn.SetReadDeadline(time.Now().Add(keepAliveInterval + time.Minute)) //lets be forbearing
+		msg, err := peer_wire.Read(c.cn)
+		if err != nil {
+			errCh <- err
+			return
+		}
 		//break from loops in not required
-		select {
-		case <-time.After(keepAliveInterval + time.Minute): //lets be forbearing
-			close(c.peerIdle)
-		case res := <-readDone:
-			if res.err != nil {
-				errCh <- res.err
-				break loop
-			}
-			var sendToChan bool
-			switch res.msg.Kind {
-			case peer_wire.Request:
-				b := reqMsgToBlock(msg)
-				c.muPeerReqs.Lock()
-				//avoid flooding readCh by not sending requests that are
-				//already requested from peer and by discarding requests when
-				//our buffer is full.
-				switch _, ok := c.peerReqs[b]; {
-				case ok:
-					duplicateRequestsReceived.Inc()
-				case len(c.peerReqs) >= c.t.reqq:
-					//should we drop?
-					c.logger.Print("peer requests buffer is full\n")
-				default: //all good
-					c.peerReqs[b] = struct{}{}
-					sendToChan = true
-				}
-				c.muPeerReqs.Unlock()
-			case peer_wire.Cancel:
-				b := reqMsgToBlock(msg)
-				c.muPeerReqs.Lock()
-				if _, ok := c.peerReqs[b]; ok {
-					delete(c.peerReqs, b)
-				} else {
-					latecomerCancels.Inc()
-				}
-				c.muPeerReqs.Unlock()
-			default:
+		var sendToChan bool
+		switch msg.Kind {
+		case peer_wire.Request:
+			b := reqMsgToBlock(msg)
+			c.muPeerReqs.Lock()
+			//avoid flooding readCh by not sending requests that are
+			//already requested from peer and by discarding requests when
+			//our buffer is full.
+			switch _, ok := c.peerReqs[b]; {
+			case ok:
+				duplicateRequestsReceived.Inc()
+			case len(c.peerReqs) >= c.t.reqq:
+				//should we drop?
+				c.logger.Print("peer requests buffer is full\n")
+			default: //all good
+				c.peerReqs[b] = struct{}{}
 				sendToChan = true
 			}
-			if sendToChan {
-				select {
-				case readCh <- res.msg:
-				case <-quit: //we must care for quit here too
-					break loop
-				}
+			c.muPeerReqs.Unlock()
+		case peer_wire.Cancel:
+			b := reqMsgToBlock(msg)
+			c.muPeerReqs.Lock()
+			if _, ok := c.peerReqs[b]; ok {
+				delete(c.peerReqs, b)
+			} else {
+				latecomerCancels.Inc()
 			}
-		case <-quit:
-			break loop
+			c.muPeerReqs.Unlock()
+		default:
+			sendToChan = true
+		}
+		if sendToChan {
+			select {
+			case readCh <- msg:
+			case <-quit: //we must care for quit here
+				return
+			}
 		}
 	}
 }
@@ -435,9 +415,6 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 			//pretend we lost connection
 			case <-c.t.drop:
 				err = io.EOF
-			case <-c.peerIdle:
-				err = errors.New("peer idle")
-				return nil
 			case <-c.keepAliveTimer.C:
 				err = c.sendKeepAlive()
 			}
