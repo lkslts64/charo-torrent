@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -125,7 +126,7 @@ func newTorrent(cl *Client) *Torrent {
 		newConnCh:                     make(chan *connChansInfo, maxConns),
 		downloadedAll:                 make(chan struct{}),
 		drop:                          make(chan struct{}),
-		displayCh:                     make(chan chan []byte),
+		displayCh:                     make(chan chan []byte, 10),
 		close:                         make(chan chan struct{}),
 		trackerAnnouncerSubmitEventCh: cl.announcer.trackerAnnouncerSubmitEventCh,
 		trackerAnnouncerResponseCh:    make(chan trackerAnnouncerResponse, 1),
@@ -335,14 +336,22 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 	}()))
 	b.WriteString(fmt.Sprintf("Downloaded: %s\tUploaded: %s\tRemaining: %s\n", humanize.Bytes(uint64(t.stats.BytesDownloaded)),
 		humanize.Bytes(uint64(t.stats.BytesUploaded)), humanize.Bytes(uint64(t.stats.BytesLeft))))
-	b.WriteString(fmt.Sprintf("Connected to %d peers", len(t.conns)))
+	b.WriteString(fmt.Sprintf("Connected to %d peers\n", len(t.conns)))
+	tabWriter := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tabWriter, "Address\t%\tUp\tDown\t")
+	for _, ci := range t.conns {
+		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.addr,
+			strconv.Itoa(int(float64(ci.peerBf.Len())/float64(t.numPieces())*100))+"%",
+			humanize.Bytes(uint64(ci.stats.uploadUsefulBytes)),
+			humanize.Bytes(uint64(ci.stats.downloadUsefulBytes)))
+	}
+	tabWriter.Flush()
 }
 
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
 	c.stats.onBlockDownload(b.len)
 	t.stats.blockDownloaded(b.len)
-	//t.pieces.pcs[b.pc].markBlockComplete(c, int(b.off))
-	t.pieces.markBlockComplete(b.pc, b.off, c)
+	t.pieces.makeBlockComplete(b.pc, b.off, c)
 }
 
 func (t *Torrent) blockUploaded(c *connInfo, b block) {
