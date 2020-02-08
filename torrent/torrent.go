@@ -409,6 +409,10 @@ func (t *Torrent) broadcastCommand(cmd interface{}) {
 	}
 }
 
+func (t *Torrent) sendCancels(b block) {
+	t.broadcastCommand(b.cancelMsg())
+}
+
 //TODO: make iter around t.conns and dont iterate twice over conns
 func (t *Torrent) onPieceDownload(i int) {
 	t.stats.onPieceDownload(t.pieceLen(uint32(i)))

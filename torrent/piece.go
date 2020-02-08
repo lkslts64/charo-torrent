@@ -35,6 +35,7 @@ type pieces struct {
 	mu             sync.Mutex
 	pcs            []*piece
 	prioritizedPcs []*piece
+	endGame        bool
 	//random until we get the first piece, rarest onwards
 	//TODO:maybe pick one by one? insteadof sorting or permute every time?
 	lessFunc    less
@@ -102,6 +103,10 @@ func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int)
 	return p.fillWithRequests(peerPieces, requests)
 }
 
+func completenessScore(p *piece) int {
+	return p.completeBlocks.Len() + p.pendingBlocks() - p.unrequestedBlocks.Len()
+}
+
 //fills the provided slice with requests. Returns how many were filled.
 func (p *pieces) fillWithRequests(peerPieces bitmap.Bitmap, requests []block) (n int) {
 	var unreq []block
@@ -109,8 +114,10 @@ func (p *pieces) fillWithRequests(peerPieces bitmap.Bitmap, requests []block) (n
 	for _, piece := range p.prioritizedPcs {
 		if peerPieces.Get(piece.index) {
 			unreq = piece.unrequestedBlocksSlc(len(requests))
-			for _, b := range unreq {
-				piece.makeBlockPending(b.off)
+			if !p.endGame {
+				for _, b := range unreq {
+					piece.makeBlockPending(b.off)
+				}
 			}
 			_n = copy(requests, unreq)
 			n += _n
@@ -125,10 +132,6 @@ func (p *pieces) fillWithRequests(peerPieces bitmap.Bitmap, requests []block) (n
 		}
 	}
 	return
-}
-
-func completenessScore(p *piece) int {
-	return p.completeBlocks.Len() + p.pendingBlocks() - p.unrequestedBlocks.Len()
 }
 
 /*
@@ -154,7 +157,15 @@ func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
 	piece := p.pcs[i]
 	p.mu.Lock()
 	piece.makeBlockComplete(ci, off)
+	inEndGame := p.endGame
 	p.mu.Unlock()
+	if inEndGame {
+		p.t.sendCancels(block{
+			pc:  i,
+			off: off,
+			len: piece.blockLen(off),
+		})
+	}
 	if piece.complete() {
 		p.t.queuePieceForHashing(i)
 	}
@@ -164,19 +175,40 @@ func (p *pieces) pieceSuccesfullyVerified(i int) {
 	p.pcs[i].verificationSuccess()
 	//change strategy after completion of first block
 	if p.ownedPieces.Len() == 0 {
-		func() {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			p.lessFunc = lessByRarity
-		}()
+		p.mu.Lock()
+		p.lessFunc = lessByRarity
+		p.mu.Unlock()
 	}
 	p.ownedPieces.Set(i, true)
+	if remaining := p.t.numPieces() - p.ownedPieces.Len(); remaining > 0 && remaining < 3 {
+		if p.prepareEndgame() {
+			p.t.broadcastCommand(requestsAvailable{})
+		}
+	}
 }
 
 func (p *pieces) pieceVerificationFailed(i int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.pcs[i].verificationFailed()
+}
+
+func (p *pieces) prepareEndgame() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.endGame {
+		return false
+	}
+	p.endGame = true
+	notOwned := bitmap.Flip(p.ownedPieces, 0, p.t.numPieces())
+	if notOwned.Len() > 2 {
+		panic("endgame start")
+	}
+	notOwned.IterTyped(func(piece int) bool {
+		p.pcs[piece].makeAllUnrequested()
+		return true
+	})
+	return true
 }
 
 //return a slice containing how many blocks a piece has.
@@ -327,7 +359,7 @@ func (p *piece) hasCompletedBlocks() bool {
 }
 
 func (p *piece) pendingBlocks() int {
-	return p.blocks - p.unrequestedBlocks.Len() - p.completeBlocks.Len()
+	return p.blocks - (p.unrequestedBlocks.Len() + p.completeBlocks.Len())
 }
 
 func (p *piece) pendingGet(off int) bool {
@@ -354,6 +386,12 @@ func (p *piece) makeBlockComplete(ci *connInfo, off int) {
 	//offset could be in unrequested if we received an unexpected block
 	p.unrequestedBlocks.Set(off, false)
 	p.contributors = append(p.contributors, ci)
+}
+
+func (p *piece) makeAllUnrequested() {
+	for i := 0; i < p.blocks; i++ {
+		p.makeBlockUnrequsted(i * p.t.blockRequestSize)
+	}
 }
 
 func (p *piece) complete() bool {

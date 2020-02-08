@@ -205,7 +205,7 @@ func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 }
 
 func (c *conn) wantBlocks() bool {
-	return c.haveInfo && c.state.canDownload() && len(c.onFlightReqs) < maxOnFlight/2
+	return !c.amSeeding && c.haveInfo && c.state.canDownload() && len(c.onFlightReqs) < maxOnFlight/2
 }
 
 func (c *conn) sendRequests() {
@@ -284,6 +284,10 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			//TODO:change to:
 			// if pc.peerBf.Get(int(v.Index)) && !pc.peerBf.peerSeeding() {
 			if c.peerBf.Get(int(v.Index)) {
+				return
+			}
+		case peer_wire.Cancel:
+			if _, ok := c.onFlightReqs[reqMsgToBlock(v)]; !ok {
 				return
 			}
 		}
@@ -628,6 +632,15 @@ type block struct {
 func (b *block) reqMsg() *peer_wire.Msg {
 	return &peer_wire.Msg{
 		Kind:  peer_wire.Request,
+		Index: uint32(b.pc),
+		Begin: uint32(b.off),
+		Len:   uint32(b.len),
+	}
+}
+
+func (b *block) cancelMsg() *peer_wire.Msg {
+	return &peer_wire.Msg{
+		Kind:  peer_wire.Cancel,
 		Index: uint32(b.pc),
 		Begin: uint32(b.off),
 		Len:   uint32(b.len),
