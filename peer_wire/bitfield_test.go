@@ -23,9 +23,9 @@ func TestBitfield(t *testing.T) {
 	for i := 0; i < 17; i++ {
 		switch i {
 		case 10, 17, 16:
-			assert.Equal(t, true, bf.HasPiece(uint32(i)))
+			assert.Equal(t, true, bf.HasPiece(i))
 		default:
-			assert.Equal(t, false, bf.HasPiece(uint32(i)))
+			assert.Equal(t, false, bf.HasPiece(i))
 		}
 	}
 }

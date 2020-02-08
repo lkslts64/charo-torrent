@@ -102,7 +102,7 @@ func (p *pieces) fillWithRequests(pieces []int, requests []block) (n int) {
 		_n = copy(requests, unreq)
 		n += _n
 		if n > total {
-			panic("read requests")
+			panic("filled with more requests than conn wanted")
 		}
 		if n == total {
 			//got as many requests as asked for

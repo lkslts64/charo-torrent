@@ -1,6 +1,7 @@
 package torrent
 
-const maxOnFlight = 10
+//TODO:this is controled by the peer in a sense
+const maxOnFlight = 20
 
 type requestQueuer struct {
 	onFlight map[block]struct{}
@@ -53,7 +54,6 @@ func (rq *requestQueuer) needMore() bool {
 	return rq.pending.empty()
 }
 
-//lock is held during this call
 func (rq *requestQueuer) frontRemove(bl block) bool {
 	if rq.frontContains(bl) {
 		delete(rq.onFlight, bl)
@@ -62,10 +62,21 @@ func (rq *requestQueuer) frontRemove(bl block) bool {
 	return false
 }
 
-//lock is held during this call
 func (rq *requestQueuer) frontContains(bl block) bool {
 	_, ok := rq.onFlight[bl]
 	return ok
+}
+
+func (rq *requestQueuer) contains(bl block) bool {
+	if rq.frontContains(bl) {
+		return true
+	}
+	for _, b := range rq.pending.blocks {
+		if b == bl {
+			return true
+		}
+	}
+	return false
 }
 
 func (rq *requestQueuer) empty() bool {

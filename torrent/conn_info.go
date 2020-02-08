@@ -12,7 +12,8 @@ import (
 //some informations like state,bitmap which also conn holds too -
 //we dont share, we communicate so we have some duplicate data-.
 type connInfo struct {
-	t *Torrent
+	t    *Torrent
+	addr string
 	//we communicate with conn with these channels - conn also has them
 	commandCh chan interface{}
 	eventCh   chan interface{}
@@ -29,6 +30,7 @@ type connInfo struct {
 func (cn *connInfo) sendCommand(cmd interface{}) {
 	select {
 	case cn.commandCh <- cmd:
+		cn.t.commandsSent++
 	case <-cn.dropped:
 		cn.t.droppedConn(cn)
 	}

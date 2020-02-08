@@ -24,8 +24,8 @@ func TestChoker(t *testing.T) {
 				isChoking:    true,
 			},
 			stats: connStats{
-				downloadUseful: i,
-				sumDownloading: time.Minute,
+				downloadUsefulBytes: i,
+				sumDownloading:      time.Minute,
 			},
 		}
 		conns = append(conns, ci)
