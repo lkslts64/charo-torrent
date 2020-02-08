@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,25 +112,20 @@ func testDataTransfer(t *testing.T, torrentFile string, numLeechers int) {
 	for i, leecher := range leechers {
 		leecher.connectToPeers(leecher.Torrents()[0], append(addrs[i+1:], seeder.addr())...)
 	}
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+	wg := sync.WaitGroup{}
 	for _, leecher := range leechers {
 		leecherTr := leecher.Torrents()[0]
-		<-leecherTr.Download()
-		//<-leecherTr.downloadedAll
-		/*loop:
-		for {
-			select {
-			case <-leecherTr.downloadedAll:
-				fmt.Println("omg", leecherTr.eventsReceived, leecherTr.commandsSent)
-				break loop
-			case <-ticker.C:
-				for _, lchr := range leechers {
-					lchr.Torrents()[0].DisplayStats()
-					//fmt.Println("omg", nonUsefulRequestReads.Load())
-				}
-			}
-		}*/
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-leecherTr.Download()
+		}()
+	}
+	wg.Wait()
+	for _, leecher := range leechers {
+		leecherTr := leecher.Torrents()[0]
 		assert.True(t, leecherTr.seeding)
 		testContents(t, dataSeeder, leecherTr)
 	}
@@ -258,18 +254,16 @@ func TestTrackerAnnouncer(t *testing.T) {
 	tr.mi.Announce = dt.addr()
 	tr.Download()
 	//we want to announce multiple times so sleep for a bit
-	time.Sleep(20 * time.Second)
-	/*time.Sleep(10 * time.Second)
-	fmt.Println(tr.numAnnounces)*/
+	time.Sleep(4 * time.Second)
 	cl.Close()
-	//assert that we filtered duplicate ip/port pairs
+	//Assert that we filtered duplicate ip/port pairs
 	//We should have established only 2 connections (in essence 1 because we have connected
 	//to ourselves so there are 2 - one becaused we dialed in `connectToPeer` and that
 	//triggered us to accept another one in `handleConn`.)
 	assert.Equal(t, 2, len(tr.conns))
 }
 
-/*func TestWithOpenTracker(t *testing.T) {
+func TestWithOpenTracker(t *testing.T) {
 	cfg := testingConfig()
 	cfg.BaseDir = "./testdata/leecher"
 	cfg.DisableTrackers = false
@@ -284,8 +278,8 @@ func TestTrackerAnnouncer(t *testing.T) {
 		tr.WriteStatus(os.Stdout)
 	}
 	cl.Close()
-}*/
+}
 
 //TODO:test piece verification failure by mocking storage (specifically ReadBlock())
 //mock storage by giving user to options to provide its own OpenStorage impl in client
-//config.
+//config. OR mock net.Conn to write garbage
