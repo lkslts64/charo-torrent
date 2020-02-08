@@ -67,50 +67,6 @@ import (
 	}
 }*/
 
-func TestPieces(t *testing.T) {
-	tr := newTestTorrent(300, 10*(1<<14)+245, 1<<13, 1<<14)
-	p := newPieces(tr)
-	var bm bitmap.Bitmap
-	bm.Add(1, 29, 30)
-	reqs := make([]block, maxOnFlight)
-	n := p.getRequests(bm, reqs)
-	reqs = reqs[:n]
-	assert.EqualValues(t, maxOnFlight, n)
-	for _, req := range reqs {
-		assert.True(t, p.pcs[req.pc].pendingBlocks.Get(req.off))
-		assert.True(t, req.pc == 1 || req.pc == 29 || req.pc == 30)
-	}
-	//based on blocks per piece
-	assert.Equal(t, tr.numPieces()-1, p.partiallyRequested.Len()+p.unrequested.Len())
-	assert.Equal(t, 1, p.partiallyRequested.Len())
-	assert.Equal(t, tr.numPieces()-2, p.unrequested.Len())
-	p.discardRequests(reqs)
-	for _, p := range p.pcs {
-		assert.True(t, p.allBlocksUnrequested())
-	}
-	assert.Equal(t, 0, p.partiallyRequested.Len())
-	assert.Equal(t, tr.numPieces(), p.unrequested.Len())
-}
-
-func TestRarestStrategy(t *testing.T) {
-	tr := newTestTorrent(40, 1*(1<<14)+1, 5*1<<12, 1<<13) //random
-	p := newPieces(tr)
-	for i, piece := range p.pcs {
-		piece.rarity = len(p.pcs) - i
-	}
-	//ci, ci2, ci3 := &connInfo{t: tr}, &connInfo{t: tr}, &connInfo{t: tr}
-	//peers ci & c2 have pieces {0,1} so piece 2 is the rarest
-	//ci.peerBf.Add(0, 1)
-	//ci2.peerBf.Add(0, 1)
-	//tr.conns = append(tr.conns, ci, ci2, ci3)
-	pieces := []int{0, 1, 2}
-	p.sortByRarity(pieces)
-	//assert.Equal(t, true, ok)
-	assert.Equal(t, 2, pieces[0])
-	assert.Equal(t, 1, pieces[1])
-	assert.Equal(t, 0, pieces[2])
-}
-
 func TestPiece(t *testing.T) {
 	blockSz := 1 << 14
 	pieceLen := 8*int(blockSz) + 100
@@ -121,8 +77,6 @@ func TestPiece(t *testing.T) {
 	assert.Equal(t, 9, p.blocks)
 	assert.Equal(t, 100, p.lastBlockLen)
 	assert.Equal(t, true, p.allBlocksUnrequested())
-	assert.Equal(t, false, p.hasPendingBlocks())
-	assert.Equal(t, false, p.isPartialyRequested())
 	assert.Equal(t, 0, p.completeBlocks.Len())
 	assert.Equal(t, 5, len(p.unrequestedBlocksSlc(5)))
 	_, err := p.blockLenSafe(5*blockSz + 20)
@@ -132,16 +86,74 @@ func TestPiece(t *testing.T) {
 	block, err := p.blockLenSafe(8 * blockSz)
 	require.NoError(t, err)
 	assert.Equal(t, p.lastBlockLen, block)
-	p.addBlockPending(blockSz)
-	assert.Equal(t, true, p.hasPendingBlocks())
+	p.makeBlockPending(blockSz)
 
 	lastp := newPiece(tr, 3)
 	assert.Equal(t, 3, lastp.index)
 	assert.Equal(t, 1, lastp.blocks)
 	assert.Equal(t, lastPieceLen, lastp.lastBlockLen)
 	assert.Equal(t, lastp.blocks, lastp.unrequestedBlocks.Len())
-	assert.Equal(t, 0, lastp.pendingBlocks.Len())
+	assert.Equal(t, 0, lastp.pendingBlocks())
 	assert.Equal(t, 0, lastp.completeBlocks.Len())
+}
+
+func TestPiecesState(t *testing.T) {
+	tr := newTestTorrent(300, 10*(1<<14)+245, 1<<13, 1<<14)
+	p := newPieces(tr)
+	var bm bitmap.Bitmap
+	bm.Add(1, 29, 30)
+	reqs := make([]block, maxOnFlight)
+	n := p.getRequests(bm, reqs)
+	reqs = reqs[:n]
+	assert.EqualValues(t, maxOnFlight, n)
+	for _, req := range reqs {
+		piece := p.pcs[req.pc]
+		assert.True(t, piece.pendingGet(req.off))
+		assert.True(t, req.pc == 1 || req.pc == 29 || req.pc == 30)
+	}
+	p.discardRequests(reqs)
+	for _, p := range p.pcs {
+		assert.True(t, p.allBlocksUnrequested())
+	}
+}
+
+func TestPiecePrioritization(t *testing.T) {
+	tr := newTestTorrent(100, 3, 1, 1)
+	p := newPieces(tr)
+	p.strategy = lessByRarity
+	var bm bitmap.Bitmap
+	bm.AddRange(0, tr.numPieces()-1)
+	//make piece 50 have the highest completeness score
+	p.pcs[50].makeBlockPending(2)
+	p.pcs[50].makeBlockPending(1)
+	//make piece 50 have the second highest completeness score
+	p.pcs[40].makeBlockPending(2)
+	//all blocks of piece 60 are pending (lowest priority)
+	p.pcs[60].makeBlockPending(0)
+	p.pcs[60].makeBlockPending(1)
+	p.pcs[60].makeBlockPending(2)
+	//pieces are sorted by rarity in ascending order
+	for i, piece := range p.pcs {
+		piece.rarity = tr.numPieces() - i
+	}
+	//take all blocks of the torrent
+	reqs := make([]block, tr.numPieces()*3)
+	n := p.getRequests(bm, reqs)
+	assert.Greater(t, n, tr.numPieces())
+	reqs = reqs[:n]
+	assert.Equal(t, 50, reqs[0].pc)
+	assert.Equal(t, 40, reqs[1].pc)
+	assert.Equal(t, 40, reqs[2].pc)
+	reqs = reqs[3:]
+	//expect to find remaining pieces sorted by rarity in descending order
+	curr, prev := 0, tr.numPieces()
+	for _, req := range reqs {
+		curr = req.pc
+		assert.LessOrEqual(t, curr, prev)
+		prev = req.pc
+	}
+	//last will be the one with the lowest priority
+	assert.Equal(t, 60, p.prioritizedPcs[len(p.prioritizedPcs)-1].index)
 }
 
 func newTestTorrent(numPieces, pieceLen, lastPieceLen, blockSz int) *Torrent {
@@ -152,7 +164,7 @@ func newTestTorrent(numPieces, pieceLen, lastPieceLen, blockSz int) *Torrent {
 				PieceLen: pieceLen,
 			},
 		},
-		length:           3*pieceLen + lastPieceLen,
+		length:           (numPieces-1)*pieceLen + lastPieceLen,
 		blockRequestSize: blockSz,
 		logger:           log.New(os.Stdout, "test", log.Flags()),
 	}
