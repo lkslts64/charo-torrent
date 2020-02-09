@@ -18,17 +18,17 @@ const (
 //TODO:reconsider how we store pcs - maybe a map would be better?
 //and store them depending on their state (dispatched,unrequested etc).
 type pieces struct {
-	t *Torrent
+	t           *Torrent
+	ownedPieces bitmap.Bitmap
 	//every conn can call getRequests and discardRequests.This mutex protects the fields
 	//that these methods access.
-	mu             sync.Mutex
-	pcs            []*piece
+	mu  sync.Mutex
+	pcs []*piece
+	//pieces sorted by their priority.All verified pieces are not present in this slice
 	prioritizedPcs []*piece
 	endGame        bool
 	//random until we get the first piece, rarest onwards
-	//TODO:maybe pick one by one? insteadof sorting or permute every time?
 	piecePickStrategy lessFunc
-	ownedPieces       bitmap.Bitmap
 }
 
 //TODO:add allVerified boolean at constructor parameter
@@ -41,9 +41,6 @@ func newPieces(t *Torrent) *pieces {
 	}
 	sorted := make([]*piece, numPieces)
 	copy(sorted, pcs)
-	/*rand.Shuffle(len(sorted), func(i, j int) {
-		sorted[i], sorted[j] = sorted[j], sorted[i]
-	})*/
 	p := &pieces{
 		t:              t,
 		pcs:            pcs,
@@ -72,7 +69,7 @@ func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	//Prioritize pieces.Pieces that have more pending &
-	//completed (but still have unrequested) blocks are prioritized.
+	//completed but still have unrequested blocks have the highest priority.
 	//If two pieces have both all blocks unrequested then we pick the one selected by
 	//our current strategy.
 	sort.Slice(p.prioritizedPcs, func(i, j int) bool {
@@ -86,18 +83,14 @@ func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int)
 		case p1.allBlocksUnrequested() && p2.allBlocksUnrequested():
 			return p.piecePickStrategy(p1, p2)
 		default:
-			return completenessScore(p1) > completenessScore(p2)
+			return p1.completeness() > p2.completeness()
 		}
 	})
 	return p.fillWithRequests(peerPieces, requests)
 }
 
 //The strategy for piece picking. In order for a piece to be picked, all piece's blocks
-//should be unrequested.Selects a piece for a conn to download.
-//'ok' set to false means no piece in peerPieces has all blocks unrequested,
-//so we cant pick any.
-//
-//The elemnts in the provided slice will be rearranged according to the strategy in use.
+//should be unrequested.
 type lessFunc func(p1, p2 *piece) bool
 
 func lessRand(p1, p2 *piece) bool {
@@ -106,10 +99,6 @@ func lessRand(p1, p2 *piece) bool {
 
 func lessByRarity(p1, p2 *piece) bool {
 	return p1.rarity < p2.rarity
-}
-
-func completenessScore(p *piece) int {
-	return p.completeBlocks.Len() + p.pendingBlocks() - p.unrequestedBlocks.Len()
 }
 
 //fills the provided slice with requests. Returns how many were filled.
@@ -239,7 +228,7 @@ func (p *pieces) blocks() []int {
 
 func (p *pieces) isValid(i int) bool {
 	if p == nil {
-		return false
+		panic("isValid: nil")
 	}
 	return i >= 0 && i < len(p.pcs)
 }
@@ -248,13 +237,8 @@ func (p *pieces) isLast(i int) bool {
 	return i == len(p.pcs)-1
 }
 
-func (p *pieces) allVerified() bool {
-	for _, piece := range p.pcs {
-		if !piece.verified {
-			return false
-		}
-	}
-	return true
+func (p *pieces) haveAll() bool {
+	return p.ownedPieces.Len() == p.t.numPieces()
 }
 
 //piece is constrcuted by master and is managed entirely
@@ -417,6 +401,9 @@ func (p *piece) complete() bool {
 	return p.completeBlocks.Len() == p.blocks
 }
 
+func (p *piece) completeness() int {
+	return p.completeBlocks.Len() + p.pendingBlocks() - p.unrequestedBlocks.Len()
+}
 func (p *piece) verificationFailed() {
 	for _, c := range p.contributors {
 		c.stats.badPiecesContributions++
