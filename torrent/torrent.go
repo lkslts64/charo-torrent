@@ -385,7 +385,7 @@ func (t *Torrent) queuePieceForHashing(i int) {
 func (t *Torrent) pieceHashed(i int, correct bool) {
 	delete(t.queuedForVerification, i)
 	if correct {
-		t.pieces.pieceSuccesfullyVerified(i)
+		t.pieces.pieceVerified(i)
 		t.onPieceDownload(i)
 	} else {
 		t.pieces.pieceVerificationFailed(i)
@@ -664,10 +664,6 @@ func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
 		pieceLen = t.mi.Info.PieceLen
 	}
 	return
-}
-
-func (t *Torrent) pieceValid(piece int) bool {
-	return piece >= 0 && piece < t.numPieces()
 }
 
 //call this when we get info

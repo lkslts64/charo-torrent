@@ -10,21 +10,10 @@ import (
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
-//The strategy for piece picking. In order for a piece to be picked, all piece's blocks
-//should be unrequested.Selects a piece for a conn to download.
-//'ok' set to false means no piece in peerPieces has all blocks unrequested,
-//so we cant pick any.
-//
-//The elemnts in the provided slice will be rearranged according to the strategy in use.
-type less func(p1, p2 *piece) bool
-
-func lessRand(p1, p2 *piece) bool {
-	return rand.Intn(2) == 1
-}
-
-func lessByRarity(p1, p2 *piece) bool {
-	return p1.rarity < p2.rarity
-}
+const (
+	endGameThreshold                    = 2
+	randomPiecePickingStrategyThreshold = 1
+)
 
 //TODO:reconsider how we store pcs - maybe a map would be better?
 //and store them depending on their state (dispatched,unrequested etc).
@@ -38,8 +27,8 @@ type pieces struct {
 	endGame        bool
 	//random until we get the first piece, rarest onwards
 	//TODO:maybe pick one by one? insteadof sorting or permute every time?
-	lessFunc    less
-	ownedPieces bitmap.Bitmap
+	piecePickStrategy lessFunc
+	ownedPieces       bitmap.Bitmap
 }
 
 //TODO:add allVerified boolean at constructor parameter
@@ -60,7 +49,7 @@ func newPieces(t *Torrent) *pieces {
 		pcs:            pcs,
 		prioritizedPcs: sorted,
 	}
-	p.lessFunc = lessRand
+	p.piecePickStrategy = lessRand
 	return p
 }
 
@@ -95,12 +84,28 @@ func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int)
 		case !p2.hasUnrequestedBlocks():
 			return true
 		case p1.allBlocksUnrequested() && p2.allBlocksUnrequested():
-			return p.lessFunc(p1, p2)
+			return p.piecePickStrategy(p1, p2)
 		default:
 			return completenessScore(p1) > completenessScore(p2)
 		}
 	})
 	return p.fillWithRequests(peerPieces, requests)
+}
+
+//The strategy for piece picking. In order for a piece to be picked, all piece's blocks
+//should be unrequested.Selects a piece for a conn to download.
+//'ok' set to false means no piece in peerPieces has all blocks unrequested,
+//so we cant pick any.
+//
+//The elemnts in the provided slice will be rearranged according to the strategy in use.
+type lessFunc func(p1, p2 *piece) bool
+
+func lessRand(p1, p2 *piece) bool {
+	return rand.Intn(2) == 1
+}
+
+func lessByRarity(p1, p2 *piece) bool {
+	return p1.rarity < p2.rarity
 }
 
 func completenessScore(p *piece) int {
@@ -154,36 +159,48 @@ func (p *pieces) discardRequests(requests []block) {
 }
 
 func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
+	var inEndGame bool
 	piece := p.pcs[i]
 	p.mu.Lock()
+	defer func() {
+		p.mu.Unlock()
+		if inEndGame {
+			p.t.sendCancels(block{
+				pc:  i,
+				off: off,
+				len: piece.blockLen(off),
+			})
+		}
+		if piece.complete() {
+			p.t.queuePieceForHashing(i)
+		}
+	}()
 	piece.makeBlockComplete(ci, off)
-	inEndGame := p.endGame
-	p.mu.Unlock()
-	if inEndGame {
-		p.t.sendCancels(block{
-			pc:  i,
-			off: off,
-			len: piece.blockLen(off),
-		})
-	}
-	if piece.complete() {
-		p.t.queuePieceForHashing(i)
-	}
+	inEndGame = p.endGame
 }
 
-func (p *pieces) pieceSuccesfullyVerified(i int) {
-	p.pcs[i].verificationSuccess()
-	//change strategy after completion of first block
-	if p.ownedPieces.Len() == 0 {
-		p.mu.Lock()
-		p.lessFunc = lessByRarity
-		p.mu.Unlock()
-	}
+func (p *pieces) pieceVerified(i int) {
+	var requestsAreAvailable bool
 	p.ownedPieces.Set(i, true)
-	if remaining := p.t.numPieces() - p.ownedPieces.Len(); remaining > 0 && remaining < 3 {
-		if p.prepareEndgame() {
+	p.pcs[i].verificationSuccess()
+	p.mu.Lock()
+	defer func() {
+		p.mu.Unlock()
+		if requestsAreAvailable {
 			p.t.broadcastCommand(requestsAvailable{})
 		}
+	}()
+	//remove the piece from priotirzedPcs, we'll never make requests for it again.
+	for j, piece := range p.prioritizedPcs {
+		if piece.index == i {
+			p.prioritizedPcs = append(p.prioritizedPcs[:j], p.prioritizedPcs[j+1:]...)
+		}
+	}
+	switch owned := p.ownedPieces.Len(); {
+	case p.t.numPieces()-owned == endGameThreshold:
+		requestsAreAvailable = p.setupEndgame()
+	case owned == randomPiecePickingStrategyThreshold:
+		p.piecePickStrategy = lessByRarity
 	}
 }
 
@@ -193,16 +210,15 @@ func (p *pieces) pieceVerificationFailed(i int) {
 	p.pcs[i].verificationFailed()
 }
 
-func (p *pieces) prepareEndgame() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (p *pieces) setupEndgame() bool {
 	if p.endGame {
+		//shouldn't happen unless we drop a piece from storage
 		return false
 	}
 	p.endGame = true
 	notOwned := bitmap.Flip(p.ownedPieces, 0, p.t.numPieces())
-	if notOwned.Len() > 2 {
-		panic("endgame start")
+	if notOwned.Len() > endGameThreshold {
+		panic("endgame before threshold")
 	}
 	notOwned.IterTyped(func(piece int) bool {
 		p.pcs[piece].makeAllUnrequested()
@@ -221,7 +237,10 @@ func (p *pieces) blocks() []int {
 	return ret
 }
 
-func (p *pieces) valid(i int) bool {
+func (p *pieces) isValid(i int) bool {
+	if p == nil {
+		return false
+	}
 	return i >= 0 && i < len(p.pcs)
 }
 
