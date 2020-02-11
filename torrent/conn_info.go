@@ -42,6 +42,9 @@ func (cn *connInfo) choke() {
 			Kind: peer_wire.Choke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
+		if cn.state.isInterested {
+			cn.stopUploading()
+		}
 	}
 }
 
@@ -51,6 +54,7 @@ func (cn *connInfo) unchoke() {
 			Kind: peer_wire.Unchoke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
+		cn.startUploading()
 	}
 }
 
@@ -71,7 +75,7 @@ func (cn *connInfo) notInterested() {
 		})
 		cn.state.amInterested = !cn.state.amInterested
 		if !cn.state.isChoking {
-			cn.stats.stopDownloading()
+			cn.stopDownloading()
 		}
 	}
 }
@@ -145,6 +149,14 @@ func (cn *connInfo) startUploading() {
 	if cn.state.canUpload() {
 		cn.stats.lastStartedUploading = time.Now()
 	}
+}
+
+func (cn *connInfo) stopDownloading() {
+	cn.stats.stopDownloading()
+}
+
+func (cn *connInfo) stopUploading() {
+	cn.stats.stopUploading()
 }
 
 func (cn *connInfo) isSnubbed() bool {
