@@ -43,7 +43,7 @@ func (t *trackerAnnouncer) announce(te trackerAnnouncerEvent) (*tracker.Announce
 		Uploaded:   int64(te.stats.BytesUploaded),
 		Event:      te.event,
 		//TODO:consider not requesting every time 50 peers
-		Numwant: -1,
+		Numwant: 200,
 		Port:    t.cl.port,
 	}
 	url := te.t.mi.Announce
