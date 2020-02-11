@@ -7,20 +7,26 @@ import (
 	"time"
 )
 
-const maxUploadSlots = 4
 const optimisticSlots = 1
+const defaultMaxUploadSlots = 4
 const chokerTriggeringInterval = 10 * time.Second
 
+//choker is responsible for unchoking peers
 type choker struct {
-	t          *Torrent
-	currRound  int
-	optimistic *connInfo
-	ticker     *time.Ticker
+	t                *Torrent
+	currRound        int
+	optimistic       *connInfo
+	ticker           *time.Ticker
+	enableOptimistic bool
+	//optimistic unchoke is not included in these slots
+	maxUploadSlots int
 }
 
 func newChoker(t *Torrent) *choker {
 	return &choker{
-		t: t,
+		t:                t,
+		maxUploadSlots:   defaultMaxUploadSlots, //-1 because we will maintain an extra slot for optimistic
+		enableOptimistic: true,
 	}
 }
 
@@ -66,7 +72,7 @@ func (c *choker) reviewUnchokedPeers() {
 	if len(c.t.conns) == 0 {
 		return
 	}
-	if c.currRound%5 == 0 {
+	if c.enableOptimistic && c.currRound%5 == 0 {
 		c.pickOptimisticUnchoke()
 	}
 	bestPeers, optimisticCandidates := []*connInfo{}, []*connInfo{}
@@ -81,14 +87,14 @@ func (c *choker) reviewUnchokedPeers() {
 		}
 	}
 	sort.Sort(byRate(bestPeers))
-	uploadSlots := int(math.Min(maxUploadSlots, float64(len(bestPeers))))
+	uploadSlots := int(math.Min(float64(c.maxUploadSlots), float64(len(bestPeers))))
 	optimisticCandidates = append(optimisticCandidates, bestPeers[uploadSlots:]...)
 	//peers that have best upload rates (optimistic may belong to bestPeers)
 	bestPeers = bestPeers[:uploadSlots]
 	for _, conn := range bestPeers {
 		conn.unchoke()
 	}
-	numOptimistics := optimisticSlots + (maxUploadSlots - uploadSlots)
+	numOptimistics := boolToInt(c.enableOptimistic) + (c.maxUploadSlots - uploadSlots)
 	var optimisticCount int
 	if containsConn(optimisticCandidates, c.optimistic) { //optimistic belongs to optimisticCandidates.
 		c.optimistic.unchoke()
@@ -97,8 +103,8 @@ func (c *choker) reviewUnchokedPeers() {
 	//unchoke optimistics in random order and choke the remaining ones.
 	indices := rand.Perm(len(optimisticCandidates))
 	for _, i := range indices {
-		//we've already handled this case
 		if c.optimistic != nil && c.optimistic == optimisticCandidates[i] {
+			//we've already unchoked optimistic
 			continue
 		}
 		if optimisticCount >= numOptimistics {

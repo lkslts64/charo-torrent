@@ -30,9 +30,12 @@ func TestChoker(t *testing.T) {
 		}
 		conns = append(conns, ci)
 	}
-	chk := newChoker(&Torrent{
-		conns: conns,
-	})
+	chk := &choker{
+		t: &Torrent{
+			conns: conns,
+		},
+		maxUploadSlots: 4,
+	}
 	chk.reviewUnchokedPeers()
 	//ensure we unchoked optimistic
 	assert.NotNil(t, chk.optimistic)
@@ -42,12 +45,12 @@ func TestChoker(t *testing.T) {
 	for i, c := range conns {
 		if c == chk.optimistic {
 			//optimistic belongs to bestPeers
-			if i >= numConns-maxUploadSlots {
+			if i >= numConns-chk.maxUploadSlots {
 				extraOptimistic = true
 			}
 			continue
 		}
-		assertion := i <= len(conns)-1-maxUploadSlots == c.state.amChoking
+		assertion := i <= len(conns)-1-chk.maxUploadSlots == c.state.amChoking
 		if !assertion {
 			if onceFlag || !extraOptimistic {
 				t.Fail()
@@ -56,7 +59,7 @@ func TestChoker(t *testing.T) {
 		}
 	}
 	testNumOfUnchokes(t, chk, numConns, numConns)
-	testNumOfUnchokes(t, chk, 0, maxUploadSlots+optimisticSlots)
+	testNumOfUnchokes(t, chk, 0, chk.maxUploadSlots+optimisticSlots)
 	testNumOfUnchokes(t, chk, numConns-2, numConns)
 }
 
