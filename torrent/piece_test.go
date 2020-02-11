@@ -120,9 +120,9 @@ func TestPiecesState(t *testing.T) {
 func TestPiecePrioritization(t *testing.T) {
 	tr := newTestTorrent(100, 3, 1, 1)
 	p := newPieces(tr)
-	p.strategy = lessByRarity
+	p.piecePickStrategy = lessByRarity
 	var bm bitmap.Bitmap
-	bm.AddRange(0, tr.numPieces()-1)
+	bm.AddRange(0, tr.numPieces())
 	//make piece 50 have the highest completeness score
 	p.pcs[50].makeBlockPending(2)
 	p.pcs[50].makeBlockPending(1)
@@ -154,6 +154,35 @@ func TestPiecePrioritization(t *testing.T) {
 	}
 	//last will be the one with the lowest priority
 	assert.Equal(t, 60, p.prioritizedPcs[len(p.prioritizedPcs)-1].index)
+}
+
+func TestEndGame(t *testing.T) {
+	tr := newTestTorrent(100, 3, 1, 1)
+	p := newPieces(tr)
+	//end game will be activated for pieces 0 and 1
+	p.ownedPieces.AddRange(2, 100)
+	//make all complete except 0 and 1
+	for _, piece := range p.pcs {
+		if piece.index == 0 || piece.index == 1 {
+			continue
+		}
+		piece.completeBlocks, piece.unrequestedBlocks = piece.unrequestedBlocks, piece.completeBlocks
+	}
+	p.pcs[0].makeBlockPending(0)
+	p.pcs[1].makeBlockPending(0)
+	p.setupEndgame()
+	assert.True(t, p.pcs[0].allBlocksUnrequested() && p.pcs[1].allBlocksUnrequested())
+	var bm bitmap.Bitmap
+	bm.AddRange(0, tr.numPieces())
+	//simulate 2 conns getting requests.The same blocks should be returned over and over again
+	for i := 0; i < 2; i++ {
+		reqs := make([]block, 10)
+		n := p.getRequests(bm, reqs)
+		reqs = reqs[:n]
+		for _, req := range reqs {
+			assert.True(t, req.pc == 0 || req.pc == 1)
+		}
+	}
 }
 
 func newTestTorrent(numPieces, pieceLen, lastPieceLen, blockSz int) *Torrent {
