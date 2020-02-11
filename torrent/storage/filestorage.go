@@ -14,13 +14,6 @@ import (
 	"github.com/lkslts64/charo-torrent/metainfo"
 )
 
-//Storage is the interface every storage should adhere to
-type Storage interface {
-	ReadBlock(b []byte, off int64) (n int, err error)
-	WriteBlock(b []byte, off int64) (n int, err error)
-	HashPiece(pieceIndex int, len int) (correct bool)
-}
-
 //FileStorage is a file-based storage for torrent data
 type FileStorage struct {
 	logger *log.Logger
@@ -32,7 +25,7 @@ type FileStorage struct {
 
 //OpenFileStorage initializes the storage.`blocks` is a slice containing how many
 //blocks each piece has. if returns true it means we are ready for seeding
-func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) (fs *FileStorage, seed bool) {
+func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger *log.Logger) (s Storage, seed bool) {
 	//Surely we can find `blocks` from metainfo but is expensive.
 	pieces := make([]*piece, mi.Info.NumPieces())
 	for i := 0; i < len(pieces); i++ {
@@ -41,13 +34,14 @@ func OpenFileStorage(mi *metainfo.MetaInfo, baseDir string, blocks []int, logger
 			dirtyBlocks: make(map[int64]struct{}),
 		}
 	}
-	fs = &FileStorage{
+	fs := &FileStorage{
 		logger: logger,
 		mi:     mi,
 		dir:    baseDir,
 		pieces: pieces,
 	}
 	seed = fs.dataComplete() && fs.dataVerified()
+	s = fs
 	return
 }
 
