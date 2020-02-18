@@ -50,7 +50,7 @@ func (r *httpAnnounceResponse) parse() error {
 			if ip = net.ParseIP(string(r.Peers[i].IP)); ip == nil {
 				var ips []net.IP
 				if ips, err = net.LookupIP(string(r.Peers[i].IP)); err != nil {
-					return fmt.Errorf("IP parse error (neither an IPv4/6 nor a DNS name) at peer with ID %s : %w", string(r.Peers[i].ID), err)
+					return fmt.Errorf("IP parse error (neither an IPv4/6 nor a DNS name) at peer with IP %v : %w", r.Peers[i].IP, err)
 				}
 				r.Peers[i].IP = ips[0]
 			} else {
