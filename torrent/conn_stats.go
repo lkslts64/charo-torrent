@@ -2,8 +2,9 @@ package torrent
 
 import (
 	"fmt"
-	"github.com/dustin/go-humanize"
 	"time"
+
+	"github.com/dustin/go-humanize"
 )
 
 type connStats struct {
@@ -25,10 +26,6 @@ type connStats struct {
 	sumUploading            time.Duration
 	badPiecesContributions  int
 	goodPiecesContributions int
-}
-
-func newConnStats() connStats {
-	return connStats{}
 }
 
 func (cs *connStats) stopDownloading() {
