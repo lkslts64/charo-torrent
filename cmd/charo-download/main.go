@@ -26,7 +26,7 @@ func main() {
 	}
 	w := uilive.New()
 	w.Start()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	finish := t.Download()
 loop:
