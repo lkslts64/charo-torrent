@@ -17,7 +17,7 @@ var proto = [...]byte{
 }
 
 type HandShake struct {
-	Reserved [8]byte
+	Reserved Reserved
 	InfoHash [20]byte
 	PeerID   [20]byte
 }
