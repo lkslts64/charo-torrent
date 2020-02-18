@@ -179,7 +179,7 @@ func (p *pieces) pieceVerified(i int) {
 			p.t.broadcastCommand(requestsAvailable{})
 		}
 	}()
-	//remove the piece from priotirzedPcs, we'll never make requests for it again.
+	//remove the piece i from priotirzedPcs, we'll never make requests for it again.
 	for j, piece := range p.prioritizedPcs {
 		if piece.index == i {
 			p.prioritizedPcs = append(p.prioritizedPcs[:j], p.prioritizedPcs[j+1:]...)
