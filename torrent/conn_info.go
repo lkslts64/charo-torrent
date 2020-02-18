@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -12,8 +13,9 @@ import (
 //some informations like state,bitmap which also conn holds too -
 //we dont share, we communicate so we have some duplicate data-.
 type connInfo struct {
-	t    *Torrent
-	addr string
+	t        *Torrent
+	addr     net.Addr
+	reserved peer_wire.Reserved
 	//we communicate with conn with these channels - conn also has them
 	commandCh chan interface{}
 	eventCh   chan interface{}
@@ -89,6 +91,13 @@ func (cn *connInfo) have(i int) {
 
 func (cn *connInfo) sendBitfield() {
 	cn.sendCommand(cn.t.pieces.ownedPieces.Copy())
+}
+
+func (cn *connInfo) sendPort() {
+	cn.sendCommand(&peer_wire.Msg{
+		Kind: peer_wire.Port,
+		Port: cn.t.cl.dhtPort(),
+	})
 }
 
 //manages if we are interested in peer after a sending us bitfield msg

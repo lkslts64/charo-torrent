@@ -41,6 +41,7 @@ type Msg struct {
 	Len         uint32
 	Bf          BitField
 	Block       []byte
+	Port        uint16
 	ExtendedID  ExtensionID
 	ExtendedMsg interface{}
 }
@@ -53,7 +54,7 @@ func (m *Msg) Write(conn io.Writer) (err error) {
 	}
 	var b bytes.Buffer
 	switch m.Kind {
-	case Port, KeepAlive:
+	case KeepAlive:
 	case Choke, Unchoke, Interested, NotInterested:
 		try(writeBinary(&b, m.Kind))
 	case Have:
@@ -64,6 +65,8 @@ func (m *Msg) Write(conn io.Writer) (err error) {
 		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
 	case Piece:
 		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
+	case Port:
+		try(writeBinary(&b, m.Kind, m.Port))
 	case Extended:
 		try(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
 	default:
@@ -83,7 +86,7 @@ func (m *Msg) EncodeBinary() ([]byte, error) {
 	}
 	var b bytes.Buffer
 	switch m.Kind {
-	case Port, KeepAlive:
+	case KeepAlive:
 	case Choke, Unchoke, Interested, NotInterested:
 		try(writeBinary(&b, m.Kind))
 	case Have:
@@ -96,6 +99,8 @@ func (m *Msg) EncodeBinary() ([]byte, error) {
 		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
 	case Extended:
 		try(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
+	case Port:
+		try(writeBinary(&b, m.Kind, m.Port))
 	default:
 		panic("Unknown kind of msg to send")
 	}
@@ -133,7 +138,6 @@ func Read(conn io.Reader) (*Msg, error) {
 	b := bytes.NewBuffer(buf)
 	checkRead(readFromBinary(b, &msg.Kind))
 	switch msg.Kind {
-	case Port: //do nothing since we dont support DHT
 	case Choke, Unchoke, Interested, NotInterested:
 	case Have:
 		checkRead(readFromBinary(b, &msg.Index))
@@ -144,6 +148,8 @@ func Read(conn io.Reader) (*Msg, error) {
 	case Piece:
 		checkRead(readFromBinary(b, &msg.Index, &msg.Begin))
 		msg.Block = b.Bytes()
+	case Port:
+		checkRead(readFromBinary(b, &msg.Port))
 	case Extended:
 		checkRead(readFromBinary(b, &msg.ExtendedID))
 		err = readExtension(msg.ExtendedID, b.Bytes(), msg)

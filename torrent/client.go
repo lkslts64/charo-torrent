@@ -10,15 +10,15 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/anacrolix/dht/v2"
 	"github.com/lkslts64/charo-torrent/metainfo"
 	"github.com/lkslts64/charo-torrent/peer_wire"
+	"github.com/lkslts64/charo-torrent/torrent/storage"
 	"github.com/lkslts64/charo-torrent/tracker"
 )
 
 const clientID = "CH"
 const version = "0001"
-
-var reserved [8]byte
 
 //Client manages multiple torrents
 type Client struct {
@@ -40,17 +40,22 @@ type Client struct {
 	listener net.Listener
 	//when this channel closes, all Torrents and conns that the client is managing will close.
 	//close                   chan chan struct{}
-	announcer               *trackerAnnouncer
+	trackerAnnouncer *trackerAnnouncer
+	dhtServer        *dht.Server
+	//the reserved bytes we'll send at every handshake
+	reserved                peer_wire.Reserved
 	trackerAnnouncerCloseCh chan chan struct{}
-	port                    int16
+	port                    int
 }
 
 type Config struct {
 	MaxOnFlightReqs int //max outstanding requests we allowed for a peer to have
 	MaxConns        int
 	DisableTrackers bool
+	DisableDHT      bool
 	//directory to store the data
-	BaseDir string
+	BaseDir     string
+	OpenStorage storage.Open
 }
 
 func NewClient(cfg *Config) (*Client, error) {
@@ -79,13 +84,27 @@ func NewClient(cfg *Config) (*Client, error) {
 		return nil, err
 	}
 	go cl.accept()
-	cl.announcer = &trackerAnnouncer{
-		cl:                            cl,
-		trackerAnnouncerSubmitEventCh: make(chan trackerAnnouncerEvent, 5),
-		trackers:                      make(map[string]tracker.TrackerURL),
-	}
 	if !cl.config.DisableTrackers {
-		go cl.announcer.run()
+		cl.trackerAnnouncer = &trackerAnnouncer{
+			cl:                            cl,
+			trackerAnnouncerSubmitEventCh: make(chan trackerAnnouncerEvent, 5),
+			trackers:                      make(map[string]tracker.TrackerURL),
+		}
+		go cl.trackerAnnouncer.run()
+	}
+	if !cl.config.DisableDHT {
+		cl.reserved.SetDHT()
+		if cl.dhtServer, err = dht.NewServer(nil); err == nil {
+			go func() {
+				ts, err := cl.dhtServer.Bootstrap()
+				if err != nil {
+					cl.logger.Printf("error bootstrapping dht: %s", err)
+				}
+				cl.logger.Printf("dht bootstrap complete with stats %v", ts)
+			}()
+		} else {
+			cl.logger.Fatalf("error creating dht server: %s", err)
+		}
 	}
 	return cl, nil
 }
@@ -115,6 +134,7 @@ func defaultConfig() (*Config, error) {
 		MaxOnFlightReqs: 250,
 		MaxConns:        55,
 		BaseDir:         tdir,
+		OpenStorage:     storage.OpenFileStorage,
 	}, nil
 }
 
@@ -123,6 +143,7 @@ func DefaultConfig() *Config {
 		MaxOnFlightReqs: 250,
 		MaxConns:        55,
 		BaseDir:         "./",
+		OpenStorage:     storage.OpenFileStorage,
 	}
 }
 
@@ -177,12 +198,23 @@ func (cl *Client) Torrents() []*Torrent {
 }
 */
 
+func (cl *Client) dhtPort() uint16 {
+	_, _port, err := net.SplitHostPort(cl.dhtServer.Addr().String())
+	if err != nil {
+		panic(err)
+	}
+	port, err := strconv.ParseUint(_port, 10, 16)
+	if err != nil {
+		panic(err)
+	}
+	return uint16(port)
+}
+
 //6881-6889
 func (cl *Client) listen() error {
-	var i int16
 	var err error
 	//var ln net.Listener
-	for i = 6881; i < 6890; i++ {
+	for i := 6881; i < 6890; i++ {
 		//we dont support IPv6
 		cl.listener, err = net.Listen("tcp4", ":"+strconv.Itoa(int(i)))
 		if err == nil {
@@ -193,6 +225,14 @@ func (cl *Client) listen() error {
 	//if none of the BT ports was avaialable, try other ones.
 	if cl.listener, err = net.Listen("tcp4", ":"); err != nil {
 		return errors.New("could not find port to listen")
+	}
+	_, port, err := net.SplitHostPort(cl.listener.Addr().String())
+	if err != nil {
+		return err
+	}
+	cl.port, err = strconv.Atoi(port)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -211,7 +251,7 @@ func (cl *Client) accept() error {
 
 func (cl *Client) handleConn(tcpConn net.Conn) {
 	hs := &peer_wire.HandShake{
-		Reserved: reserved,
+		Reserved: cl.reserved,
 		PeerID:   cl.peerID,
 	}
 	err := cl.handshake(tcpConn, hs)
@@ -233,19 +273,20 @@ func (cl *Client) handleConn(tcpConn net.Conn) {
 
 //TODO: store the remote addr and pop when finish
 func (cl *Client) connectToPeer(address string, t *Torrent) {
-	tcpConn, err := net.Dial("tcp", address)
+	//cl.logger.Printf("new conn at connectPeer with address %s\n", address)
+	tcpConn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		cl.logger.Printf("cannot dial peer: %s", err)
 		return
 	}
 	defer tcpConn.Close()
 	err = cl.handshake(tcpConn, &peer_wire.HandShake{
-		Reserved: reserved,
+		Reserved: cl.reserved,
 		PeerID:   cl.peerID,
 		InfoHash: t.mi.Info.Hash,
 	})
 	if err != nil {
-		cl.logger.Println(err)
+		cl.logger.Printf("handshake: %s", err)
 		return
 	}
 	err = newConn(t, tcpConn, cl.peerID[:]).mainLoop()
@@ -268,9 +309,5 @@ func (cl *Client) handshake(tcpConn net.Conn, hs *peer_wire.HandShake) error {
 	//dont wait more than 5 secs for handshake
 	tcpConn.SetDeadline(time.Now().Add(5 * time.Second))
 	defer tcpConn.SetDeadline(time.Time{})
-	err := hs.Do(tcpConn, cl.infoHashes)
-	if err != nil {
-		cl.logger.Println(err)
-	}
-	return err
+	return hs.Do(tcpConn, cl.infoHashes)
 }

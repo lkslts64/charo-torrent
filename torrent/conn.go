@@ -36,6 +36,7 @@ type conn struct {
 	logger *log.Logger
 	//tcp connection with peer
 	cn   net.Conn
+	addr net.Addr
 	exts peer_wire.Extensions
 	//main goroutine also has this state - needs to be synced between
 	//the two goroutines
@@ -62,6 +63,7 @@ type conn struct {
 	//An integer, the number of outstanding request messages this peer supports
 	//without dropping any. The default in in libtorrent is 250.
 	peerReqq int
+	reserved peer_wire.Reserved
 	//TODO: we 'll need this later.
 	peerBf bitmap.Bitmap
 	myBf   bitmap.Bitmap
@@ -75,6 +77,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		t:            t,
 		logger:       log.New(t.cl.logWriter, fmt.Sprintf("%x", peerID), log.LstdFlags),
 		cn:           cn,
+		addr:         cn.RemoteAddr(),
 		state:        newConnState(),
 		commandCh:    make(chan interface{}, commandChSize),
 		eventCh:      make(chan interface{}, eventChSize),
@@ -84,12 +87,15 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		peerReqs:     make(map[block]struct{}),
 	}
 	//inform Torrent about the new conn
-	t.newConnCh <- &connChansInfo{
-		c.commandCh,
-		c.eventCh,
-		c.dropped,
+	t.newConnCh <- &connInfo{
+		t:         c.t,
+		commandCh: c.commandCh,
+		eventCh:   c.eventCh,
+		dropped:   c.dropped,
+		addr:      c.addr,
+		reserved:  c.reserved,
+		state:     c.state,
 	}
-	c.eventCh <- c.cn.RemoteAddr()
 	return c
 }
 
@@ -257,6 +263,7 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 	switch v := cmd.(type) {
 	case *peer_wire.Msg:
 		switch v.Kind {
+		case peer_wire.Port:
 		case peer_wire.Interested:
 			c.state.amInterested = true
 			defer c.sendRequests()
@@ -290,6 +297,8 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			if _, ok := c.onFlightReqs[reqMsgToBlock(v)]; !ok {
 				return
 			}
+		default:
+			panic("unknown msg type")
 		}
 		err = c.sendMsg(v)
 	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
@@ -356,7 +365,7 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		return c.sendPeerEvent(msg)
 	}
 	switch msg.Kind {
-	case peer_wire.KeepAlive, peer_wire.Port:
+	case peer_wire.KeepAlive:
 	case peer_wire.Interested:
 		err = stateChange(&c.state.isInterested, true)
 	case peer_wire.NotInterested:
@@ -394,6 +403,17 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		err = c.sendPeerEvent(c.peerBf.Copy())
 	case peer_wire.Extended:
 		c.onExtended(msg)
+	case peer_wire.Port:
+		pingAddr, err := net.ResolveUDPAddr("udp", c.addr.String())
+		if err != nil {
+			panic(err)
+		}
+		if msg.Port != 0 {
+			pingAddr.Port = int(msg.Port)
+		}
+		if c.t.cl.dhtServer != nil {
+			go c.t.cl.dhtServer.Ping(pingAddr, nil)
+		}
 	default:
 		err = errors.New("unknown msg kind received")
 	}
@@ -577,7 +597,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		if !c.haveInfo {
 			return errors.New("peer send piece while we dont have info")
 		}
-		if !c.t.pieceValid(bl.pc) {
+		if !c.t.pieces.isValid(bl.pc) {
 			return errors.New("peer send piece doesn't exist")
 		}
 		//TODO: check if we have the particular block
