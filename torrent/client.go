@@ -2,11 +2,11 @@ package torrent
 
 import (
 	"errors"
-	"io"
-	"io/ioutil"
+	"fmt"
 	"log"
 	"net"
 	"os"
+	"path"
 	"strconv"
 	"time"
 
@@ -19,15 +19,13 @@ import (
 
 const clientID = "CH"
 const version = "0001"
+const logFileName = "charo.log"
 
 //Client manages multiple torrents
 type Client struct {
-	config    *Config
-	peerID    [20]byte
-	logger    *log.Logger
-	logWriter io.Writer
-	//torrents []Torrent
-	//conns    []net.Conn
+	config   *Config
+	peerID   [20]byte
+	logger   *log.Logger
 	torrents map[[20]byte]*Torrent
 	//torrents map[[20]byte]Torrent
 	//a set of info_hashes that clients is
@@ -48,42 +46,49 @@ type Client struct {
 	port                    int
 }
 
+//Config provides configuration for a Client.
 type Config struct {
-	MaxOnFlightReqs int //max outstanding requests we allowed for a peer to have
-	MaxConns        int
-	DisableTrackers bool
-	DisableDHT      bool
+	//max outstanding requests per connection we allow for a peer to have
+	MaxOnFlightReqs     int
+	MaxEstablishedConns int
+	//This option disables DHT also.
+	RejectIncomingConnections bool
+	DisableTrackers           bool
+	DisableDHT                bool
 	//directory to store the data
 	BaseDir     string
 	OpenStorage storage.Open
 }
 
+//NewClient creats a fresh new Client with the provided configuration.
+//Use `NewClient(nil)` for the default configuration.
 func NewClient(cfg *Config) (*Client, error) {
 	var err error
 	if cfg == nil {
-		cfg, err = defaultConfig()
+		cfg, err = DefaultConfig()
 		if err != nil {
 			return nil, err
 		}
 	}
-	//TODO: maybe overwrite log file instead of creating a new one
-	//logFile, err := ioutil.TempFile("", "charo.log")
-	logFile, err := os.Create(os.TempDir() + "/charo.log")
+	logFile, err := os.Create(path.Join(os.TempDir(), logFileName))
 	if err != nil {
 		return nil, err
 	}
 	cl := &Client{
 		peerID:     newPeerID(),
 		config:     cfg,
-		logWriter:  logFile,
-		logger:     log.New(logFile, "client", log.LstdFlags),
 		infoHashes: make(map[[20]byte]struct{}),
 		torrents:   make(map[[20]byte]*Torrent),
 	}
-	if err = cl.listen(); err != nil {
-		return nil, err
+	logPrefix := fmt.Sprintf("client%x ", cl.peerID[14:len(cl.peerID)]) //last 6 bytes of peerID
+	cl.logger = log.New(logFile, logPrefix, log.LstdFlags)
+	if !cl.config.RejectIncomingConnections {
+		go func() {
+			log.Fatal(cl.listenAndAccept())
+		}()
+	} else {
+		cl.config.DisableDHT = true
 	}
-	go cl.accept()
 	if !cl.config.DisableTrackers {
 		cl.trackerAnnouncer = &trackerAnnouncer{
 			cl:                            cl,
@@ -109,63 +114,81 @@ func NewClient(cfg *Config) (*Client, error) {
 	return cl, nil
 }
 
-//drops all torrents that client manages
+//Close drops all Torrents that the client manages
 func (cl *Client) Close() {
-	chanArr := []chan struct{}{}
-	for range cl.torrents {
-		chanArr = append(chanArr, make(chan struct{}, 1))
+	torrents := cl.Torrents()
+	chanArr := make([]chan struct{}, len(torrents))
+	for i := 0; i < len(chanArr); i++ {
+		chanArr[i] = make(chan struct{}, 1)
 	}
 	//signal all torents to close
-	for i, t := range cl.Torrents() {
+	for i, t := range torrents {
 		t.close <- chanArr[i]
 	}
 	//wait until all torrents actually close
-	for i := 0; i < len(cl.torrents); i++ {
-		<-chanArr[i]
+	for _, ch := range chanArr {
+		<-ch
 	}
 }
 
-func defaultConfig() (*Config, error) {
-	tdir, err := ioutil.TempDir(os.TempDir(), "")
+//Returns the default configuration for a client
+func DefaultConfig() (*Config, error) {
+	dir, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
 	return &Config{
-		MaxOnFlightReqs: 250,
-		MaxConns:        55,
-		BaseDir:         tdir,
-		OpenStorage:     storage.OpenFileStorage,
+		MaxOnFlightReqs:     250,
+		MaxEstablishedConns: 55,
+		BaseDir:             dir,
+		OpenStorage:         storage.OpenFileStorage,
 	}, nil
 }
 
-func DefaultConfig() *Config {
-	return &Config{
-		MaxOnFlightReqs: 250,
-		MaxConns:        55,
-		BaseDir:         "./",
-		OpenStorage:     storage.OpenFileStorage,
-	}
-}
-
-//NewTorrentFromFile creates a torrent based on a .torrent file
-func (cl *Client) NewTorrentFromFile(filename string) (*Torrent, error) {
+//AddFromFile creates a torrent based on the contents of filename.
+//The Torrent returned maybe be in seeding mode if all the data is already downloaded.
+func (cl *Client) AddFromFile(filename string) (*Torrent, error) {
 	t := newTorrent(cl)
 	var err error
 	if t.mi, err = metainfo.LoadMetainfoFile(filename); err != nil {
 		return nil, err
 	}
-	cl.infoHashes[t.mi.Info.Hash] = struct{}{}
-	cl.torrents[t.mi.Info.Hash] = t
-	//TODO: find another way of getting the info bytes, it is expensive
-	//to read and decode the file twice
-	if t.infoRaw, err = t.mi.Info.Bytes(filename); err != nil {
-		return nil, err
-	}
+	cl.addToMaps(t)
 	t.gotInfo()
-	//go t.mainLoop()
 	return t, nil
 }
 
+//AddFromMagnet creates a torrent based on the magnet link provided
+func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
+	t := newTorrent(cl)
+	//TODO:change with parseMagnet
+	cl.addToMaps(t)
+	return t, nil
+}
+
+//AddFromInfoHash creates a torrent based on it's infohash.
+func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
+	t := newTorrent(cl)
+	t.mi = &metainfo.MetaInfo{
+		Info: &metainfo.InfoDict{
+			Hash: infohash,
+		},
+	}
+	cl.addToMaps(t)
+	return t, nil
+}
+
+func (cl *Client) addToMaps(t *Torrent) error {
+	ihash := t.mi.Info.Hash
+	if _, ok := cl.infoHashes[ihash]; ok {
+		return errors.New("torrent already exists")
+	}
+	cl.infoHashes[ihash] = struct{}{}
+	cl.torrents[ihash] = t
+	return nil
+}
+
+//Torrents returns all torrents that the client manages.
 func (cl *Client) Torrents() []*Torrent {
 	ts := []*Torrent{}
 	for _, t := range cl.torrents {
@@ -173,30 +196,6 @@ func (cl *Client) Torrents() []*Torrent {
 	}
 	return ts
 }
-
-/*func NewClient(sources []string) (*Client, error) {
-	var err error
-	var peerID [20]byte
-	rand.Read(peerID[:])
-	torrents := make([]*Torrent, len(sources))
-	for i, s := range sources {
-		torrents[i], err = NewTorrent(s)
-		if err != nil {
-			return nil, err
-		}
-	}
-	infoHashes := make(map[[20]byte]struct{})
-	for _, t := range torrents {
-		infoHashes[t.tm.mi.Info.Hash] = struct{}{}
-	}
-	return &Client{
-		peerID:     peerID,
-		torrents:   torrents,
-		infoHashes: infoHashes,
-	}, nil
-
-}
-*/
 
 func (cl *Client) dhtPort() uint16 {
 	_, _port, err := net.SplitHostPort(cl.dhtServer.Addr().String())
@@ -210,10 +209,9 @@ func (cl *Client) dhtPort() uint16 {
 	return uint16(port)
 }
 
-//6881-6889
-func (cl *Client) listen() error {
+func (cl *Client) listenAndAccept() error {
 	var err error
-	//var ln net.Listener
+	//try ports 6881-6889 first
 	for i := 6881; i < 6890; i++ {
 		//we dont support IPv6
 		cl.listener, err = net.Listen("tcp4", ":"+strconv.Itoa(int(i)))
@@ -222,7 +220,7 @@ func (cl *Client) listen() error {
 			return nil
 		}
 	}
-	//if none of the BT ports was avaialable, try other ones.
+	//if none of the above ports were avaialable, try other ones.
 	if cl.listener, err = net.Listen("tcp4", ":"); err != nil {
 		return errors.New("could not find port to listen")
 	}
@@ -234,16 +232,10 @@ func (cl *Client) listen() error {
 	if err != nil {
 		return err
 	}
-	return nil
-}
-
-func (cl *Client) accept() error {
 	for {
 		conn, err := cl.listener.Accept()
 		if err != nil {
-			//TODO: handle different
-			cl.logger.Printf("error accepting conn")
-			continue
+			return err
 		}
 		go cl.handleConn(conn)
 	}
