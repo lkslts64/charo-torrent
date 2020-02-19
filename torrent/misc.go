@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"log"
+	"math/rand"
 	"net"
 	"time"
 )
@@ -14,15 +15,17 @@ func newExpiredTimer() *time.Timer {
 	return timer
 }
 
-// Get preferred outbound ip of this machine
-func GetOutboundIP() net.IP {
+// Get machine's preferred outbound ip
+func getOutboundIP() net.IP {
 	conn, err := net.Dial("udp", "8.8.8.8:80") //never write to this conn
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer conn.Close()
-
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
-
 	return localAddr.IP
+}
+
+func flipCoin() bool {
+	return rand.Intn(2) == 0
 }
