@@ -15,12 +15,15 @@ func main() {
 	if len(args) != 1 {
 		log.Fatal("wrong # of args")
 	}
-	cfg := torrent.DefaultConfig()
+	cfg, err := torrent.DefaultConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
 	cl, err := torrent.NewClient(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	t, err := cl.NewTorrentFromFile(args[0])
+	t, err := cl.AddFromFile(args[0])
 	if err != nil {
 		log.Fatal(err)
 	}
