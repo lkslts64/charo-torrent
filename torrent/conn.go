@@ -75,7 +75,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 	c := &conn{
 		cl:           t.cl,
 		t:            t,
-		logger:       log.New(t.cl.logWriter, fmt.Sprintf("%x", peerID), log.LstdFlags),
+		logger:       log.New(t.cl.logger.Writer(), fmt.Sprintf("%x", peerID), log.LstdFlags),
 		cn:           cn,
 		addr:         cn.RemoteAddr(),
 		state:        newConnState(),
@@ -139,10 +139,6 @@ func (c *conn) mainLoop() error {
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
-			/*case <-debugTick.C:
-			if len(c.onFlightReqs) > 0 {
-				c.logger.Printf("onFlight: %d canDownload: %t\n", len(c.onFlightReqs), c.state.canDownload())
-			}*/
 		}
 		if err != nil {
 			return err
@@ -288,9 +284,7 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			//At the same time, it may be worthwhile to send a HAVE message
 			//to a peer that has that piece already since it will be useful in
 			//determining which piece is rare.
-			//TODO:change to:
-			// if pc.peerBf.Get(int(v.Index)) && !pc.peerBf.peerSeeding() {
-			if c.peerBf.Get(int(v.Index)) {
+			if c.peerSeeding() || (c.peerBf.Get(int(v.Index)) && flipCoin()) {
 				return
 			}
 		case peer_wire.Cancel:
