@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,9 +103,10 @@ type Torrent struct {
 	infoSize int64
 	//we serve metadata only if we have it all.
 	//lock only when writing
-	metadataMu          sync.Mutex //TODO:rename to infoMu
-	infoRaw             []byte
-	ownedMetadataPieces []bool
+	infoMu sync.Mutex
+	//used only when we dont have infoDict part of metaInfo
+	infoBytes       []byte
+	ownedInfoBlocks []bool
 	//frequency map of infoSizes we have received
 	infoSizeFreq freqMap
 	//length of data to be downloaded
@@ -119,17 +119,16 @@ type Torrent struct {
 
 func newTorrent(cl *Client) *Torrent {
 	t := &Torrent{
-		cl:            cl,
-		openStorage:   cl.config.OpenStorage,
-		reqq:          250, //libtorent also has this default
-		done:          make(chan struct{}),
-		events:        make(chan event, maxConns*eventChSize),
-		newConnCh:     make(chan *connInfo, maxConns),
-		downloadedAll: make(chan struct{}),
-		drop:          make(chan struct{}),
-		displayCh:     make(chan chan []byte, 10),
-		close:         make(chan chan struct{}),
-		//trackerAnnouncerSubmitEventCh: cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh,
+		cl:                         cl,
+		openStorage:                cl.config.OpenStorage,
+		reqq:                       250, //libtorent also has this default
+		done:                       make(chan struct{}),
+		events:                     make(chan event, maxConns*eventChSize),
+		newConnCh:                  make(chan *connInfo, maxConns),
+		downloadedAll:              make(chan struct{}),
+		drop:                       make(chan struct{}),
+		displayCh:                  make(chan chan []byte, 10),
+		close:                      make(chan chan struct{}),
 		trackerAnnouncerResponseCh: make(chan trackerAnnouncerResponse, 1),
 		trackerAnnouncerTimer:      newExpiredTimer(),
 		dhtAnnounceTimer:           newExpiredTimer(),
@@ -137,7 +136,7 @@ func newTorrent(cl *Client) *Torrent {
 		queuedForVerification:      make(map[int]struct{}),
 		infoSizeFreq:               newFreqMap(),
 		stats:                      Stats{},
-		logger:                     log.New(cl.logWriter, "torrent", log.LstdFlags),
+		logger:                     log.New(cl.logger.Writer(), "torrent", log.LstdFlags),
 		canAnnounceDht:             true,
 		canAnnounceTracker:         true,
 	}
@@ -176,7 +175,7 @@ func (t *Torrent) mainLoop() {
 				t.startSeeding()
 			}
 		case ci := <-t.newConnCh: //we established a new connection
-			t.addConn(ci)
+			t.establishedConnection(ci)
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
 		case tresp := <-t.trackerAnnouncerResponseCh:
@@ -213,9 +212,6 @@ func (t *Torrent) Close() {
 	//wait until all conns close and then close `doneClosing`.
 	for _, c := range t.conns {
 		<-c.dropped
-		//TODO:logging when conn closes is bad. find another way to log dropped conns
-		//stats.Maybe hold a droppedConns slice, or maybe dont care about droppedConns?
-		//t.logger.Println(c.String())
 	}
 }
 
@@ -267,8 +263,6 @@ func (t *Torrent) parseEvent(e event) {
 		t.droppedConn(e.conn)
 	case discardedRequests:
 		t.broadcastCommand(requestsAvailable{})
-	case net.Addr:
-		e.conn.addr = v
 	}
 }
 
@@ -502,7 +496,7 @@ func (t *Torrent) sendHaves(i int) {
 	}
 }
 
-func (t *Torrent) addConn(ci *connInfo) bool {
+func (t *Torrent) establishedConnection(ci *connInfo) bool {
 	if len(t.conns) >= maxConns {
 		ci.commandCh <- drop{}
 		t.closeDhtAnnounce()
@@ -624,19 +618,19 @@ func (t *Torrent) downloadMetadata() bool {
 	if infoSize == 0 || infoSize > 10000000 { //10MB,anacrolix pulled from his ass
 		return false
 	}
-	t.infoRaw = make([]byte, infoSize)
+	t.infoBytes = make([]byte, infoSize)
 	isLastSmaller := infoSize%metadataPieceSz != 0
 	numPieces := infoSize / metadataPieceSz
 	if isLastSmaller {
 		numPieces++
 	}
-	t.ownedMetadataPieces = make([]bool, numPieces)
+	t.ownedInfoBlocks = make([]bool, numPieces)
 	//send requests to all conns
 	return true
 }
 
 func (t *Torrent) downloadedMetadata() bool {
-	for _, v := range t.ownedMetadataPieces {
+	for _, v := range t.ownedInfoBlocks {
 		if !v {
 			return false
 		}
@@ -647,21 +641,21 @@ func (t *Torrent) downloadedMetadata() bool {
 func (t *Torrent) writeMetadataPiece(b []byte, i int) error {
 	//tm.metadataMu.Lock()
 	//defer tm.metadataMu.Unlock()
-	if t.ownedMetadataPieces[i] {
+	if t.ownedInfoBlocks[i] {
 		return nil
 	}
 	//TODO:log this
-	if i*metadataPieceSz >= len(t.infoRaw) {
+	if i*metadataPieceSz >= len(t.infoBytes) {
 		return errors.New("write metadata piece: out of range")
 	}
 	if len(b) > metadataPieceSz {
 		return errors.New("write metadata piece: length of of piece too big")
 	}
-	if len(b) != metadataPieceSz && i != len(t.ownedMetadataPieces)-1 {
+	if len(b) != metadataPieceSz && i != len(t.ownedInfoBlocks)-1 {
 		return errors.New("write metadata piece:piece is not the last and length is not 16KB")
 	}
-	copy(t.infoRaw[i*metadataPieceSz:], b)
-	t.ownedMetadataPieces[i] = true
+	copy(t.infoBytes[i*metadataPieceSz:], b)
+	t.ownedInfoBlocks[i] = true
 	if t.downloadedMetadata() && t.verifyInfoDict() {
 		t.gotInfo()
 	} else {
@@ -675,24 +669,24 @@ func (t *Torrent) readMetadataPiece(b []byte, i int) error {
 		panic("read metadata piece:we dont have info")
 	}
 	//out of range
-	if i*metadataPieceSz >= len(t.infoRaw) {
+	if i*metadataPieceSz >= len(t.infoBytes) {
 		return errors.New("read metadata piece: out of range")
 	}
 
 	//last piece case
-	if (i+1)*metadataPieceSz >= len(t.infoRaw) {
-		b = t.infoRaw[i*metadataPieceSz:]
+	if (i+1)*metadataPieceSz >= len(t.infoBytes) {
+		b = t.infoBytes[i*metadataPieceSz:]
 	} else {
-		b = t.infoRaw[i*metadataPieceSz : (i+1)*metadataPieceSz]
+		b = t.infoBytes[i*metadataPieceSz : (i+1)*metadataPieceSz]
 	}
 	return nil
 }
 
 func (t *Torrent) verifyInfoDict() bool {
-	if sha1.Sum(t.infoRaw) != t.mi.Info.Hash {
+	if sha1.Sum(t.infoBytes) != t.mi.Info.Hash {
 		return false
 	}
-	if err := bencode.Decode(t.infoRaw, t.mi.Info); err != nil {
+	if err := bencode.Decode(t.infoBytes, t.mi.Info); err != nil {
 		t.logger.Fatal("cant decode info dict")
 	}
 	return true
