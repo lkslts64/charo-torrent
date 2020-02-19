@@ -44,7 +44,7 @@ func (t *trackerAnnouncer) announce(te trackerAnnouncerEvent) (*tracker.Announce
 		Event:      te.event,
 		//TODO:consider not requesting every time 50 peers
 		Numwant: 200,
-		Port:    t.cl.port,
+		Port:    int16(t.cl.port),
 	}
 	url := te.t.mi.Announce
 	if _, ok := t.trackers[url]; !ok {
