@@ -103,7 +103,7 @@ func TestPeerRequestAndCancel(t *testing.T) {
 	w, r := net.Pipe()
 	//we need to read the Piece msgs that r produces (see net.Pipe docs)
 	go readForever(w)
-	cn, tr, err := loadTorrentFile(w, r, "../metainfo/testdata/archlinux-2011.08.19-netinstall-i686.iso.torrent")
+	cn, tr, err := loadTorrentFile(t, w, r, "../metainfo/testdata/archlinux-2011.08.19-netinstall-i686.iso.torrent")
 	require.NoError(t, err)
 	tr.storage = dummyStorage{}
 	allowUpload(cn, w)
@@ -157,12 +157,12 @@ func TestPeerRequestAndCancel(t *testing.T) {
 
 func BenchmarkPeerPieceMsg(b *testing.B) {
 	w, r := net.Pipe()
-	cn, tr, err := loadTorrentFile(w, r, "../metainfo/testdata/oliver-koletszki-Schneeweiss11.torrent")
+	cn, tr, err := loadTorrentFile(b, w, r, "testdata/blockchain.torrent")
 	tr.storage = dummyStorage{}
 	tr.blockRequestSize = tr.blockSize()
 	tr.pieces = newPieces(tr)
 	require.NoError(b, err)
-	allowDownload(cn, w)
+	cn.state.isChoking, cn.state.amInterested = false, true
 	msg := &peer_wire.Msg{
 		Kind:  peer_wire.Piece,
 		Block: make([]byte, 1<<14),
@@ -190,20 +190,20 @@ func readForever(r io.Reader) {
 	}
 }
 
-func loadTorrentFile(w, r net.Conn, filename string) (*conn, *Torrent, error) {
-	cl, err := NewClient(nil)
-	if err != nil {
-		return nil, nil, err
-	}
+func loadTorrentFile(t testing.TB, w, r net.Conn, filename string) (*conn, *Torrent, error) {
+	cfg := testingConfig()
+	cfg.RejectIncomingConnections = true
+	cl, err := NewClient(cfg)
+	require.NoError(t, err)
 	tr := newTorrent(cl)
 	cn := newConn(tr, r, make([]byte, 20))
 	tr.mi, err = metainfo.LoadMetainfoFile(filename)
-	if err != nil {
-		return nil, nil, err
-	}
+	require.NoError(t, err)
 	tr.logger = log.New(os.Stdout, "test_logger", log.LstdFlags)
 	cn.commandCh <- haveInfo{}
-	go cn.mainLoop()
+	go func() {
+		require.NoError(t, cn.mainLoop())
+	}()
 	return cn, tr, nil
 }
 
