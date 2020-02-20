@@ -15,6 +15,7 @@ import (
 type connInfo struct {
 	t        *Torrent
 	addr     net.Addr
+	peer     Peer
 	reserved peer_wire.Reserved
 	//we communicate with conn with these channels - conn also has them
 	commandCh chan interface{}

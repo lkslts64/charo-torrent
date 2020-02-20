@@ -4,6 +4,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -28,4 +29,28 @@ func getOutboundIP() net.IP {
 
 func flipCoin() bool {
 	return rand.Intn(2) == 0
+}
+
+type addrPort struct {
+	ip   net.IP
+	port uint16
+}
+
+func parseAddr(address string) (*addrPort, error) {
+	shost, sport, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.ParseUint(sport, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	ip := net.ParseIP(shost)
+	if ip == nil {
+		return nil, err
+	}
+	return &addrPort{
+		ip:   ip.To4(),
+		port: uint16(port),
+	}, nil
 }

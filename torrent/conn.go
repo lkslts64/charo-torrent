@@ -36,7 +36,7 @@ type conn struct {
 	logger *log.Logger
 	//tcp connection with peer
 	cn   net.Conn
-	addr net.Addr
+	peer Peer
 	exts peer_wire.Extensions
 	//main goroutine also has this state - needs to be synced between
 	//the two goroutines
@@ -71,13 +71,13 @@ type conn struct {
 }
 
 //just wraps a msg with an error
-func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
+func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 	c := &conn{
 		cl:           t.cl,
 		t:            t,
-		logger:       log.New(t.cl.logger.Writer(), fmt.Sprintf("%x", peerID), log.LstdFlags),
+		logger:       log.New(t.cl.logger.Writer(), "conn", log.LstdFlags),
 		cn:           cn,
-		addr:         cn.RemoteAddr(),
+		peer:         peer,
 		state:        newConnState(),
 		commandCh:    make(chan interface{}, commandChSize),
 		eventCh:      make(chan interface{}, eventChSize),
@@ -92,7 +92,7 @@ func newConn(t *Torrent, cn net.Conn, peerID []byte) *conn {
 		commandCh: c.commandCh,
 		eventCh:   c.eventCh,
 		dropped:   c.dropped,
-		addr:      c.addr,
+		peer:      c.peer,
 		reserved:  c.reserved,
 		state:     c.state,
 	}
@@ -398,7 +398,7 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	case peer_wire.Extended:
 		c.onExtended(msg)
 	case peer_wire.Port:
-		pingAddr, err := net.ResolveUDPAddr("udp", c.addr.String())
+		pingAddr, err := net.ResolveUDPAddr("udp", c.cn.RemoteAddr().String())
 		if err != nil {
 			panic(err)
 		}
