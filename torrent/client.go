@@ -49,7 +49,8 @@ type Client struct {
 //Config provides configuration for a Client.
 type Config struct {
 	//max outstanding requests per connection we allow for a peer to have
-	MaxOnFlightReqs     int
+	MaxOnFlightReqs int
+	//TODO: move to torrent
 	MaxEstablishedConns int
 	//This option disables DHT also.
 	RejectIncomingConnections bool
@@ -83,8 +84,9 @@ func NewClient(cfg *Config) (*Client, error) {
 	logPrefix := fmt.Sprintf("client%x ", cl.peerID[14:len(cl.peerID)]) //last 6 bytes of peerID
 	cl.logger = log.New(logFile, logPrefix, log.LstdFlags)
 	if !cl.config.RejectIncomingConnections {
+		cl.listen()
 		go func() {
-			log.Fatal(cl.listenAndAccept())
+			log.Fatal(cl.acceptForEver())
 		}()
 	} else {
 		cl.config.DisableDHT = true
@@ -198,18 +200,14 @@ func (cl *Client) Torrents() []*Torrent {
 }
 
 func (cl *Client) dhtPort() uint16 {
-	_, _port, err := net.SplitHostPort(cl.dhtServer.Addr().String())
+	ap, err := parseAddr(cl.dhtServer.Addr().String())
 	if err != nil {
 		panic(err)
 	}
-	port, err := strconv.ParseUint(_port, 10, 16)
-	if err != nil {
-		panic(err)
-	}
-	return uint16(port)
+	return ap.port
 }
 
-func (cl *Client) listenAndAccept() error {
+func (cl *Client) listen() error {
 	var err error
 	//try ports 6881-6889 first
 	for i := 6881; i < 6890; i++ {
@@ -224,14 +222,15 @@ func (cl *Client) listenAndAccept() error {
 	if cl.listener, err = net.Listen("tcp4", ":"); err != nil {
 		return errors.New("could not find port to listen")
 	}
-	_, port, err := net.SplitHostPort(cl.listener.Addr().String())
+	ap, err := parseAddr(cl.listener.Addr().String())
 	if err != nil {
 		return err
 	}
-	cl.port, err = strconv.Atoi(port)
-	if err != nil {
-		return err
-	}
+	cl.port = int(ap.port)
+	return nil
+}
+
+func (cl *Client) acceptForEver() error {
 	for {
 		conn, err := cl.listener.Accept()
 		if err != nil {
@@ -241,7 +240,22 @@ func (cl *Client) listenAndAccept() error {
 	}
 }
 
+func addrToPeer(address string, source PeerSource) Peer {
+	ap, err := parseAddr(address)
+	if err != nil {
+		panic(err)
+	}
+	return Peer{
+		tp: tracker.Peer{
+			IP:   ap.ip,
+			Port: ap.port,
+		},
+		source: source,
+	}
+}
+
 func (cl *Client) handleConn(tcpConn net.Conn) {
+	defer tcpConn.Close()
 	hs := &peer_wire.HandShake{
 		Reserved: cl.reserved,
 		PeerID:   cl.peerID,
@@ -257,16 +271,16 @@ func (cl *Client) handleConn(tcpConn net.Conn) {
 	if t, ok = cl.torrents[hs.InfoHash]; !ok {
 		panic("we checked that we have this torrent")
 	}
-	err = newConn(t, tcpConn, cl.peerID[:]).mainLoop()
+	p := addrToPeer(tcpConn.RemoteAddr().String(), SourceIncoming)
+	err = newConn(t, tcpConn, p).mainLoop()
 	if err != nil {
 		cl.logger.Println(err)
 	}
 }
 
 //TODO: store the remote addr and pop when finish
-func (cl *Client) connectToPeer(address string, t *Torrent) {
-	//cl.logger.Printf("new conn at connectPeer with address %s\n", address)
-	tcpConn, err := net.DialTimeout("tcp", address, 5*time.Second)
+func (cl *Client) connectToPeer(peer Peer, t *Torrent) {
+	tcpConn, err := net.DialTimeout("tcp", peer.tp.String(), 5*time.Second)
 	if err != nil {
 		cl.logger.Printf("cannot dial peer: %s", err)
 		return
@@ -281,15 +295,16 @@ func (cl *Client) connectToPeer(address string, t *Torrent) {
 		cl.logger.Printf("handshake: %s", err)
 		return
 	}
-	err = newConn(t, tcpConn, cl.peerID[:]).mainLoop()
+	//TODO:check if IDs match?
+	err = newConn(t, tcpConn, peer).mainLoop()
 	if err != nil {
 		cl.logger.Println(err)
 	}
 }
 
-func (cl *Client) connectToPeers(t *Torrent, addresses ...string) {
-	for _, addr := range addresses {
-		go cl.connectToPeer(addr, t)
+func (cl *Client) connectToPeers(t *Torrent, peers ...Peer) {
+	for _, peer := range peers {
+		go cl.connectToPeer(peer, t)
 	}
 }
 
