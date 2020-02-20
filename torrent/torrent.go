@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"errors"
 	"fmt"
@@ -185,7 +186,11 @@ func (t *Torrent) mainLoop() {
 			if t.wantPeers() {
 				t.sendAnnounceToTracker(tracker.None)
 			}
-		case pvs := <-t.dhtAnnounceResp.Peers:
+			//TODO:check if it closes
+		case pvs, ok := <-t.dhtAnnounceResp.Peers:
+			if ok {
+				//panic()
+			}
 			if len(pvs.Peers) > 0 {
 				t.dhtAnnounced(pvs)
 			}
@@ -288,22 +293,31 @@ func (t *Torrent) trackerAnnounced(tresp trackerAnnouncerResponse) {
 	}
 	t.resetNextAnnounce(tresp.resp.Interval)
 	t.lastAnnounceResp = tresp.resp
-	t.gotPeers(tresp.resp.Peers)
+	peers := make([]Peer, len(tresp.resp.Peers))
+	for i := 0; i < len(peers); i++ {
+		peers[i] = Peer{
+			tp:     tresp.resp.Peers[i],
+			source: SourceTracker,
+		}
+	}
+	t.gotPeers(peers)
 }
 
-func (t *Torrent) filterNotConnected(peers []tracker.Peer) []string {
-	addrsNotConnected := []string{}
-nextPeer:
+func filterPeers(peers []Peer, f func(peer Peer) bool) []Peer {
+	ret := []Peer{}
 	for _, peer := range peers {
-		for _, ci := range t.conns {
-			if ci.addr.String() == peer.String() {
-				continue nextPeer
-			}
+		if f(peer) {
+			ret = append(ret, peer)
 		}
-		addrsNotConnected = append(addrsNotConnected, peer.String())
 	}
-	return addrsNotConnected
+	return ret
 }
+
+/*func (t *Torrent) filterConns(f func(ci *connInfo) bool) []*conn{
+	for _,ci := range t.conns {
+		if f(ci)
+	}
+}*/
 
 func (t *Torrent) resetNextAnnounce(interval int32) {
 	nextAnnounce := time.Duration(interval) * time.Second
@@ -335,14 +349,17 @@ func (t *Torrent) announceDht() {
 }
 
 func (t *Torrent) dhtAnnounced(pvs dht.PeersValues) {
-	peers := []tracker.Peer{}
+	peers := []Peer{}
 	for _, peer := range pvs.Peers {
 		if peer.Port == 0 {
 			continue
 		}
-		peers = append(peers, tracker.Peer{
-			IP:   peer.IP,
-			Port: uint16(peer.Port),
+		peers = append(peers, Peer{
+			tp: tracker.Peer{
+				IP:   peer.IP,
+				Port: uint16(peer.Port),
+			},
+			source: SourceDHT,
 		})
 	}
 	t.gotPeers(peers)
@@ -357,12 +374,21 @@ func (t *Torrent) closeDhtAnnounce() {
 	t.dhtAnnounceResp.Peers = nil
 }
 
-func (t *Torrent) gotPeers(peers []tracker.Peer) {
-	addrsNotConnected := t.filterNotConnected(peers)
-	t.cl.connectToPeers(t, addrsNotConnected...)
+func (t *Torrent) gotPeers(peers []Peer) {
+	fpeers := filterPeers(peers, func(peer Peer) bool {
+		for _, ci := range t.conns {
+			if bytes.Equal(ci.peer.tp.IP, peer.tp.IP) && ci.peer.tp.Port == peer.tp.Port {
+				return false
+			}
+		}
+		return true
+	})
+	if len(fpeers) > 0 {
+		t.cl.connectToPeers(t, fpeers...)
+	}
 }
 
-//TODO: change this to WriteStats(w *io.Writer)
+//WriteStatus writes to w a human readable message about the status of the Torrent.
 func (t *Torrent) WriteStatus(w io.Writer) {
 	//send a signal to mainLoop to fill a status buffer and send it back to us
 	ch := make(chan []byte)
