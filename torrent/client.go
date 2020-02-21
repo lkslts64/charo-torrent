@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/anacrolix/dht/v2"
@@ -27,6 +28,7 @@ type Client struct {
 	peerID   [20]byte
 	logger   *log.Logger
 	torrents map[[20]byte]*Torrent
+	close    chan struct{}
 	//torrents map[[20]byte]Torrent
 	//a set of info_hashes that clients is
 	//responsible for - easy access
@@ -78,13 +80,16 @@ func NewClient(cfg *Config) (*Client, error) {
 	cl := &Client{
 		peerID:     newPeerID(),
 		config:     cfg,
+		close:      make(chan struct{}),
 		infoHashes: make(map[[20]byte]struct{}),
 		torrents:   make(map[[20]byte]*Torrent),
 	}
 	logPrefix := fmt.Sprintf("client%x ", cl.peerID[14:len(cl.peerID)]) //last 6 bytes of peerID
 	cl.logger = log.New(logFile, logPrefix, log.LstdFlags)
 	if !cl.config.RejectIncomingConnections {
-		cl.listen()
+		if err = cl.listen(); err != nil {
+			cl.logger.Fatal(err)
+		}
 		go func() {
 			log.Fatal(cl.acceptForEver())
 		}()
@@ -116,24 +121,26 @@ func NewClient(cfg *Config) (*Client, error) {
 	return cl, nil
 }
 
-//Close drops all Torrents that the client manages
+//Close calls Remove for all the torrents managed by the client.
 func (cl *Client) Close() {
-	torrents := cl.Torrents()
-	chanArr := make([]chan struct{}, len(torrents))
-	for i := 0; i < len(chanArr); i++ {
-		chanArr[i] = make(chan struct{}, 1)
+	close(cl.close)
+	if cl.dhtServer != nil {
+		cl.dhtServer.Close()
 	}
-	//signal all torents to close
-	for i, t := range torrents {
-		t.close <- chanArr[i]
+	wg := sync.WaitGroup{}
+	wg.Add(len(cl.torrents))
+	for ihash := range cl.torrents {
+		go func(ihash [20]byte) {
+			defer wg.Done()
+			if err := cl.Remove(ihash); err != nil {
+				panic(err)
+			}
+		}(ihash)
 	}
-	//wait until all torrents actually close
-	for _, ch := range chanArr {
-		<-ch
-	}
+	wg.Wait()
 }
 
-//Returns the default configuration for a client
+//DefaultConfig Returns the default configuration for a client
 func DefaultConfig() (*Config, error) {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -178,6 +185,22 @@ func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
 	}
 	cl.addToMaps(t)
 	return t, nil
+}
+
+//Remove removes the Torrent the  torrent with infohash `infohash`.
+func (cl *Client) Remove(infohash [20]byte) error {
+	var (
+		t  *Torrent
+		ok bool
+	)
+	if t, ok = cl.torrents[infohash]; !ok {
+		return errors.New("torrent doesn't exist")
+	}
+	ch := make(chan struct{})
+	t.close <- ch
+	<-ch
+	delete(cl.torrents, infohash)
+	return nil
 }
 
 func (cl *Client) addToMaps(t *Torrent) error {
@@ -236,7 +259,7 @@ func (cl *Client) acceptForEver() error {
 		if err != nil {
 			return err
 		}
-		go cl.handleConn(conn)
+		go cl.handleIncomingConnection(conn)
 	}
 }
 
@@ -254,7 +277,7 @@ func addrToPeer(address string, source PeerSource) Peer {
 	}
 }
 
-func (cl *Client) handleConn(tcpConn net.Conn) {
+func (cl *Client) handleIncomingConnection(tcpConn net.Conn) {
 	defer tcpConn.Close()
 	hs := &peer_wire.HandShake{
 		Reserved: cl.reserved,
@@ -272,14 +295,14 @@ func (cl *Client) handleConn(tcpConn net.Conn) {
 		panic("we checked that we have this torrent")
 	}
 	p := addrToPeer(tcpConn.RemoteAddr().String(), SourceIncoming)
-	err = newConn(t, tcpConn, p).mainLoop()
+	runConnection(t, tcpConn, p)
 	if err != nil {
 		cl.logger.Println(err)
 	}
 }
 
 //TODO: store the remote addr and pop when finish
-func (cl *Client) connectToPeer(peer Peer, t *Torrent) {
+func (cl *Client) makeOutgoingConnection(t *Torrent, peer Peer) {
 	tcpConn, err := net.DialTimeout("tcp", peer.tp.String(), 5*time.Second)
 	if err != nil {
 		cl.logger.Printf("cannot dial peer: %s", err)
@@ -296,15 +319,19 @@ func (cl *Client) connectToPeer(peer Peer, t *Torrent) {
 		return
 	}
 	//TODO:check if IDs match?
-	err = newConn(t, tcpConn, peer).mainLoop()
+	runConnection(t, tcpConn, peer)
 	if err != nil {
 		cl.logger.Println(err)
 	}
 }
 
-func (cl *Client) connectToPeers(t *Torrent, peers ...Peer) {
+func runConnection(t *Torrent, conn net.Conn, peer Peer) error {
+	return newConn(t, conn, peer).mainLoop()
+}
+
+func (cl *Client) makeOutgoingConnections(t *Torrent, peers ...Peer) {
 	for _, peer := range peers {
-		go cl.connectToPeer(peer, t)
+		go cl.makeOutgoingConnection(t, peer)
 	}
 }
 
