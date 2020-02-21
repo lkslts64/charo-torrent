@@ -135,7 +135,7 @@ func (c *conn) mainLoop() error {
 		case msg := <-readCh:
 			err = c.parsePeerMsg(msg)
 		case err = <-readErrCh:
-		case <-c.t.drop:
+		case <-c.t.closed:
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
@@ -207,28 +207,30 @@ func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 }
 
 func (c *conn) wantBlocks() bool {
-	return !c.amSeeding && c.haveInfo && c.state.canDownload() && len(c.onFlightReqs) < maxOnFlight/2
+	return !c.amSeeding && c.haveInfo && c.state.canDownload() &&
+		c.peerBf.Len() > 0 && len(c.onFlightReqs) < maxOnFlight/2
 }
 
 func (c *conn) sendRequests() {
-	if c.wantBlocks() {
-		requests := make([]block, maxOnFlight-len(c.onFlightReqs))
-		n := c.t.pieces.getRequests(c.peerBf, requests)
-		if n == 0 {
-			if (requests[0] != block{}) {
-				panic("send requests")
-			}
-			nonUsefulRequestReads.Inc()
-			return
+	if !c.wantBlocks() {
+		return
+	}
+	requests := make([]block, maxOnFlight-len(c.onFlightReqs))
+	n := c.t.pieces.getRequests(c.peerBf, requests)
+	if n == 0 {
+		if (requests[0] != block{}) {
+			panic("send requests")
 		}
-		requests = requests[:n]
-		for _, req := range requests {
-			if _, ok := c.onFlightReqs[req]; ok {
-				continue
-			}
-			c.onFlightReqs[req] = struct{}{}
-			c.sendMsg(req.reqMsg())
+		nonUsefulRequestReads.Inc()
+		return
+	}
+	requests = requests[:n]
+	for _, req := range requests {
+		if _, ok := c.onFlightReqs[req]; ok {
+			continue
 		}
+		c.onFlightReqs[req] = struct{}{}
+		c.sendMsg(req.reqMsg())
 	}
 }
 
@@ -263,12 +265,11 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		case peer_wire.Interested:
 			c.state.amInterested = true
 			defer c.sendRequests()
-			//c.sendRequests()
 		case peer_wire.NotInterested:
 			c.state.amInterested = false
-			lostBlocksDueToSync.Add(uint64(len(c.onFlightReqs)))
-			//due to inconsistent states between Torrent and conn we may have onFlightReqs
+			//due to inconsistent states between Torrent and conn we may have requests on flight
 			//which we'll be lost (hopefully I think this doesn't happen too much)
+			lostBlocksDueToSync.Add(uint64(len(c.onFlightReqs)))
 			c.discardBlocks()
 		case peer_wire.Choke:
 			c.state.amChoking = true
@@ -318,10 +319,12 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		c.sendRequests()
 	case haveInfo:
 		c.haveInfo = true
+		if c.peerBf.Len() > 0 {
+			c.t.pieces.onBitfield(c.peerBf)
+		}
 	case seeding:
 		c.amSeeding = true
 		if c.notUseful() {
-			//c.logger.Println("conn is not useful anymore for both ends")
 			err = io.EOF
 		}
 	case drop:
@@ -381,7 +384,9 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 			return
 		}
 		c.peerBf.Set(int(msg.Index), true)
-		c.t.pieces.onHave(int(msg.Index))
+		if c.haveInfo {
+			c.t.pieces.onHave(int(msg.Index))
+		}
 		err = c.sendPeerEvent(msg)
 	case peer_wire.Bitfield:
 		if !c.peerBf.IsEmpty() {
@@ -393,7 +398,9 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 			return
 		}
 		c.peerBf = *tmp
-		c.t.pieces.onBitfield(c.peerBf)
+		if c.haveInfo {
+			c.t.pieces.onBitfield(c.peerBf)
+		}
 		err = c.sendPeerEvent(c.peerBf.Copy())
 	case peer_wire.Extended:
 		c.onExtended(msg)
@@ -431,7 +438,7 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 			case c.eventCh <- e:
 				return nil
 			//pretend we lost connection
-			case <-c.t.drop:
+			case <-c.t.closed:
 				err = io.EOF
 			case <-c.keepAliveTimer.C:
 				err = c.sendKeepAlive()
@@ -627,6 +634,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		if errors.Is(err, storage.ErrAlreadyWritten) {
 			//propably another conn got the same block
 			duplicateBlocksReceived.Inc()
+			c.logger.Printf("duplicate blocks received: %v", bl)
 			return nil
 		}
 		c.t.logger.Fatalf("storage write err %s\n", err)
