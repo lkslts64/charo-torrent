@@ -11,7 +11,6 @@ import (
 )
 
 const (
-	endGameThreshold                    = 2
 	randomPiecePickingStrategyThreshold = 1
 )
 
@@ -148,11 +147,20 @@ func (p *pieces) discardRequests(requests []block) {
 }
 
 func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
-	var inEndGame bool
+	var inEndGame, transitionIntoEndGame bool
 	piece := p.pcs[i]
 	p.mu.Lock()
 	defer func() {
 		p.mu.Unlock()
+		//send to channels without acquiring the lock
+		if piece.complete() {
+			p.t.queuePieceForHashing(i)
+		}
+		if transitionIntoEndGame {
+			p.t.broadcastCommand(requestsAvailable{})
+			//No need to send cancels just after entered end game
+			return
+		}
 		if inEndGame {
 			p.t.sendCancels(block{
 				pc:  i,
@@ -160,25 +168,20 @@ func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
 				len: piece.blockLen(off),
 			})
 		}
-		if piece.complete() {
-			p.t.queuePieceForHashing(i)
-		}
 	}()
 	piece.makeBlockComplete(ci, off)
+	if !p.endGame && p.allRequested() {
+		p.setupEndgame()
+		transitionIntoEndGame = true
+	}
 	inEndGame = p.endGame
 }
 
 func (p *pieces) pieceVerified(i int) {
-	var requestsAreAvailable bool
 	p.ownedPieces.Set(i, true)
 	p.pcs[i].verificationSuccess()
 	p.mu.Lock()
-	defer func() {
-		p.mu.Unlock()
-		if requestsAreAvailable {
-			p.t.broadcastCommand(requestsAvailable{})
-		}
-	}()
+	defer p.mu.Unlock()
 	//remove the piece i from priotirzedPcs, we'll never make requests for it again.
 	for j, piece := range p.prioritizedPcs {
 		if piece.index == i {
@@ -186,8 +189,6 @@ func (p *pieces) pieceVerified(i int) {
 		}
 	}
 	switch owned := p.ownedPieces.Len(); {
-	case p.t.numPieces()-owned == endGameThreshold:
-		requestsAreAvailable = p.setupEndgame()
 	case owned == randomPiecePickingStrategyThreshold:
 		p.piecePickStrategy = lessByRarity
 	}
@@ -199,21 +200,16 @@ func (p *pieces) pieceVerificationFailed(i int) {
 	p.pcs[i].verificationFailed()
 }
 
-func (p *pieces) setupEndgame() bool {
+func (p *pieces) setupEndgame() {
 	if p.endGame {
-		//shouldn't happen unless we drop a piece from storage
-		return false
+		panic("already in endgame")
 	}
 	p.endGame = true
 	notOwned := bitmap.Flip(p.ownedPieces, 0, p.t.numPieces())
-	if notOwned.Len() > endGameThreshold {
-		panic("endgame before threshold")
-	}
 	notOwned.IterTyped(func(piece int) bool {
 		p.pcs[piece].makeAllUnrequested()
 		return true
 	})
-	return true
 }
 
 //return a slice containing how many blocks a piece has.
@@ -239,6 +235,16 @@ func (p *pieces) isLast(i int) bool {
 
 func (p *pieces) haveAll() bool {
 	return p.ownedPieces.Len() == p.t.numPieces()
+}
+
+//true if all the pieces have been requested (or completed).
+func (p *pieces) allRequested() bool {
+	for _, piece := range p.pcs {
+		if piece.hasUnrequestedBlocks() {
+			return false
+		}
+	}
+	return true
 }
 
 //piece is constrcuted by master and is managed entirely
