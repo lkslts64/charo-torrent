@@ -19,7 +19,9 @@ import (
 //via Have messages.
 func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 	w, r := net.Pipe()
-	tr := newTorrent(&Client{})
+	cl, err := NewClient(testingConfig())
+	require.NoError(t, err)
+	tr := newTorrent(cl)
 	cn := newConn(tr, r, Peer{})
 	go cn.mainLoop()
 	numPieces := 100
@@ -53,7 +55,9 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 
 func TestConnState(t *testing.T) {
 	w, r := net.Pipe()
-	tr := newTorrent(&Client{})
+	cl, err := NewClient(testingConfig())
+	require.NoError(t, err)
+	tr := newTorrent(cl)
 	cn := newConn(tr, r, Peer{})
 	go cn.mainLoop()
 	//we dont expect conn to send an event since state didn't change
