@@ -1,7 +1,8 @@
 package torrent
 
 type pieceHasher struct {
-	t *Torrent
+	t           *Torrent
+	numVerified int
 }
 
 func (p *pieceHasher) Run() {
@@ -13,7 +14,13 @@ func (p *pieceHasher) Run() {
 				pieceIndex: piece,
 				ok:         correct,
 			}
-		case <-p.t.drop:
+			if correct {
+				p.numVerified++
+				if p.numVerified == p.t.numPieces() {
+					return
+				}
+			}
+		case <-p.t.closeHasher:
 			//TODO:wait in torrent to finish or not?
 			return
 		}
