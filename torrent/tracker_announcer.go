@@ -28,6 +28,9 @@ func (t *trackerAnnouncer) run() {
 				resp: resp,
 				err:  err,
 			}
+		case <-t.cl.close:
+			//TODO:send stopped msgs to trackers?
+			return
 		}
 	}
 }
@@ -42,9 +45,8 @@ func (t *trackerAnnouncer) announce(te trackerAnnouncerEvent) (*tracker.Announce
 		Left:       int64(te.stats.BytesLeft),
 		Uploaded:   int64(te.stats.BytesUploaded),
 		Event:      te.event,
-		//TODO:consider not requesting every time 50 peers
-		Numwant: 200,
-		Port:    int16(t.cl.port),
+		Numwant:    200,
+		Port:       int16(t.cl.port),
 	}
 	url := te.t.mi.Announce
 	if _, ok := t.trackers[url]; !ok {
