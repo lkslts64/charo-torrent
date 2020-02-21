@@ -6,14 +6,14 @@ import "github.com/lkslts64/charo-torrent/tracker"
 type PeerSource byte
 
 const (
+	//The user manually added this peer
+	SourceUser PeerSource = iota
 	//It was an incoming connection
-	SourceIncoming PeerSource = iota
+	SourceIncoming
 	//The peer was give to us by DHT
 	SourceDHT
 	//The peer was give to us by a tracker
 	SourceTracker
-	//The user manually added this peer
-	SourceUser
 )
 
 //Holds basic information about a peer
