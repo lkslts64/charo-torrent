@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 )
 
 const protoLen byte = 19
@@ -22,55 +21,51 @@ type HandShake struct {
 	PeerID   [20]byte
 }
 
-//If Do returns error connection should be closed
 //h.InfoHash should be zero if are going to be recipient.
-func (h *HandShake) Do(
-	conn net.Conn, ihashes map[[20]byte]struct{}) error {
-	var err error
+func (h *HandShake) Do(rw io.ReadWriter) (*HandShake, error) {
 	//check if we are initiator or recipients
 	switch {
 	case h.InfoHash != [20]byte{}:
-		err = h.Initiate(conn)
+		return h.initiate(rw)
 	default:
-		err = h.Receipt(conn, ihashes)
+		return h.receipt(rw)
 	}
-	return err
 }
 
-//Initiate should be called when a client wants to initiate
+//initiate should be called when a client wants to initiate
 //a handshake .InfoHash field should not be empty.
-func (h *HandShake) Initiate(conn io.ReadWriter) error {
+func (h *HandShake) initiate(rw io.ReadWriter) (*HandShake, error) {
 	var err error
-	if err = h.write(conn); err != nil {
-		return fmt.Errorf("hs initiate: %w", err)
+	if err = h.write(rw); err != nil {
+		return nil, fmt.Errorf("hs initiate: %s", err)
 	}
 	var _h *HandShake
-	if _h, err = readHs(conn); err != nil {
-		return fmt.Errorf("hs initiate: %w", err)
+	if _h, err = readHs(rw); err != nil {
+		return nil, fmt.Errorf("hs initiate: %s", err)
 	}
 	if h.InfoHash != _h.InfoHash {
-		return fmt.Errorf("hs initiate:info_hash response of peer  doesn't match the client's")
+		return nil, fmt.Errorf("hs initiate:info_hash response of peer  doesn't match the client's")
 	}
-	return nil
+	return _h, nil
 }
 
-//Receipt should be called when client is the recipient
+//receipt should be called when client is the recipient
 //of a handshake. InfoHash field must be zero - will be
 //filled inside.
-func (h *HandShake) Receipt(conn io.ReadWriter, ihashes map[[20]byte]struct{}) error {
+func (h *HandShake) receipt(rw io.ReadWriter) (*HandShake, error) {
 	var err error
 	var _h *HandShake
-	if _h, err = readHsWithoutPeerID(conn); err != nil {
-		return fmt.Errorf("hs receipt: %w", err)
-	}
-	if _, ok := ihashes[_h.InfoHash]; !ok {
-		return errors.New("hs receipt: client doesn't manage this info_hash")
+	if _h, err = readHsWithoutPeerID(rw); err != nil {
+		return nil, fmt.Errorf("hs receipt: %s", err)
 	}
 	h.InfoHash = _h.InfoHash
-	if err = h.write(conn); err != nil {
-		return fmt.Errorf("hs receipt: %w", err)
+	if err = h.write(rw); err != nil {
+		return nil, fmt.Errorf("hs receipt: %s", err)
 	}
-	return _h.readPeerID(conn)
+	if err = _h.readPeerID(rw); err != nil {
+		return nil, err
+	}
+	return _h, nil
 }
 
 //write sends write the bytes of h to conn.
@@ -81,7 +76,7 @@ func (h *HandShake) write(conn io.Writer) error {
 	}
 	_, err := conn.Write(b.Bytes())
 	if err != nil {
-		return fmt.Errorf("write: %w", err)
+		return fmt.Errorf("write: %s", err)
 	}
 	return nil
 }

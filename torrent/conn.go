@@ -72,10 +72,16 @@ type conn struct {
 
 //just wraps a msg with an error
 func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
-	c := &conn{
+	logPrefix := t.cl.logger.Prefix() + "CN"
+	if peer.tp.ID != nil {
+		logPrefix += fmt.Sprintf("%x ", peer.tp.ID[14:])
+	} else {
+		logPrefix += "------ "
+	}
+	return &conn{
 		cl:           t.cl,
 		t:            t,
-		logger:       log.New(t.cl.logger.Writer(), "conn", log.LstdFlags),
+		logger:       log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags),
 		cn:           cn,
 		peer:         peer,
 		state:        newConnState(),
@@ -86,8 +92,21 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
 		peerReqs:     make(map[block]struct{}),
 	}
-	//inform Torrent about the new conn
-	t.newConnCh <- &connInfo{
+}
+
+//inform Torrent about the new connection
+func (c *conn) informTorrent() error {
+	select {
+	case c.t.newConnCh <- c.connInfo():
+		return nil
+	case <-time.After(5 * time.Second):
+		//propably the torrent is in paused state or it hasn't even started downloading
+		return errors.New("conn: couldn't inform torrent about the connection")
+	}
+}
+
+func (c *conn) connInfo() *connInfo {
+	return &connInfo{
 		t:         c.t,
 		commandCh: c.commandCh,
 		eventCh:   c.eventCh,
@@ -96,7 +115,6 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 		reserved:  c.reserved,
 		state:     c.state,
 	}
-	return c
 }
 
 func (c *conn) close() {
@@ -634,7 +652,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		if errors.Is(err, storage.ErrAlreadyWritten) {
 			//propably another conn got the same block
 			duplicateBlocksReceived.Inc()
-			c.logger.Printf("duplicate blocks received: %v", bl)
+			c.logger.Printf("attempt to write the same block: %v", bl)
 			return nil
 		}
 		c.t.logger.Fatalf("storage write err %s\n", err)
