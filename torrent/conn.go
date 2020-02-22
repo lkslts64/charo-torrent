@@ -320,19 +320,6 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			Kind: peer_wire.Bitfield,
 			Bf:   c.encodeBitMap(c.myBf),
 		})
-	case verifyPiece:
-		//c.logger.Printf("going to verify piece #%d\n", v)
-		correct := c.t.storage.HashPiece(int(v), c.t.pieceLen(uint32(v)))
-		/*c.logger.Printf("piece #%d verification %s", v, func(correct bool) string {
-			if correct {
-				return "successful"
-			}
-			return "failed"
-		}(correct))*/
-		err = c.sendPeerEvent(pieceHashed{
-			pieceIndex: int(v),
-			ok:         correct,
-		})
 	case requestsAvailable:
 		c.sendRequests()
 	case haveInfo:
