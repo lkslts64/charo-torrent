@@ -39,7 +39,7 @@ import (
 //When master gouritine wants to change state of a particular
 //conn goroutine it sends an Event through this channel.
 
-var maxConns = 55
+var maxEstablishedConnsDefault = 55
 
 var maxRequestBlockSz = 1 << 14
 
@@ -49,6 +49,18 @@ const metadataPieceSz = 1 << 14
 //we actively form new connections
 const wantPeersThreshold = 30
 
+//State of a Torrent
+type State int
+
+const (
+	//Added is the state after a call to client.AddFrom*
+	Added State = iota
+	//Running is the state after a call to torrent.Start
+	Running
+	//Paused is the state after a call to torrent.Pause
+	Paused
+)
+
 //Torrent
 type Torrent struct {
 	cl          *Client
@@ -57,9 +69,10 @@ type Torrent struct {
 	openStorage storage.Open
 	storage     storage.Storage
 	//These are active connections
-	conns []*connInfo
-	//These are conns that we are not connected to anymore
-	droppedConns []*connInfo
+	conns                     []*connInfo
+	maxEstablishedConnections int
+	//These are the conns that we should try to connect after a call to Resume().
+	droppedPeers []Peer
 	newConnCh    chan *connInfo
 	pieces       *pieces
 	choker       *choker
@@ -84,12 +97,12 @@ type Torrent struct {
 	canAnnounceDht   bool
 	numDhtAnnounces  int
 
-	//surely we 'll need this
-	done chan struct{}
+	userCh chan chan struct{}
+	locker torrentLocker
 	//client sends to this chan when client.Close is called
 	close chan chan struct{}
-	//when close,signals all conns to be dropped
-	drop          chan struct{}
+	//when this closes it signals all conns and the hasher to exit
+	closed        chan struct{}
 	downloadedAll chan struct{}
 	//for displaying the state of torrent and conns
 	displayCh             chan chan []byte
@@ -97,6 +110,7 @@ type Torrent struct {
 	pieceQueuedHashingCh  chan int
 	pieceHashedCh         chan pieceHashed
 	queuedForVerification map[int]struct{}
+	closeHasher           chan struct{}
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
 	//whole mi.Info part.
@@ -106,13 +120,14 @@ type Torrent struct {
 	//lock only when writing
 	infoMu sync.Mutex
 	//used only when we dont have infoDict part of metaInfo
-	infoBytes       []byte
+	infoBytes []byte
+	//TODO: change to bitmap
 	ownedInfoBlocks []bool
 	//frequency map of infoSizes we have received
 	infoSizeFreq freqMap
 	//length of data to be downloaded
-	length int
-
+	length         int
+	state          State
 	stats          Stats
 	eventsReceived int
 	commandsSent   int
@@ -123,11 +138,12 @@ func newTorrent(cl *Client) *Torrent {
 		cl:                         cl,
 		openStorage:                cl.config.OpenStorage,
 		reqq:                       250, //libtorent also has this default
-		done:                       make(chan struct{}),
-		events:                     make(chan event, maxConns*eventChSize),
-		newConnCh:                  make(chan *connInfo, maxConns),
+		events:                     make(chan event, maxEstablishedConnsDefault*eventChSize),
+		newConnCh:                  make(chan *connInfo, maxEstablishedConnsDefault),
+		userCh:                     make(chan chan struct{}),
+		maxEstablishedConnections:  55,
 		downloadedAll:              make(chan struct{}),
-		drop:                       make(chan struct{}),
+		closed:                     make(chan struct{}),
 		displayCh:                  make(chan chan []byte, 10),
 		close:                      make(chan chan struct{}),
 		trackerAnnouncerResponseCh: make(chan trackerAnnouncerResponse, 1),
@@ -135,6 +151,7 @@ func newTorrent(cl *Client) *Torrent {
 		dhtAnnounceTimer:           newExpiredTimer(),
 		dhtAnnounceResp:            new(dht.Announce),
 		queuedForVerification:      make(map[int]struct{}),
+		closeHasher:                make(chan struct{}),
 		infoSizeFreq:               newFreqMap(),
 		stats:                      Stats{},
 		logger:                     log.New(cl.logger.Writer(), "torrent", log.LstdFlags),
@@ -145,12 +162,99 @@ func newTorrent(cl *Client) *Torrent {
 		t.trackerAnnouncerSubmitEventCh = cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh
 	}
 	t.choker = newChoker(t)
+	t.locker = torrentLocker{
+		ch: t.userCh,
+	}
 	return t
 }
 
 func (t *Torrent) Download() <-chan struct{} {
+	t.state = Running
 	go t.mainLoop()
 	return t.downloadedAll
+}
+
+//Close closes all connections with peers that were associated with this Torrent.
+func (t *Torrent) Close() {
+	close(t.closeHasher)
+	t.dropAllConns()
+	//TODO: clear struct fields
+}
+
+/*TODO
+func (t *Torrent) SetMaxEstablishedConnections(n int) {
+
+}
+
+func (t *Torrent) setMaxEstablishedConnections(n int) {
+	t.maxEstablishedConnections = n
+	if wantPeersThreshold > t.maxEstablishedConnections {
+		//make it equal to maxEstablishedConnections
+	}
+}
+
+func (t *Torrent) MaxEstablishedConnections() int {
+	return t.maxEstablishedConnections
+}*/
+
+func (t *Torrent) dropAllConns() {
+	t.closeDhtAnnounce()
+	//signal conns to close and wait until all conns actually close
+	close(t.closed)
+	for _, c := range t.conns {
+		<-c.dropped
+	}
+	t.conns = nil
+}
+
+func (t *Torrent) withLockContext(f func()) {
+	ch := t.locker.lock()
+	defer t.locker.unlock(ch)
+	f()
+}
+
+/*func (t *Torrent) pause() error {
+	switch t.state {
+	case Paused:
+		return errors.New("torrent already in paused state")
+	case Added:
+		return errors.New("cant pause a torrent in Added state")
+	}
+	t.dropAllConns()
+	t.sendAnnounceToTracker(tracker.Stopped)
+	t.state = Paused
+	return nil
+}
+
+//start downloading or seeding the Torrent.
+func (t *Torrent) start() error {
+	if t.state == Running {
+		return errors.New("torrent already in running state")
+	}
+	defer func(state State) {
+		//err != nil
+		if state == Added {
+			go t.mainLoop()
+		}
+	}(t.state)
+	t.sendAnnounceToTracker(tracker.Started)
+	if !t.dhtAnnounceTimer.Stop() {
+		<-t.dhtAnnounceTimer.C
+	}
+	t.announceDht()
+	t.state = Running
+	return nil
+}
+
+func (t *Torrent) State() State {
+	return t.state
+}*/
+
+//AddPeers establishes connections with peers.
+func (t *Torrent) AddPeers(peers ...Peer) {
+	ch := t.locker.lock()
+	defer t.locker.unlock(ch)
+	t.gotPeers(peers)
 }
 
 //jobs that we 'll send are proportional to the # of events we have received.
@@ -188,8 +292,9 @@ func (t *Torrent) mainLoop() {
 			}
 			//TODO:check if it closes
 		case pvs, ok := <-t.dhtAnnounceResp.Peers:
-			if ok {
-				//panic()
+			if !ok {
+				t.dhtAnnounceResp.Peers = nil
+				t.logger.Println("dht announce chan was closed")
 			}
 			if len(pvs.Peers) > 0 {
 				t.dhtAnnounced(pvs)
@@ -198,25 +303,18 @@ func (t *Torrent) mainLoop() {
 			//new announce is permited only after the timer expires
 			t.canAnnounceDht = true
 			t.closeDhtAnnounce()
-		case statusBytesCh := <-t.displayCh:
-			b := new(strings.Builder)
-			t.writeStatus(b)
-			statusBytesCh <- []byte(b.String())
+		/*case statusBytesCh := <-t.displayCh:
+		b := new(strings.Builder)
+		t.writeStatus(b)
+		statusBytesCh <- []byte(b.String())
+		*/
 		case doneClosing := <-t.close:
 			t.Close()
 			close(doneClosing)
 			return
+		case userDone := <-t.userCh:
+			<-userDone
 		}
-	}
-}
-
-//Close closes all connections with peers that were associated with this Torrent.
-func (t *Torrent) Close() {
-	close(t.drop) //signal conns to close
-	t.closeDhtAnnounce()
-	//wait until all conns close and then close `doneClosing`.
-	for _, c := range t.conns {
-		<-c.dropped
 	}
 }
 
@@ -288,10 +386,10 @@ func (t *Torrent) trackerAnnounced(tresp trackerAnnouncerResponse) {
 	if tresp.err != nil {
 		t.logger.Printf("tracker error: %s\n", tresp.err)
 		//announce after one minute if tracker send error
-		t.resetNextAnnounce(60)
+		t.resetNextTrackerAnnounce(60)
 		return
 	}
-	t.resetNextAnnounce(tresp.resp.Interval)
+	t.resetNextTrackerAnnounce(tresp.resp.Interval)
 	t.lastAnnounceResp = tresp.resp
 	peers := make([]Peer, len(tresp.resp.Peers))
 	for i := 0; i < len(peers); i++ {
@@ -319,9 +417,9 @@ func filterPeers(peers []Peer, f func(peer Peer) bool) []Peer {
 	}
 }*/
 
-func (t *Torrent) resetNextAnnounce(interval int32) {
+func (t *Torrent) resetNextTrackerAnnounce(interval int32) {
 	nextAnnounce := time.Duration(interval) * time.Second
-	if t.trackerAnnouncerTimer == nil {
+	if t.trackerAnnouncerTimer == nil { //TODO:does this happen?
 		t.trackerAnnouncerTimer = time.NewTimer(nextAnnounce)
 	} else {
 		if t.trackerAnnouncerTimer.Stop() {
@@ -366,7 +464,7 @@ func (t *Torrent) dhtAnnounced(pvs dht.PeersValues) {
 }
 
 func (t *Torrent) closeDhtAnnounce() {
-	if t.dhtAnnounceResp.Peers == nil {
+	if t.cl.dhtServer == nil || t.dhtAnnounceResp.Peers == nil {
 		return
 	}
 	t.dhtAnnounceResp.Close()
@@ -384,17 +482,17 @@ func (t *Torrent) gotPeers(peers []Peer) {
 		return true
 	})
 	if len(fpeers) > 0 {
-		t.cl.connectToPeers(t, fpeers...)
+		t.cl.makeOutgoingConnections(t, fpeers...)
 	}
 }
 
 //WriteStatus writes to w a human readable message about the status of the Torrent.
 func (t *Torrent) WriteStatus(w io.Writer) {
-	//send a signal to mainLoop to fill a status buffer and send it back to us
-	ch := make(chan []byte)
-	t.displayCh <- ch
-	b := <-ch
-	w.Write(b)
+	ch := t.locker.lock()
+	defer t.locker.unlock(ch)
+	b := new(strings.Builder)
+	t.writeStatus(b)
+	w.Write([]byte(b.String()))
 }
 
 func (t *Torrent) writeStatus(b *strings.Builder) {
@@ -423,7 +521,7 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 	tabWriter := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tabWriter, "Address\t%\tUp\tDown\t")
 	for _, ci := range t.conns {
-		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.addr,
+		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.peer.tp.IP.String(),
 			strconv.Itoa(int(float64(ci.peerBf.Len())/float64(t.numPieces())*100))+"%",
 			humanize.Bytes(uint64(ci.stats.uploadUsefulBytes)),
 			humanize.Bytes(uint64(ci.stats.downloadUsefulBytes)))
@@ -523,10 +621,10 @@ func (t *Torrent) sendHaves(i int) {
 }
 
 func (t *Torrent) establishedConnection(ci *connInfo) bool {
-	if len(t.conns) >= maxConns {
+	if len(t.conns) >= maxEstablishedConnsDefault {
 		ci.commandCh <- drop{}
 		t.closeDhtAnnounce()
-		t.logger.Printf("rejected a connection with peer %s\n", ci.addr.String())
+		t.logger.Printf("rejected a connection with peer %s\n", ci.peer.tp.String())
 		return false
 	}
 	defer t.choker.reviewUnchokedPeers()
@@ -718,6 +816,11 @@ func (t *Torrent) verifyInfoDict() bool {
 	return true
 }
 
+func (t *Torrent) gotInfoHash() {
+	logPrefix := t.cl.logger.Prefix() + fmt.Sprintf("TR%x", t.mi.Info.Hash[14:])
+	t.logger = log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags)
+}
+
 //TODO:open storage & create pieces etc.
 func (t *Torrent) gotInfo() {
 	t.length = t.mi.Info.TotalLength()
@@ -736,7 +839,7 @@ func (t *Torrent) gotInfo() {
 		//hashing is succesfull
 		for i, p := range t.pieces.pcs {
 			p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
-			p.t.pieceHashed(i, true)
+			t.pieceHashed(i, true)
 		}
 		t.startSeeding()
 	}
