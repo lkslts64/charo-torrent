@@ -2,7 +2,6 @@ package torrent
 
 import (
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/anacrolix/missinggo/bitmap"
@@ -14,7 +13,6 @@ import (
 //we dont share, we communicate so we have some duplicate data-.
 type connInfo struct {
 	t        *Torrent
-	addr     net.Addr
 	peer     Peer
 	reserved peer_wire.Reserved
 	//we communicate with conn with these channels - conn also has them
@@ -99,6 +97,32 @@ func (cn *connInfo) sendPort() {
 		Kind: peer_wire.Port,
 		Port: cn.t.cl.dhtPort(),
 	})
+}
+
+func (cn *connInfo) peerInterestChanged() {
+	cn.state.isInterested = !cn.state.isInterested
+	if cn.state.isInterested {
+		if !cn.state.amChoking {
+			cn.t.choker.reviewUnchokedPeers()
+		}
+		cn.startUploading()
+	} else {
+		if !cn.state.amChoking {
+			cn.t.choker.reviewUnchokedPeers()
+			cn.stopUploading()
+		}
+	}
+}
+
+func (cn *connInfo) peerChokeChanged() {
+	cn.state.isChoking = !cn.state.isChoking
+	if cn.state.isChoking {
+		if cn.state.amInterested {
+			cn.stopDownloading()
+		}
+	} else {
+		cn.startDownloading()
+	}
 }
 
 //manages if we are interested in peer after a sending us bitfield msg

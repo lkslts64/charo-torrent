@@ -5,7 +5,6 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"strconv"
 	"strings"
@@ -57,8 +56,8 @@ const (
 	Added State = iota
 	//Running is the state after a call to torrent.Start
 	Running
-	//Paused is the state after a call to torrent.Pause
-	Paused
+	//Closed is the state after a call to torrent.Pause
+	Closed
 )
 
 //Torrent
@@ -99,10 +98,10 @@ type Torrent struct {
 
 	userCh chan chan struct{}
 	locker torrentLocker
-	//client sends to this chan when client.Close is called
-	close chan chan struct{}
+
+	closed chan struct{}
 	//when this closes it signals all conns and the hasher to exit
-	closed        chan struct{}
+	drop          chan struct{}
 	downloadedAll chan struct{}
 	//for displaying the state of torrent and conns
 	displayCh             chan chan []byte
@@ -110,7 +109,6 @@ type Torrent struct {
 	pieceQueuedHashingCh  chan int
 	pieceHashedCh         chan pieceHashed
 	queuedForVerification map[int]struct{}
-	closeHasher           chan struct{}
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
 	//whole mi.Info part.
@@ -143,15 +141,14 @@ func newTorrent(cl *Client) *Torrent {
 		userCh:                     make(chan chan struct{}),
 		maxEstablishedConnections:  55,
 		downloadedAll:              make(chan struct{}),
+		drop:                       make(chan struct{}),
 		closed:                     make(chan struct{}),
 		displayCh:                  make(chan chan []byte, 10),
-		close:                      make(chan chan struct{}),
 		trackerAnnouncerResponseCh: make(chan trackerAnnouncerResponse, 1),
 		trackerAnnouncerTimer:      newExpiredTimer(),
 		dhtAnnounceTimer:           newExpiredTimer(),
 		dhtAnnounceResp:            new(dht.Announce),
 		queuedForVerification:      make(map[int]struct{}),
-		closeHasher:                make(chan struct{}),
 		infoSizeFreq:               newFreqMap(),
 		stats:                      Stats{},
 		logger:                     log.New(cl.logger.Writer(), "torrent", log.LstdFlags),
@@ -163,98 +160,42 @@ func newTorrent(cl *Client) *Torrent {
 	}
 	t.choker = newChoker(t)
 	t.locker = torrentLocker{
-		ch: t.userCh,
+		ch:    t.userCh,
+		state: &t.state,
 	}
 	return t
 }
 
-func (t *Torrent) Download() <-chan struct{} {
-	t.state = Running
-	go t.mainLoop()
-	return t.downloadedAll
-}
-
-//Close closes all connections with peers that were associated with this Torrent.
-func (t *Torrent) Close() {
-	close(t.closeHasher)
+//close closes all connections with peers that were associated with this Torrent.
+func (t *Torrent) close() {
+	if t.state == Closed {
+		panic("attempt to close torrent but is already closed")
+	}
+	t.state = Closed
+	close(t.closed)
 	t.dropAllConns()
+	t.choker.ticker.Stop()
+	t.trackerAnnouncerTimer.Stop()
+	t.dhtAnnounceTimer.Stop()
+	t.choker = nil
+	t.trackerAnnouncerResponseCh = nil
+	t.events = nil
+	t.newConnCh = nil
+	t.pieces = nil
+	t.mi = nil
+	t.infoBytes = nil
+	//t.logger = nil
 	//TODO: clear struct fields
 }
-
-/*TODO
-func (t *Torrent) SetMaxEstablishedConnections(n int) {
-
-}
-
-func (t *Torrent) setMaxEstablishedConnections(n int) {
-	t.maxEstablishedConnections = n
-	if wantPeersThreshold > t.maxEstablishedConnections {
-		//make it equal to maxEstablishedConnections
-	}
-}
-
-func (t *Torrent) MaxEstablishedConnections() int {
-	return t.maxEstablishedConnections
-}*/
 
 func (t *Torrent) dropAllConns() {
 	t.closeDhtAnnounce()
 	//signal conns to close and wait until all conns actually close
-	close(t.closed)
+	close(t.drop)
 	for _, c := range t.conns {
 		<-c.dropped
 	}
 	t.conns = nil
-}
-
-func (t *Torrent) withLockContext(f func()) {
-	ch := t.locker.lock()
-	defer t.locker.unlock(ch)
-	f()
-}
-
-/*func (t *Torrent) pause() error {
-	switch t.state {
-	case Paused:
-		return errors.New("torrent already in paused state")
-	case Added:
-		return errors.New("cant pause a torrent in Added state")
-	}
-	t.dropAllConns()
-	t.sendAnnounceToTracker(tracker.Stopped)
-	t.state = Paused
-	return nil
-}
-
-//start downloading or seeding the Torrent.
-func (t *Torrent) start() error {
-	if t.state == Running {
-		return errors.New("torrent already in running state")
-	}
-	defer func(state State) {
-		//err != nil
-		if state == Added {
-			go t.mainLoop()
-		}
-	}(t.state)
-	t.sendAnnounceToTracker(tracker.Started)
-	if !t.dhtAnnounceTimer.Stop() {
-		<-t.dhtAnnounceTimer.C
-	}
-	t.announceDht()
-	t.state = Running
-	return nil
-}
-
-func (t *Torrent) State() State {
-	return t.state
-}*/
-
-//AddPeers establishes connections with peers.
-func (t *Torrent) AddPeers(peers ...Peer) {
-	ch := t.locker.lock()
-	defer t.locker.unlock(ch)
-	t.gotPeers(peers)
 }
 
 //jobs that we 'll send are proportional to the # of events we have received.
@@ -263,11 +204,6 @@ func (t *Torrent) mainLoop() {
 	t.sendAnnounceToTracker(tracker.Started)
 	t.announceDht()
 	t.choker.startTicker()
-	defer func() {
-		t.choker.ticker.Stop()
-		t.trackerAnnouncerTimer.Stop()
-		t.dhtAnnounceTimer.Stop()
-	}()
 	for {
 		select {
 		case e := <-t.events:
@@ -287,9 +223,7 @@ func (t *Torrent) mainLoop() {
 			t.trackerAnnounced(tresp)
 		case <-t.trackerAnnouncerTimer.C:
 			t.canAnnounceTracker = true
-			if t.wantPeers() {
-				t.sendAnnounceToTracker(tracker.None)
-			}
+			t.sendAnnounceToTracker(tracker.None)
 			//TODO:check if it closes
 		case pvs, ok := <-t.dhtAnnounceResp.Peers:
 			if !ok {
@@ -297,23 +231,19 @@ func (t *Torrent) mainLoop() {
 				t.logger.Println("dht announce chan was closed")
 			}
 			if len(pvs.Peers) > 0 {
+				t.logger.Printf("got %d peers by dht", len(pvs.Peers))
 				t.dhtAnnounced(pvs)
 			}
 		case <-t.dhtAnnounceTimer.C:
 			//new announce is permited only after the timer expires
 			t.canAnnounceDht = true
 			t.closeDhtAnnounce()
-		/*case statusBytesCh := <-t.displayCh:
-		b := new(strings.Builder)
-		t.writeStatus(b)
-		statusBytesCh <- []byte(b.String())
-		*/
-		case doneClosing := <-t.close:
-			t.Close()
-			close(doneClosing)
-			return
+			t.announceDht()
 		case userDone := <-t.userCh:
 			<-userDone
+			if t.state == Closed {
+				return
+			}
 		}
 	}
 }
@@ -322,28 +252,10 @@ func (t *Torrent) parseEvent(e event) {
 	switch v := e.val.(type) {
 	case *peer_wire.Msg:
 		switch v.Kind {
-		case peer_wire.Interested:
-			e.conn.state.isInterested = true
-			if !e.conn.state.amChoking {
-				t.choker.reviewUnchokedPeers()
-			}
-			e.conn.startUploading()
-		case peer_wire.NotInterested:
-			e.conn.state.isInterested = false
-			if !e.conn.state.amChoking {
-				t.choker.reviewUnchokedPeers()
-			}
-			if !e.conn.state.amChoking {
-				e.conn.stopUploading()
-			}
-		case peer_wire.Choke:
-			e.conn.state.isChoking = true
-			if e.conn.state.amInterested {
-				e.conn.stopDownloading()
-			}
-		case peer_wire.Unchoke:
-			e.conn.state.isChoking = false
-			e.conn.startDownloading()
+		case peer_wire.Interested, peer_wire.NotInterested:
+			e.conn.peerInterestChanged()
+		case peer_wire.Choke, peer_wire.Unchoke:
+			e.conn.peerChokeChanged()
 		case peer_wire.Have:
 			e.conn.peerBf.Set(int(v.Index), true)
 			e.conn.reviewInterestsOnHave(int(v.Index))
@@ -352,12 +264,6 @@ func (t *Torrent) parseEvent(e event) {
 		t.blockDownloaded(e.conn, block(v))
 	case uploadedBlock:
 		t.blockUploaded(e.conn, block(v))
-	case pieceHashed:
-		e.conn.stats.onPieceHashed()
-		t.pieceHashed(v.pieceIndex, v.ok)
-		if t.pieces.haveAll() {
-			t.startSeeding()
-		}
 	case metainfoSize:
 	case bitmap.Bitmap:
 		e.conn.peerBf = v
@@ -374,11 +280,13 @@ func (t *Torrent) wantPeers() bool {
 }
 
 func (t *Torrent) sendAnnounceToTracker(event tracker.Event) {
-	if !t.cl.config.DisableTrackers && t.cl.trackerAnnouncer != nil && t.mi.Announce != "" {
-		t.trackerAnnouncerSubmitEventCh <- trackerAnnouncerEvent{t, event, t.stats}
-		t.numTrackerAnnouncesSend++
-		t.canAnnounceTracker = false
+	if t.cl.config.DisableTrackers || t.cl.trackerAnnouncer == nil || t.mi.Announce == "" ||
+		(event == tracker.None && !t.wantPeers()) {
+		return
 	}
+	t.trackerAnnouncerSubmitEventCh <- trackerAnnouncerEvent{t, event, t.stats}
+	t.numTrackerAnnouncesSend++
+	t.canAnnounceTracker = false
 }
 
 func (t *Torrent) trackerAnnounced(tresp trackerAnnouncerResponse) {
@@ -430,20 +338,20 @@ func (t *Torrent) resetNextTrackerAnnounce(interval int32) {
 }
 
 func (t *Torrent) announceDht() {
-	if !t.cl.config.DisableDHT && t.cl.dhtServer != nil {
-		ann, err := t.cl.dhtServer.Announce(t.mi.Info.Hash, int(t.cl.port), true)
-		if err != nil {
-			t.logger.Printf("dht error: %s", err)
-		}
-		t.dhtAnnounceResp = ann
-		if t.dhtAnnounceTimer.Stop() {
-			panic("dht timer hasn't expired")
-		}
-		t.dhtAnnounceTimer.Reset(5 * time.Minute)
-		t.canAnnounceDht = false
-		t.numDhtAnnounces++
-		t.logger.Println("dht announce")
+	if t.cl.config.DisableDHT || t.cl.dhtServer == nil || !t.wantPeers() {
+		return
 	}
+	ann, err := t.cl.dhtServer.Announce(t.mi.Info.Hash, int(t.cl.port), true)
+	if err != nil {
+		t.logger.Printf("dht error: %s", err)
+	}
+	t.dhtAnnounceResp = ann
+	if t.dhtAnnounceTimer.Stop() {
+		panic("dht timer hasn't expired")
+	}
+	t.dhtAnnounceTimer.Reset(5 * time.Minute)
+	t.canAnnounceDht = false
+	t.numDhtAnnounces++
 }
 
 func (t *Torrent) dhtAnnounced(pvs dht.PeersValues) {
@@ -484,15 +392,6 @@ func (t *Torrent) gotPeers(peers []Peer) {
 	if len(fpeers) > 0 {
 		t.cl.makeOutgoingConnections(t, fpeers...)
 	}
-}
-
-//WriteStatus writes to w a human readable message about the status of the Torrent.
-func (t *Torrent) WriteStatus(w io.Writer) {
-	ch := t.locker.lock()
-	defer t.locker.unlock(ch)
-	b := new(strings.Builder)
-	t.writeStatus(b)
-	w.Write([]byte(b.String()))
 }
 
 func (t *Torrent) writeStatus(b *strings.Builder) {
@@ -694,13 +593,11 @@ func (t *Torrent) connsIter(f func(ci *connInfo) bool) {
 //clear the fields that included the conn
 func (t *Torrent) removeConn(ci *connInfo, index int) {
 	t.conns = append(t.conns[:index], t.conns[index+1:]...)
-	if t.wantPeers() {
-		if t.canAnnounceTracker {
-			t.sendAnnounceToTracker(tracker.None)
-		}
-		if t.canAnnounceDht {
-			t.announceDht()
-		}
+	if t.canAnnounceTracker {
+		t.sendAnnounceToTracker(tracker.None)
+	}
+	if t.canAnnounceDht {
+		t.announceDht()
 	}
 }
 

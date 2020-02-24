@@ -208,9 +208,7 @@ func (cl *Client) Remove(infohash [20]byte) error {
 	if t, ok = cl.torrents[infohash]; !ok {
 		return errors.New("torrent doesn't exist")
 	}
-	ch := make(chan struct{})
-	t.close <- ch
-	<-ch
+	t.withLockContext(t.close)
 	delete(cl.torrents, infohash)
 	return nil
 }
@@ -229,6 +227,7 @@ func (cl *Client) ListenPort() int {
 	return cl.port
 }
 
+//ID returns the Client's random ID
 func (cl *Client) ID() []byte {
 	return cl.peerID[:]
 }
