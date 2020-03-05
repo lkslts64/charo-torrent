@@ -24,7 +24,7 @@ type seeding struct{}
 
 type drop struct{}
 
-type verifyPiece int
+type downloadPieces struct{}
 
 type jobID int8
 
@@ -105,10 +105,6 @@ type uploadedBlock block
 
 //signals that a conn was dropped
 type connDroped struct{}
-
-//signals that a conn has space to request some blokcs i.e request queue length
-//is not full.
-type wantBlocks struct{}
 
 //when a conn discards requests, we use this event to notify other conns that
 //some blocks are available for requesting.
