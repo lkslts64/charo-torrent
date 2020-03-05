@@ -50,13 +50,14 @@ type conn struct {
 	//channel that we send received msgs
 	eventCh chan interface{}
 	//chans to signal that conn should is dropped
-	dropped        chan struct{}
-	keepAliveTimer *time.Timer
-	peerReqs       map[block]struct{}
-	onFlightReqs   map[block]struct{}
-	muPeerReqs     sync.Mutex
-	haveInfo       bool
-	amSeeding      bool
+	dropped         chan struct{}
+	keepAliveTimer  *time.Timer
+	peerReqs        map[block]struct{}
+	onFlightReqs    map[block]struct{}
+	muPeerReqs      sync.Mutex
+	haveInfo        bool
+	amSeeding       bool
+	downloadAllowed bool
 
 	//
 	debugVerifications int
@@ -99,9 +100,10 @@ func (c *conn) informTorrent() error {
 	select {
 	case c.t.newConnCh <- c.connInfo():
 		return nil
-	case <-time.After(5 * time.Second):
-		//propably the torrent is in paused state or it hasn't even started downloading
-		return errors.New("conn: couldn't inform torrent about the connection")
+	case <-c.t.drop:
+		return errors.New("torrent closed")
+	case <-time.After(time.Minute):
+		panic("conn: couldn't inform torrent about the connection")
 	}
 }
 
@@ -118,11 +120,24 @@ func (c *conn) connInfo() *connInfo {
 }
 
 func (c *conn) close() {
-	c.discardBlocks()
+	c.discardBlocks(false)
+	//notify Torrent that conn closed
+	select {
+	case <-c.dropped:
+	default:
+		close(c.dropped)
+	}
+	//because we closed `dropped`, there is no deadlock possibility
+	select {
+	case <-c.t.drop:
+	case c.eventCh <- discardedRequests{}:
+	}
+	select {
+	case <-c.t.drop:
+	case c.eventCh <- connDroped{}:
+	}
 	//close chan - avoid leak goroutines
 	close(c.eventCh)
-	//notify Torrent that conn closed
-	close(c.dropped)
 }
 
 type readResult struct {
@@ -132,7 +147,6 @@ type readResult struct {
 
 func (c *conn) mainLoop() error {
 	var err error
-	//pc.init()
 	readCh := make(chan *peer_wire.Msg, readChSize)
 	readErrCh := make(chan error, 1)
 	//we need o quit chan in order to not leak readMsgs goroutine
@@ -144,16 +158,16 @@ func (c *conn) mainLoop() error {
 	}()
 	go c.readPeerMsgs(readCh, quit, readErrCh)
 	c.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
-	debugTick := time.NewTicker(2 * time.Second)
-	defer debugTick.Stop()
+	//debugTick := time.NewTicker(2 * time.Second)
+	//defer debugTick.Stop()
 	for {
 		select {
 		case cmd := <-c.commandCh:
-			err = c.parseCommand(cmd)
+			err = c.gotCommand(cmd)
 		case msg := <-readCh:
 			err = c.parsePeerMsg(msg)
 		case err = <-readErrCh:
-		case <-c.t.closed:
+		case <-c.t.drop:
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
@@ -225,7 +239,7 @@ func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 }
 
 func (c *conn) wantBlocks() bool {
-	return !c.amSeeding && c.haveInfo && c.state.canDownload() &&
+	return c.downloadAllowed && !c.amSeeding && c.haveInfo && c.state.canDownload() &&
 		c.peerBf.Len() > 0 && len(c.onFlightReqs) < maxOnFlight/2
 }
 
@@ -275,7 +289,7 @@ func (c *conn) sendKeepAlive() error {
 	return nil
 }
 
-func (c *conn) parseCommand(cmd interface{}) (err error) {
+func (c *conn) gotCommand(cmd interface{}) (err error) {
 	switch v := cmd.(type) {
 	case *peer_wire.Msg:
 		switch v.Kind {
@@ -288,7 +302,10 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 			//due to inconsistent states between Torrent and conn we may have requests on flight
 			//which we'll be lost (hopefully I think this doesn't happen too much)
 			lostBlocksDueToSync.Add(uint64(len(c.onFlightReqs)))
-			c.discardBlocks()
+			err = c.discardBlocks(true)
+			if err != nil {
+				return err
+			}
 		case peer_wire.Choke:
 			c.state.amChoking = true
 			c.muPeerReqs.Lock()
@@ -316,7 +333,7 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		err = c.sendMsg(v)
 	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
 		c.myBf = v
-		c.sendMsg(&peer_wire.Msg{
+		err = c.sendMsg(&peer_wire.Msg{
 			Kind: peer_wire.Bitfield,
 			Bf:   c.encodeBitMap(c.myBf),
 		})
@@ -327,6 +344,9 @@ func (c *conn) parseCommand(cmd interface{}) (err error) {
 		if c.peerBf.Len() > 0 {
 			c.t.pieces.onBitfield(c.peerBf)
 		}
+	case downloadPieces:
+		c.downloadAllowed = true
+		c.sendRequests()
 	case seeding:
 		c.amSeeding = true
 		if c.notUseful() {
@@ -373,7 +393,10 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	case peer_wire.NotInterested:
 		err = stateChange(&c.state.isInterested, false)
 	case peer_wire.Choke:
-		c.discardBlocks()
+		err = c.discardBlocks(true)
+		if err != nil {
+			return err
+		}
 		err = stateChange(&c.state.isChoking, true)
 	case peer_wire.Unchoke:
 		err = stateChange(&c.state.isChoking, false)
@@ -426,6 +449,7 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	return
 }
 
+//e is guranteed to be sent in eventCh even if error occurs
 func (c *conn) sendPeerEvent(e interface{}) error {
 	var err error
 	for {
@@ -439,17 +463,23 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 			//to deadlock.
 			select {
 			case cmd := <-c.commandCh:
-				err = c.parseCommand(cmd)
+				err = c.gotCommand(cmd)
 			case c.eventCh <- e:
 				return nil
 			//pretend we lost connection
-			case <-c.t.closed:
+			case <-c.t.drop:
 				err = io.EOF
 			case <-c.keepAliveTimer.C:
 				err = c.sendKeepAlive()
 			}
 		}
 		if err != nil {
+			close(c.dropped)
+			//no deadlock possibility because we closed dropped chan
+			select {
+			case <-c.t.drop:
+			case c.eventCh <- e:
+			}
 			return err
 		}
 	}
@@ -525,7 +555,7 @@ func (c *conn) onExtended(msg *peer_wire.Msg) (err error) {
 	return nil
 }
 
-func (c *conn) discardBlocks() {
+func (c *conn) discardBlocks(notifyTorrent bool) error {
 	if len(c.onFlightReqs) > 0 {
 		unsatisfiedRequests := []block{}
 		for req := range c.onFlightReqs {
@@ -533,8 +563,13 @@ func (c *conn) discardBlocks() {
 		}
 		c.t.pieces.discardRequests(unsatisfiedRequests)
 		c.onFlightReqs = make(map[block]struct{})
-		c.sendPeerEvent(discardedRequests{})
+		var err error
+		if notifyTorrent {
+			err = c.sendPeerEvent(discardedRequests{})
+		}
+		return err
 	}
+	return nil
 }
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
