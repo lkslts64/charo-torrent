@@ -373,15 +373,14 @@ func (t *Torrent) addFilteredPeers(peers []Peer, f func(peer Peer) bool) {
 
 func (t *Torrent) resetNextTrackerAnnounce(interval int32) {
 	nextAnnounce := time.Duration(interval) * time.Second
-	if t.trackerAnnouncerTimer == nil { //TODO:does this happen?
-		t.trackerAnnouncerTimer = time.NewTimer(nextAnnounce)
-	} else {
-		//TODO: fix bug, when we announce for tracker.Complete we shouldn't panic.
-		if t.trackerAnnouncerTimer.Stop() {
-			panic("announce before tracker specified interval")
+	if !t.trackerAnnouncerTimer.Stop() {
+		select {
+		//too rare - only when we announced with event Complete or Started
+		case <-t.trackerAnnouncerTimer.C:
+		default:
 		}
-		t.trackerAnnouncerTimer.Reset(nextAnnounce)
 	}
+	t.trackerAnnouncerTimer.Reset(nextAnnounce)
 }
 
 func (t *Torrent) announceDht() {
