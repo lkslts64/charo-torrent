@@ -60,6 +60,7 @@ func TestConnState(t *testing.T) {
 	tr := newTorrent(cl)
 	cn := newConn(tr, r, Peer{})
 	go cn.mainLoop()
+	go readForever(w)
 	//we dont expect conn to send an event since state didn't change
 	(&peer_wire.Msg{
 		Kind: peer_wire.NotInterested,
@@ -71,17 +72,9 @@ func TestConnState(t *testing.T) {
 	cn.commandCh <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}
-	//read here is mandatory, see net.Pipe() docs
-	w.Read(make([]byte, 100))
 	e := <-cn.eventCh
 	msg := e.(*peer_wire.Msg)
 	assert.Equal(t, peer_wire.Unchoke, msg.Kind)
-	e = <-cn.eventCh
-	switch e.(type) {
-	case wantBlocks:
-	default:
-		t.Fail()
-	}
 }
 
 type dummyStorage struct{}
