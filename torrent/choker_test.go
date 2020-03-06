@@ -11,7 +11,7 @@ import (
 func TestChoker(t *testing.T) {
 	conns := []*connInfo{}
 	//create conns by ascending download rate order.
-	numConns := maxConns
+	numConns := 55
 	for i := 0; i < numConns; i++ {
 		ci := &connInfo{
 			t: &Torrent{
@@ -34,7 +34,8 @@ func TestChoker(t *testing.T) {
 		t: &Torrent{
 			conns: conns,
 		},
-		maxUploadSlots: 4,
+		maxUploadSlots:   4,
+		enableOptimistic: true,
 	}
 	chk.reviewUnchokedPeers()
 	//ensure we unchoked optimistic
