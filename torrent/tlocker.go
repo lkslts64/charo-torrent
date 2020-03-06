@@ -7,7 +7,6 @@ import "errors"
 type torrentLocker struct {
 	ch     chan chan interface{}
 	closed chan struct{}
-	state  *State
 }
 
 func (l *torrentLocker) lock() (chan interface{}, error) {

@@ -45,20 +45,6 @@ var maxRequestBlockSz = 1 << 14
 
 const metadataPieceSz = 1 << 14
 
-//State of a Torrent
-type State int
-
-const (
-	//we are in sleepingState if DownloadData or DownloadInfo hasn't yet been called.
-	sleepingState State = iota
-	//we are in  downloadingInfoState when is DownloadInfo is called
-	downloadingInfoState
-	//we are in  downloadingInfoState when is DownloadData is called
-	downloadingDataState
-	//
-	closedState
-)
-
 //Torrent
 type Torrent struct {
 	cl          *Client
@@ -133,7 +119,6 @@ type Torrent struct {
 	infoSizeFreq freqMap
 	//length of data to be downloaded
 	length int
-	state  State
 	//
 	stats          Stats
 	eventsReceived int
@@ -173,7 +158,6 @@ func newTorrent(cl *Client) *Torrent {
 	t.locker = torrentLocker{
 		ch:     t.userCh,
 		closed: t.closed,
-		state:  &t.state,
 	}
 	return t
 }
@@ -187,7 +171,6 @@ func (t *Torrent) close() {
 		close(t.closed)
 		t.isClosed = true
 	}()
-	t.state = closedState
 	t.dropAllConns()
 	t.choker.ticker.Stop()
 	t.trackerAnnouncerTimer.Stop()
@@ -364,12 +347,6 @@ func (t *Torrent) addFilteredPeers(peers []Peer, f func(peer Peer) bool) {
 		}
 	}
 }
-
-/*func (t *Torrent) filterConns(f func(ci *connInfo) bool) []*conn{
-	for _,ci := range t.conns {
-		if f(ci)
-	}
-}*/
 
 func (t *Torrent) resetNextTrackerAnnounce(interval int32) {
 	nextAnnounce := time.Duration(interval) * time.Second
