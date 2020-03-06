@@ -45,7 +45,8 @@ var maxRequestBlockSz = 1 << 14
 
 const metadataPieceSz = 1 << 14
 
-//Torrent
+//Torrent represents a torrent and maintains state about it.Multiple goroutines may
+//invoke methods on a Torrent simultaneously.
 type Torrent struct {
 	cl          *Client
 	logger      *log.Logger
@@ -90,7 +91,6 @@ type Torrent struct {
 	userCh chan chan interface{}
 	//this bool is set true when its time to download the data
 	downloadRequest bool
-	locker          torrentLocker
 	closed          chan struct{}
 	isClosed        bool
 	//when this closes it signals all conns to exit
@@ -134,7 +134,7 @@ func newTorrent(cl *Client) *Torrent {
 		newConnCh:                  make(chan *connInfo, maxEstablishedConnsDefault),
 		halfOpenConns:              make(map[string]Peer),
 		userCh:                     make(chan chan interface{}),
-		maxEstablishedConnections:  55,
+		maxEstablishedConnections:  cl.config.MaxEstablishedConns,
 		maxHalfOpenConns:           55,
 		wantPeersThreshold:         100,
 		drop:                       make(chan struct{}),
@@ -155,10 +155,6 @@ func newTorrent(cl *Client) *Torrent {
 		t.trackerAnnouncerSubmitEventCh = cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh
 	}
 	t.choker = newChoker(t)
-	t.locker = torrentLocker{
-		ch:     t.userCh,
-		closed: t.closed,
-	}
 	return t
 }
 
@@ -181,6 +177,7 @@ func (t *Torrent) close() {
 	t.newConnCh = nil
 	t.pieces = nil
 	t.infoBytes = nil
+	t.peers = nil
 	//t.logger = nil
 	//TODO: clear struct fields
 }
@@ -481,12 +478,7 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 	if t.lastAnnounceResp != nil {
 		b.WriteString(fmt.Sprintf("Seeders: %d\tLeechers: %d\tInterval: %d(secs)\n", t.lastAnnounceResp.Seeders, t.lastAnnounceResp.Seeders, t.lastAnnounceResp.Interval))
 	}
-	b.WriteString(fmt.Sprintf("Mode: %s\n", func() string {
-		if t.seeding {
-			return "seeding"
-		}
-		return "downloading"
-	}()))
+	b.WriteString(fmt.Sprintf("State: %s\n", t.state()))
 	b.WriteString(fmt.Sprintf("Downloaded: %s\tUploaded: %s\tRemaining: %s\n", humanize.Bytes(uint64(t.stats.BytesDownloaded)),
 		humanize.Bytes(uint64(t.stats.BytesUploaded)), humanize.Bytes(uint64(t.stats.BytesLeft))))
 	b.WriteString(fmt.Sprintf("Connected to %d peers\n", len(t.conns)))
@@ -499,6 +491,22 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 			humanize.Bytes(uint64(ci.stats.downloadUsefulBytes)))
 	}
 	tabWriter.Flush()
+}
+
+func (t *Torrent) state() string {
+	if t.isClosed {
+		return "closed"
+	}
+	if t.seeding {
+		return "seeding"
+	}
+	if !t.haveInfo() {
+		return "downloading info"
+	}
+	if t.downloadRequest {
+		return "downloading data"
+	}
+	return "waiting for downloading request"
 }
 
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
@@ -878,4 +886,10 @@ func (t *Torrent) scrapeTracker() (*tracker.ScrapeResp, error) {
 
 func (t *Torrent) haveInfo() bool {
 	return t.mi.Info != nil
+}
+
+func (t *Torrent) newLocker() *torrentLocker {
+	return &torrentLocker{
+		t: t,
+	}
 }
