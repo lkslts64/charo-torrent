@@ -30,10 +30,8 @@ type pieces struct {
 	piecePickStrategy lessFunc
 }
 
-//TODO:add allVerified boolean at constructor parameter
 func newPieces(t *Torrent) *pieces {
 	numPieces := int(t.numPieces())
-	//TODO:shuffle pieces
 	pcs := make([]*piece, numPieces)
 	for i := 0; i < numPieces; i++ {
 		pcs[i] = newPiece(t, i)
@@ -67,7 +65,7 @@ func (p *pieces) onBitfield(bm bitmap.Bitmap) {
 func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	//Prioritize pieces.Pieces that have more pending &
+	//Prioritize pieces.Pieces that have more pending and
 	//completed but still have unrequested blocks have the highest priority.
 	//If two pieces have both all blocks unrequested then we pick the one selected by
 	//our current strategy.
@@ -153,6 +151,7 @@ func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
 	defer func() {
 		p.mu.Unlock()
 		//send to channels without acquiring the lock
+		//
 		if piece.complete() {
 			p.t.queuePieceForHashing(i)
 		}
@@ -247,15 +246,9 @@ func (p *pieces) allRequested() bool {
 	return true
 }
 
-//piece is constrcuted by master and is managed entirely
-//by him.Blocks can be at three states and each block lies
-//on a single state at each time. All blocks are initially
-//unrequested.When we request a block through the workers,
-// then a block becomes pending and after downloaded.
-//If a worker gets choked and has requests unsatisfied
-//then master puts them again at unrequested state
-//At all cases,this equality should hold true:
-//len(pendingBlocks)+len(downloadedBlocks)+len(unrequestedBlocks) == totalBlocks
+//Blocks can be at three states.
+//All blocks are initially unrequested.When we request a block,
+//then it becomes pending and when we download it it becomes complete.
 type piece struct {
 	t        *Torrent
 	index    int

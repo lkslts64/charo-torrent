@@ -118,7 +118,7 @@ func TestPiecesState(t *testing.T) {
 }
 
 func TestPiecePrioritization(t *testing.T) {
-	tr := newTestTorrent(100, 3, 1, 1)
+	tr := newTestTorrent(100, 3, 3, 1)
 	p := newPieces(tr)
 	p.piecePickStrategy = lessByRarity
 	var bm bitmap.Bitmap
@@ -126,7 +126,7 @@ func TestPiecePrioritization(t *testing.T) {
 	//make piece 50 have the highest completeness score
 	p.pcs[50].makeBlockPending(2)
 	p.pcs[50].makeBlockPending(1)
-	//make piece 50 have the second highest completeness score
+	//make piece 40 have the second highest completeness score
 	p.pcs[40].makeBlockPending(2)
 	//all blocks of piece 60 are pending (lowest priority)
 	p.pcs[60].makeBlockPending(0)
