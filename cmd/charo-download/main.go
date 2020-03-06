@@ -36,6 +36,7 @@ func main() {
 		log.Fatal(err)
 	}
 	cl, err := torrent.NewClient(cfg)
+	defer cl.Close()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -47,17 +48,28 @@ func main() {
 	w.Start()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	finish := t.Download()
+	ch := make(chan error)
+	go func() {
+		err := t.Download()
+		if err != nil {
+			ch <- err
+		}
+		fmt.Println("downloaded torrent. seeding for 1 hour")
+		time.Sleep(time.Hour)
+		ch <- nil
+	}()
 loop:
 	for {
 		select {
-		case <-finish:
+		case err := <-ch:
+			if err != nil {
+				fmt.Println(err)
+			}
 			break loop
 		case <-ticker.C:
 			t.WriteStatus(w)
 		}
 	}
-	fmt.Println("downloaded torrent")
 	//
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
