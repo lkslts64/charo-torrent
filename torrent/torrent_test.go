@@ -231,8 +231,10 @@ func testThirdPartyDataTransfer(t *testing.T, torrentFile string) {
 	leecher.config.BaseDir = "./testdata/leecher"
 	defer os.RemoveAll(leecher.config.BaseDir)
 	leecherTr, err := leecher.AddFromFile(torrentFile)
-	go leecher.makeOutgoingConnections(leecherTr, addrToPeer(seeder.ListenAddrs()[0].String(), SourceUser))
+	//go leecher.makeOutgoingConnection(leecherTr, addrToPeer(seeder.ListenAddrs()[0].String(), SourceUser))
+	leecherTr.AddPeers(addrToPeer(seeder.ListenAddrs()[0].String(), SourceUser))
 	leecherTr.Download()
+
 	assert.True(t, leecherTr.seeding)
 	testContentsThirdParty(t, seederTr, leecherTr)
 }
