@@ -296,7 +296,7 @@ func (t *Torrent) wantPeers() bool {
 	return len(t.peers) < wantPeersThreshold
 }
 
-//true if we are interested in something to download (info or data)
+//true if we are interested in something to download (i.e info or data)
 func (t *Torrent) downloading() bool {
 	if t.seeding {
 		return false
@@ -352,7 +352,7 @@ func (t *Torrent) resetNextTrackerAnnounce(interval int32) {
 	nextAnnounce := time.Duration(interval) * time.Second
 	if !t.trackerAnnouncerTimer.Stop() {
 		select {
-		//too rare - only when we announced with event Complete or Started
+		//rare case - only when we announced with event Complete or Started
 		case <-t.trackerAnnouncerTimer.C:
 		default:
 		}

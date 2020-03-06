@@ -20,8 +20,7 @@ func (p *pieceHasher) Run() {
 					return
 				}
 			}
-		case <-p.t.closeHasher:
-			//TODO:wait in torrent to finish or not?
+		case <-p.t.closed:
 			return
 		}
 	}
