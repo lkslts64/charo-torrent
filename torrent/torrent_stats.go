@@ -22,13 +22,15 @@ var lostBlocksDueToSync atomic.Uint64
 
 //Stats contains statistics about a Torrent
 type Stats struct {
-	BlocksDownloaded int //not necessary verified
-	BlocksUploaded   int //verified
-	//Remainings bytes to download and non verified
+	//Number of blocks/chunks downloaded (not necessarily verified)
+	BlocksDownloaded int
+	//Number of blocks/chunks uploaded
+	BlocksUploaded int
+	//Remainings bytes to download (bytes that are downloaded but not verified are not included)
 	BytesLeft int
-	//Bytes we have downloaded and verified
+	//Number of verified bytes we have downloaded
 	BytesDownloaded int
-	//Bytes we have uploaded and verified
+	//Number of bytes we have uploaded
 	BytesUploaded int
 }
 

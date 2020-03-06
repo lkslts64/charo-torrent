@@ -10,9 +10,9 @@ const (
 	SourceUser PeerSource = iota
 	//It was an incoming connection
 	SourceIncoming
-	//The peer was give to us by DHT
+	//The peer was given to us by DHT
 	SourceDHT
-	//The peer was give to us by a tracker
+	//The peer was given to us by a tracker
 	SourceTracker
 )
 
