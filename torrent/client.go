@@ -29,6 +29,8 @@ type Client struct {
 	logger   *log.Logger
 	torrents map[[20]byte]*Torrent
 	close    chan struct{}
+
+	mu sync.Mutex
 	//torrents map[[20]byte]Torrent
 	//a set of info_hashes that clients is
 	//responsible for - easy access
@@ -129,13 +131,11 @@ func (cl *Client) Close() {
 	}
 	wg := sync.WaitGroup{}
 	wg.Add(len(cl.torrents))
-	for ihash := range cl.torrents {
-		go func(ihash [20]byte) {
+	for _, t := range cl.Torrents() {
+		go func(t *Torrent) {
 			defer wg.Done()
-			if err := cl.Remove(ihash); err != nil {
-				panic(err)
-			}
-		}(ihash)
+			t.Close()
+		}(t)
 	}
 	wg.Wait()
 }
@@ -166,21 +166,38 @@ func (cl *Client) AddFromFile(filename string) (*Torrent, error) {
 		return nil, err
 	}
 	t.gotInfo()
+	go t.mainLoop()
 	return t, nil
 }
 
 //AddFromMagnet creates a torrent based on the magnet link provided
 func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
-	return cl.add(&metainfo.MagnetParser{
+	t, err := cl.add(&metainfo.MagnetParser{
 		URI: uri,
 	})
+	if err != nil {
+		return nil, err
+	}
+	go t.mainLoop()
+	if err = <-t.info; err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 //AddFromInfoHash creates a torrent based on it's infohash.
 func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
-	return cl.add(&metainfo.InfoHashParser{
+	t, err := cl.add(&metainfo.InfoHashParser{
 		InfoHash: infohash,
 	})
+	if err != nil {
+		return nil, err
+	}
+	go t.mainLoop()
+	if err = <-t.info; err != nil {
+		return nil, err
+	}
+	return t, nil
 }
 
 func (cl *Client) add(p metainfo.Parser) (*Torrent, error) {
@@ -199,16 +216,13 @@ func (cl *Client) add(p metainfo.Parser) (*Torrent, error) {
 	return t, nil
 }
 
-//Remove removes the Torrent the  torrent with infohash `infohash`.
-func (cl *Client) Remove(infohash [20]byte) error {
-	var (
-		t  *Torrent
-		ok bool
-	)
-	if t, ok = cl.torrents[infohash]; !ok {
+//dropTorrent removes the Torrent the  torrent with infohash `infohash`.
+func (cl *Client) dropTorrent(infohash [20]byte) error {
+	if _, ok := cl.torrents[infohash]; !ok {
 		return errors.New("torrent doesn't exist")
 	}
-	t.withLockContext(t.close)
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
 	delete(cl.torrents, infohash)
 	return nil
 }
@@ -288,21 +302,16 @@ func (cl *Client) runConnection(c *conn) {
 	err = c.mainLoop()
 }
 
-func (cl *Client) makeOutgoingConnections(t *Torrent, peers ...Peer) {
-	for _, peer := range peers {
-		go func(peer Peer) {
-			c, err := (&dialer{
-				cl:   cl,
-				t:    t,
-				peer: peer,
-			}).dial()
-			if err != nil {
-				cl.logger.Println(err)
-				return
-			}
-			cl.runConnection(c)
-		}(peer)
+func (cl *Client) makeOutgoingConnection(t *Torrent, peer Peer) {
+	c, err := (&dialer{
+		cl:   cl,
+		t:    t,
+		peer: peer,
+	}).dial()
+	if err != nil {
+		return
 	}
+	cl.runConnection(c)
 }
 
 func (cl *Client) addr() string {
