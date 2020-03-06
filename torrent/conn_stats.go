@@ -2,8 +2,9 @@ package torrent
 
 import (
 	"fmt"
-	"github.com/dustin/go-humanize"
 	"time"
+
+	"github.com/dustin/go-humanize"
 )
 
 type connStats struct {
@@ -23,12 +24,9 @@ type connStats struct {
 	sumDownloading time.Duration
 	//duration we are in uploading state
 	sumUploading            time.Duration
+	snubbed                 bool
 	badPiecesContributions  int
 	goodPiecesContributions int
-}
-
-func newConnStats() connStats {
-	return connStats{}
 }
 
 func (cs *connStats) stopDownloading() {
@@ -61,7 +59,11 @@ func (cs *connStats) uploadLimitsReached() bool {
 }
 
 func (cs *connStats) isSnubbed() bool {
-	return (!cs.lastReceivedPieceMsg.IsZero() && time.Since(cs.lastReceivedPieceMsg) >= time.Minute)
+	if cs.snubbed {
+		return true
+	}
+	cs.snubbed = (!cs.lastReceivedPieceMsg.IsZero() && time.Since(cs.lastReceivedPieceMsg) >= time.Minute)
+	return cs.snubbed
 }
 
 func (cs *connStats) malliciousness() int {

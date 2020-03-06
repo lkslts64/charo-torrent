@@ -10,56 +10,40 @@ import (
 	"github.com/lkslts64/charo-torrent/peer_wire"
 )
 
-//The strategy for piece picking. In order for a piece to be picked, all piece's blocks
-//should be unrequested.Selects a piece for a conn to download.
-//'ok' set to false means no piece in peerPieces has all blocks unrequested,
-//so we cant pick any.
-//
-//The elemnts in the provided slice will be rearranged according to the strategy in use.
-type less func(p1, p2 *piece) bool
-
-func lessRand(p1, p2 *piece) bool {
-	return rand.Intn(2) == 1
-}
-
-func lessByRarity(p1, p2 *piece) bool {
-	return p1.rarity < p2.rarity
-}
+const (
+	randomPiecePickingStrategyThreshold = 1
+)
 
 //TODO:reconsider how we store pcs - maybe a map would be better?
 //and store them depending on their state (dispatched,unrequested etc).
 type pieces struct {
-	t *Torrent
+	t           *Torrent
+	ownedPieces bitmap.Bitmap
 	//every conn can call getRequests and discardRequests.This mutex protects the fields
 	//that these methods access.
-	mu             sync.Mutex
-	pcs            []*piece
+	mu  sync.Mutex
+	pcs []*piece
+	//pieces sorted by their priority.All verified pieces are not present in this slice
 	prioritizedPcs []*piece
+	endGame        bool
 	//random until we get the first piece, rarest onwards
-	//TODO:maybe pick one by one? insteadof sorting or permute every time?
-	lessFunc    less
-	ownedPieces bitmap.Bitmap
+	piecePickStrategy lessFunc
 }
 
-//TODO:add allVerified boolean at constructor parameter
 func newPieces(t *Torrent) *pieces {
 	numPieces := int(t.numPieces())
-	//TODO:shuffle pieces
 	pcs := make([]*piece, numPieces)
 	for i := 0; i < numPieces; i++ {
 		pcs[i] = newPiece(t, i)
 	}
 	sorted := make([]*piece, numPieces)
 	copy(sorted, pcs)
-	/*rand.Shuffle(len(sorted), func(i, j int) {
-		sorted[i], sorted[j] = sorted[j], sorted[i]
-	})*/
 	p := &pieces{
 		t:              t,
 		pcs:            pcs,
 		prioritizedPcs: sorted,
 	}
-	p.lessFunc = lessRand
+	p.piecePickStrategy = lessRand
 	return p
 }
 
@@ -81,8 +65,8 @@ func (p *pieces) onBitfield(bm bitmap.Bitmap) {
 func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	//Prioritize pieces.Pieces that have more pending &
-	//completed (but still have unrequested) blocks are prioritized.
+	//Prioritize pieces.Pieces that have more pending and
+	//completed but still have unrequested blocks have the highest priority.
 	//If two pieces have both all blocks unrequested then we pick the one selected by
 	//our current strategy.
 	sort.Slice(p.prioritizedPcs, func(i, j int) bool {
@@ -94,12 +78,24 @@ func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int)
 		case !p2.hasUnrequestedBlocks():
 			return true
 		case p1.allBlocksUnrequested() && p2.allBlocksUnrequested():
-			return p.lessFunc(p1, p2)
+			return p.piecePickStrategy(p1, p2)
 		default:
-			return completenessScore(p1) > completenessScore(p2)
+			return p1.completeness() > p2.completeness()
 		}
 	})
 	return p.fillWithRequests(peerPieces, requests)
+}
+
+//The strategy for piece picking. In order for a piece to be picked, all piece's blocks
+//should be unrequested.
+type lessFunc func(p1, p2 *piece) bool
+
+func lessRand(p1, p2 *piece) bool {
+	return rand.Intn(2) == 1
+}
+
+func lessByRarity(p1, p2 *piece) bool {
+	return p1.rarity < p2.rarity
 }
 
 //fills the provided slice with requests. Returns how many were filled.
@@ -109,8 +105,10 @@ func (p *pieces) fillWithRequests(peerPieces bitmap.Bitmap, requests []block) (n
 	for _, piece := range p.prioritizedPcs {
 		if peerPieces.Get(piece.index) {
 			unreq = piece.unrequestedBlocksSlc(len(requests))
-			for _, b := range unreq {
-				piece.makeBlockPending(b.off)
+			if !p.endGame {
+				for _, b := range unreq {
+					piece.makeBlockPending(b.off)
+				}
 			}
 			_n = copy(requests, unreq)
 			n += _n
@@ -125,10 +123,6 @@ func (p *pieces) fillWithRequests(peerPieces bitmap.Bitmap, requests []block) (n
 		}
 	}
 	return
-}
-
-func completenessScore(p *piece) int {
-	return p.completeBlocks.Len() + p.pendingBlocks() - p.unrequestedBlocks.Len()
 }
 
 /*
@@ -151,32 +145,70 @@ func (p *pieces) discardRequests(requests []block) {
 }
 
 func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
+	var inEndGame, transitionIntoEndGame bool
 	piece := p.pcs[i]
 	p.mu.Lock()
+	defer func() {
+		p.mu.Unlock()
+		//send to channels without acquiring the lock
+		//
+		if piece.complete() {
+			p.t.queuePieceForHashing(i)
+		}
+		if transitionIntoEndGame {
+			p.t.broadcastCommand(requestsAvailable{})
+			//No need to send cancels just after entered end game
+			return
+		}
+		if inEndGame {
+			p.t.sendCancels(block{
+				pc:  i,
+				off: off,
+				len: piece.blockLen(off),
+			})
+		}
+	}()
 	piece.makeBlockComplete(ci, off)
-	p.mu.Unlock()
-	if piece.complete() {
-		p.t.queuePieceForHashing(i)
+	if !p.endGame && p.allRequested() {
+		p.setupEndgame()
+		transitionIntoEndGame = true
 	}
+	inEndGame = p.endGame
 }
 
-func (p *pieces) pieceSuccesfullyVerified(i int) {
-	p.pcs[i].verificationSuccess()
-	//change strategy after completion of first block
-	if p.ownedPieces.Len() == 0 {
-		func() {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			p.lessFunc = lessByRarity
-		}()
-	}
+func (p *pieces) pieceVerified(i int) {
 	p.ownedPieces.Set(i, true)
+	p.pcs[i].verificationSuccess()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	//remove the piece i from priotirzedPcs, we'll never make requests for it again.
+	for j, piece := range p.prioritizedPcs {
+		if piece.index == i {
+			p.prioritizedPcs = append(p.prioritizedPcs[:j], p.prioritizedPcs[j+1:]...)
+		}
+	}
+	switch owned := p.ownedPieces.Len(); {
+	case owned == randomPiecePickingStrategyThreshold:
+		p.piecePickStrategy = lessByRarity
+	}
 }
 
 func (p *pieces) pieceVerificationFailed(i int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.pcs[i].verificationFailed()
+}
+
+func (p *pieces) setupEndgame() {
+	if p.endGame {
+		panic("already in endgame")
+	}
+	p.endGame = true
+	notOwned := bitmap.Flip(p.ownedPieces, 0, p.t.numPieces())
+	notOwned.IterTyped(func(piece int) bool {
+		p.pcs[piece].makeAllUnrequested()
+		return true
+	})
 }
 
 //return a slice containing how many blocks a piece has.
@@ -189,7 +221,10 @@ func (p *pieces) blocks() []int {
 	return ret
 }
 
-func (p *pieces) valid(i int) bool {
+func (p *pieces) isValid(i int) bool {
+	if p == nil {
+		panic("isValid: nil")
+	}
 	return i >= 0 && i < len(p.pcs)
 }
 
@@ -197,24 +232,23 @@ func (p *pieces) isLast(i int) bool {
 	return i == len(p.pcs)-1
 }
 
-func (p *pieces) allVerified() bool {
+func (p *pieces) haveAll() bool {
+	return p.ownedPieces.Len() == p.t.numPieces()
+}
+
+//true if all the pieces have been requested (or completed).
+func (p *pieces) allRequested() bool {
 	for _, piece := range p.pcs {
-		if !piece.verified {
+		if piece.hasUnrequestedBlocks() {
 			return false
 		}
 	}
 	return true
 }
 
-//piece is constrcuted by master and is managed entirely
-//by him.Blocks can be at three states and each block lies
-//on a single state at each time. All blocks are initially
-//unrequested.When we request a block through the workers,
-// then a block becomes pending and after downloaded.
-//If a worker gets choked and has requests unsatisfied
-//then master puts them again at unrequested state
-//At all cases,this equality should hold true:
-//len(pendingBlocks)+len(downloadedBlocks)+len(unrequestedBlocks) == totalBlocks
+//Blocks can be at three states.
+//All blocks are initially unrequested.When we request a block,
+//then it becomes pending and when we download it it becomes complete.
 type piece struct {
 	t        *Torrent
 	index    int
@@ -327,7 +361,7 @@ func (p *piece) hasCompletedBlocks() bool {
 }
 
 func (p *piece) pendingBlocks() int {
-	return p.blocks - p.unrequestedBlocks.Len() - p.completeBlocks.Len()
+	return p.blocks - (p.unrequestedBlocks.Len() + p.completeBlocks.Len())
 }
 
 func (p *piece) pendingGet(off int) bool {
@@ -356,10 +390,19 @@ func (p *piece) makeBlockComplete(ci *connInfo, off int) {
 	p.contributors = append(p.contributors, ci)
 }
 
+func (p *piece) makeAllUnrequested() {
+	for i := 0; i < p.blocks; i++ {
+		p.makeBlockUnrequsted(i * p.t.blockRequestSize)
+	}
+}
+
 func (p *piece) complete() bool {
 	return p.completeBlocks.Len() == p.blocks
 }
 
+func (p *piece) completeness() int {
+	return p.completeBlocks.Len() + p.pendingBlocks() - p.unrequestedBlocks.Len()
+}
 func (p *piece) verificationFailed() {
 	for _, c := range p.contributors {
 		c.stats.badPiecesContributions++

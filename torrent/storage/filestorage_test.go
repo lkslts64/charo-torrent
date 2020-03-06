@@ -41,15 +41,16 @@ func TestStorage(t *testing.T) {
 	s, seeding := OpenFileStorage(&metainfo.MetaInfo{
 		Info: info,
 	}, td, blocks, log.New(os.Stdout, "storage", log.LstdFlags))
+	fs := s.(*FileStorage)
 	assert.False(t, seeding)
 	piece := 1
-	testParallelWrites(t, s, blockSize, piece)
+	testParallelWrites(t, fs, blockSize, piece)
 	//try to read one block before verification
 	b := make([]byte, blockSize)
-	n, err := s.ReadBlock(b, int64(piece*s.mi.Info.PieceLen))
+	n, err := fs.ReadBlock(b, int64(piece*fs.mi.Info.PieceLen))
 	assert.Equal(t, ErrReadNonVerified, err)
 	assert.Equal(t, 0, n)
-	testHashPiece(t, s, piece)
+	testHashPiece(t, fs, piece)
 	//try to read after verification
 	//
 	//fill the buffer with something else than zeros because we expect to be
@@ -57,7 +58,7 @@ func TestStorage(t *testing.T) {
 	for i := 0; i < len(b); i++ {
 		b[i] = byte(i + 1)
 	}
-	n, err = s.ReadBlock(b, int64(piece*s.mi.Info.PieceLen))
+	n, err = fs.ReadBlock(b, int64(piece*fs.mi.Info.PieceLen))
 	assert.NoError(t, err)
 	assert.Equal(t, len(b), n)
 	assert.Equal(t, byte(0), b[0])

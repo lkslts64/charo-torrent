@@ -1,42 +1,85 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"time"
 
 	"github.com/gosuri/uilive"
 	"github.com/lkslts64/charo-torrent/torrent"
 )
 
+var torrentFile = flag.String("torrentfile", "", "read the contents of the torrent `file`")
+var cpuprofile = flag.String("cpuprof", "", "write cpu profile to `file`")
+var memprofile = flag.String("memprof", "", "write memory profile to `file`")
+
 func main() {
-	args := os.Args[1:]
-	if len(args) != 1 {
-		log.Fatal("wrong # of args")
+	flag.Parse()
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
 	}
-	cfg := torrent.DefaultConfig()
-	cl, err := torrent.NewClient(cfg)
+	//
+	cfg, err := torrent.DefaultConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
-	t, err := cl.NewTorrentFromFile(args[0])
+	cl, err := torrent.NewClient(cfg)
+	defer cl.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
+	t, err := cl.AddFromFile(*torrentFile)
 	if err != nil {
 		log.Fatal(err)
 	}
 	w := uilive.New()
 	w.Start()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	finish := t.Download()
+	ch := make(chan error)
+	go func() {
+		err := t.Download()
+		if err != nil {
+			ch <- err
+		}
+		fmt.Println("downloaded torrent. seeding for 1 hour")
+		time.Sleep(time.Hour)
+		ch <- nil
+	}()
 loop:
 	for {
 		select {
-		case <-finish:
+		case err := <-ch:
+			if err != nil {
+				fmt.Println(err)
+			}
 			break loop
 		case <-ticker.C:
 			t.WriteStatus(w)
 		}
 	}
-	fmt.Println("downloaded torrent")
+	//
+	if *memprofile != "" {
+		f, err := os.Create(*memprofile)
+		if err != nil {
+			log.Fatal("could not create memory profile: ", err)
+		}
+		defer f.Close()
+		runtime.GC() // get up-to-date statistics
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Fatal("could not write memory profile: ", err)
+		}
+	}
 }

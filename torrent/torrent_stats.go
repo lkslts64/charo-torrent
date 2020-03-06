@@ -10,27 +10,40 @@ import (
 //we had already processed the request
 var latecomerCancels atomic.Uint32
 
+var duplicateBlocksReceived atomic.Uint32
+
+var duplicateRequestsReceived atomic.Uint32
+
+var nonUsefulRequestReads atomic.Uint64
+
+var sendRequestWhenChoked atomic.Uint64
+
+var lostBlocksDueToSync atomic.Uint64
+
 //Stats contains statistics about a Torrent
 type Stats struct {
-	BlocksDownloaded int
-	BlocksUploaded   int
-	//Remainings bytes to download
+	BlocksDownloaded int //not necessary verified
+	BlocksUploaded   int //verified
+	//Remainings bytes to download and non verified
 	BytesLeft int
 	//Bytes we have downloaded and verified
 	BytesDownloaded int
-	//Bytes we have uploaded
+	//Bytes we have uploaded and verified
 	BytesUploaded int
 }
 
 func (s *Stats) blockDownloaded(bytes int) {
-	s.BytesDownloaded += bytes
-	s.BytesLeft -= bytes
 	s.BlocksDownloaded++
 }
 
 func (s *Stats) blockUploaded(bytes int) {
 	s.BytesUploaded += bytes
 	s.BlocksUploaded++
+}
+
+func (s *Stats) onPieceDownload(bytes int) {
+	s.BytesDownloaded += bytes
+	s.BytesLeft -= bytes
 }
 
 func (s *Stats) String() string {

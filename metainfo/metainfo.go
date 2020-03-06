@@ -21,13 +21,9 @@ type MetaInfo struct {
 	//URLList      []string    `bencode:"url-list" empty:"omit"`
 }
 
-func LoadMetainfoFile(fileName string) (*MetaInfo, error) {
-	data, err := ioutil.ReadFile(fileName)
-	if err != nil {
-		return nil, fmt.Errorf("load metainfo:cant read .torrent file with err: %w", err)
-	}
+func loadMetainfoFromBytes(data []byte) (*MetaInfo, error) {
 	var meta MetaInfo
-	err = bencode.Decode(data, &meta)
+	err := bencode.Decode(data, &meta)
 	if err != nil {
 		return nil, fmt.Errorf("load metainfo:: %w", err)
 	}
@@ -42,6 +38,14 @@ func LoadMetainfoFile(fileName string) (*MetaInfo, error) {
 		return nil, fmt.Errorf("load metainfo: %w", err)
 	}
 	return &meta, nil
+}
+
+func LoadMetainfoFile(filename string) (*MetaInfo, error) {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("load metainfo:cant read .torrent file with err: %w", err)
+	}
+	return loadMetainfoFromBytes(data)
 }
 
 //Parse makes some checks based on a torrent file.

@@ -12,8 +12,9 @@ import (
 //some informations like state,bitmap which also conn holds too -
 //we dont share, we communicate so we have some duplicate data-.
 type connInfo struct {
-	t    *Torrent
-	addr string
+	t        *Torrent
+	peer     Peer
+	reserved peer_wire.Reserved
 	//we communicate with conn with these channels - conn also has them
 	commandCh chan interface{}
 	eventCh   chan interface{}
@@ -42,6 +43,9 @@ func (cn *connInfo) choke() {
 			Kind: peer_wire.Choke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
+		if cn.state.isInterested {
+			cn.stopUploading()
+		}
 	}
 }
 
@@ -51,6 +55,7 @@ func (cn *connInfo) unchoke() {
 			Kind: peer_wire.Unchoke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
+		cn.startUploading()
 	}
 }
 
@@ -71,7 +76,7 @@ func (cn *connInfo) notInterested() {
 		})
 		cn.state.amInterested = !cn.state.amInterested
 		if !cn.state.isChoking {
-			cn.stats.stopDownloading()
+			cn.stopDownloading()
 		}
 	}
 }
@@ -85,6 +90,39 @@ func (cn *connInfo) have(i int) {
 
 func (cn *connInfo) sendBitfield() {
 	cn.sendCommand(cn.t.pieces.ownedPieces.Copy())
+}
+
+func (cn *connInfo) sendPort() {
+	cn.sendCommand(&peer_wire.Msg{
+		Kind: peer_wire.Port,
+		Port: cn.t.cl.dhtPort(),
+	})
+}
+
+func (cn *connInfo) peerInterestChanged() {
+	cn.state.isInterested = !cn.state.isInterested
+	if cn.state.isInterested {
+		if !cn.state.amChoking {
+			cn.t.choker.reviewUnchokedPeers()
+		}
+		cn.startUploading()
+	} else {
+		if !cn.state.amChoking {
+			cn.t.choker.reviewUnchokedPeers()
+			cn.stopUploading()
+		}
+	}
+}
+
+func (cn *connInfo) peerChokeChanged() {
+	cn.state.isChoking = !cn.state.isChoking
+	if cn.state.isChoking {
+		if cn.state.amInterested {
+			cn.stopDownloading()
+		}
+	} else {
+		cn.startDownloading()
+	}
 }
 
 //manages if we are interested in peer after a sending us bitfield msg
@@ -145,6 +183,14 @@ func (cn *connInfo) startUploading() {
 	if cn.state.canUpload() {
 		cn.stats.lastStartedUploading = time.Now()
 	}
+}
+
+func (cn *connInfo) stopDownloading() {
+	cn.stats.stopDownloading()
+}
+
+func (cn *connInfo) stopUploading() {
+	cn.stats.stopUploading()
 }
 
 func (cn *connInfo) isSnubbed() bool {

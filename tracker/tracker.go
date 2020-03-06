@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"strconv"
@@ -68,16 +67,21 @@ func (p *Peer) String() string {
 type cheapPeers []byte
 
 func (cheap cheapPeers) peers() ([]Peer, error) {
-	var numPeers int
 	var ip net.IP
-	if numPeers = len(cheap); numPeers%6 != 0 {
-		return nil, fmt.Errorf("cheapPeers length is not divided exactly by 6.Instead it has length %d", numPeers)
+	remainder := len(cheap) % 6
+	cheap = cheap[:len(cheap)-remainder]
+	if len(cheap)%6 != 0 {
+		panic("cheap not divided exactly by 6")
 	}
-	peers := make([]Peer, numPeers/6)
+	//there are extensions so this assertions shouldn't hold
+	/*if numPeers = len(cheap); numPeers%6 != 0 {
+		return nil, fmt.Errorf("cheapPeers length is not divided exactly by 6.Instead it has length %d", numPeers)
+	}*/
+	peers := make([]Peer, len(cheap)/6)
 	j := 0
-	for i := 0; i < numPeers; i += 6 {
+	for i := 0; i < len(cheap); i += 6 {
 		j = i / 6
-		if ip = net.IP([]byte(cheap[i : i+4])).To16(); ip == nil {
+		if ip = net.IP([]byte(cheap[i : i+4])).To4(); ip == nil {
 			return nil, errors.New("cheapPeers ip parse")
 		}
 		peers[j].Port = binary.BigEndian.Uint16(cheap[i+4 : i+6])
