@@ -62,11 +62,9 @@ type Torrent struct {
 	//we should make effort to obtain new peers if they are below this threshold
 	wantPeersThreshold int
 	peers              []Peer
-	//These are the conns that we should try to connect after a call to Resume().
-	droppedPeers []Peer
-	newConnCh    chan *connInfo
-	pieces       *pieces
-	choker       *choker
+	newConnCh          chan *connInfo
+	pieces             *pieces
+	choker             *choker
 	//the number of outstanding request messages we support
 	//without dropping any. The default in in libtorrent is 250.
 	reqq                          int
@@ -79,9 +77,7 @@ type Torrent struct {
 	numAnnounces                  int
 	numTrackerAnnouncesSend       int
 	//
-	dhtAnnounceResp    *dht.Announce
-	dhtAnnounceRequest chan struct{} //with size of 1,select when want to send
-	//if blocks,means we have other announce currently happening so abort.
+	dhtAnnounceResp  *dht.Announce
 	dhtAnnounceTimer *time.Timer
 	canAnnounceDht   bool
 	numDhtAnnounces  int
