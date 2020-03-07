@@ -100,6 +100,7 @@ func TestPiece(t *testing.T) {
 func TestPiecesState(t *testing.T) {
 	tr := newTestTorrent(300, 10*(1<<14)+245, 1<<13, 1<<14)
 	p := newPieces(tr)
+	p.setDownloadAllowed()
 	var bm bitmap.Bitmap
 	bm.Add(1, 29, 30)
 	reqs := make([]block, maxOnFlight)
@@ -120,6 +121,7 @@ func TestPiecesState(t *testing.T) {
 func TestPiecePrioritization(t *testing.T) {
 	tr := newTestTorrent(100, 3, 3, 1)
 	p := newPieces(tr)
+	p.setDownloadAllowed()
 	p.piecePickStrategy = lessByRarity
 	var bm bitmap.Bitmap
 	bm.AddRange(0, tr.numPieces())
@@ -159,6 +161,7 @@ func TestPiecePrioritization(t *testing.T) {
 func TestEndGame(t *testing.T) {
 	tr := newTestTorrent(100, 3, 1, 1)
 	p := newPieces(tr)
+	p.setDownloadAllowed()
 	//end game will be activated for pieces 0 and 1
 	p.ownedPieces.AddRange(2, 100)
 	//make all complete except 0 and 1
