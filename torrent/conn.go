@@ -50,14 +50,12 @@ type conn struct {
 	//channel that we send received msgs
 	eventCh chan interface{}
 	//chans to signal that conn should is dropped
-	dropped         chan struct{}
-	keepAliveTimer  *time.Timer
-	peerReqs        map[block]struct{}
-	onFlightReqs    map[block]struct{}
-	muPeerReqs      sync.Mutex
-	haveInfo        bool
-	amSeeding       bool
-	downloadAllowed bool
+	dropped        chan struct{}
+	keepAliveTimer *time.Timer
+	peerReqs       map[block]struct{}
+	onFlightReqs   map[block]struct{}
+	muPeerReqs     sync.Mutex
+	haveInfo       bool
 
 	//
 	debugVerifications int
@@ -74,8 +72,8 @@ type conn struct {
 //just wraps a msg with an error
 func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 	logPrefix := t.cl.logger.Prefix() + "CN"
-	if peer.tp.ID != nil {
-		logPrefix += fmt.Sprintf("%x ", peer.tp.ID[14:])
+	if peer.P.ID != nil {
+		logPrefix += fmt.Sprintf("%x ", peer.P.ID[14:])
 	} else {
 		logPrefix += "------ "
 	}
@@ -239,7 +237,7 @@ func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 }
 
 func (c *conn) wantBlocks() bool {
-	return c.downloadAllowed && !c.amSeeding && c.haveInfo && c.state.canDownload() &&
+	return !c.amSeeding() && c.haveInfo && c.state.canDownload() &&
 		c.peerBf.Len() > 0 && len(c.onFlightReqs) < maxOnFlight/2
 }
 
@@ -266,16 +264,26 @@ func (c *conn) sendRequests() {
 	}
 }
 
-//returns true if its worth to keep the conn alive
+//returns false if its worth to keep the conn alive
 func (c *conn) notUseful() bool {
 	if !c.haveInfo {
 		return false
 	}
-	return c.peerSeeding() && c.amSeeding
+	return c.peerSeeding() && c.amSeeding()
 }
 
 func (c *conn) peerSeeding() bool {
+	if !c.haveInfo {
+		panic("require info")
+	}
 	return c.peerBf.Len() == c.t.numPieces()
+}
+
+func (c *conn) amSeeding() bool {
+	if !c.haveInfo {
+		return false
+	}
+	return c.myBf.Len() == c.t.numPieces()
 }
 
 func (c *conn) sendKeepAlive() error {
@@ -315,6 +323,10 @@ func (c *conn) gotCommand(cmd interface{}) (err error) {
 			c.state.amChoking = false
 		case peer_wire.Have:
 			c.myBf.Set(int(v.Index), true)
+			if c.notUseful() {
+				err = io.EOF
+				return
+			}
 			//Surpress have msgs.
 			//From https://wiki.theory.org/index.php/BitTorrentSpecification:
 			//At the same time, it may be worthwhile to send a HAVE message
@@ -333,6 +345,10 @@ func (c *conn) gotCommand(cmd interface{}) (err error) {
 		err = c.sendMsg(v)
 	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
 		c.myBf = v
+		if c.notUseful() {
+			err = io.EOF
+			return
+		}
 		err = c.sendMsg(&peer_wire.Msg{
 			Kind: peer_wire.Bitfield,
 			Bf:   c.encodeBitMap(c.myBf),
@@ -343,14 +359,6 @@ func (c *conn) gotCommand(cmd interface{}) (err error) {
 		c.haveInfo = true
 		if c.peerBf.Len() > 0 {
 			c.t.pieces.onBitfield(c.peerBf)
-		}
-	case downloadPieces:
-		c.downloadAllowed = true
-		c.sendRequests()
-	case seeding:
-		c.amSeeding = true
-		if c.notUseful() {
-			err = io.EOF
 		}
 	case drop:
 		err = io.EOF
@@ -412,6 +420,10 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 			return
 		}
 		c.peerBf.Set(int(msg.Index), true)
+		if c.notUseful() {
+			err = io.EOF
+			return
+		}
 		if c.haveInfo {
 			c.t.pieces.onHave(int(msg.Index))
 		}
@@ -426,6 +438,10 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 			return
 		}
 		c.peerBf = *tmp
+		if c.notUseful() {
+			err = io.EOF
+			return
+		}
 		if c.haveInfo {
 			c.t.pieces.onBitfield(c.peerBf)
 		}

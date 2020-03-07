@@ -26,6 +26,8 @@ type pieces struct {
 	//pieces sorted by their priority.All verified pieces are not present in this slice
 	prioritizedPcs []*piece
 	endGame        bool
+	//if false we shouldn't make any requests
+	downloadAllowed bool
 	//random until we get the first piece, rarest onwards
 	piecePickStrategy lessFunc
 }
@@ -62,9 +64,18 @@ func (p *pieces) onBitfield(bm bitmap.Bitmap) {
 	})
 }
 
+func (p *pieces) setDownloadAllowed() {
+	p.mu.Lock()
+	p.downloadAllowed = true
+	p.mu.Unlock()
+}
+
 func (p *pieces) getRequests(peerPieces bitmap.Bitmap, requests []block) (n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !p.downloadAllowed {
+		return
+	}
 	//Prioritize pieces.Pieces that have more pending and
 	//completed but still have unrequested blocks have the highest priority.
 	//If two pieces have both all blocks unrequested then we pick the one selected by

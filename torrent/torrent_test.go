@@ -1,7 +1,7 @@
 package torrent
 
 import (
-	"fmt"
+	"bytes"
 	"io"
 	"log"
 	"net/http"
@@ -27,6 +27,7 @@ func TestTorrentNewConnection(t *testing.T) {
 	cl, err := NewClient(testingConfig())
 	require.NoError(t, err)
 	tr, err := cl.AddFromFile(helloWorldTorrentFile)
+	tr.Download() //allow connection establishment
 	require.NoError(t, err)
 	go tr.mainLoop()
 	for i := 0; i < tr.maxEstablishedConnections; i++ {
@@ -43,11 +44,6 @@ func TestTorrentNewConnection(t *testing.T) {
 			t.Fail()
 		}
 		switch (<-ci.commandCh).(type) {
-		case seeding:
-		default:
-			t.Fail()
-		}
-		switch (<-ci.commandCh).(type) {
 		case bitmap.Bitmap:
 		default:
 			t.Fail()
@@ -57,15 +53,17 @@ func TestTorrentNewConnection(t *testing.T) {
 }
 
 func TestStatsUpdate(t *testing.T) {
+	tr := &Torrent{
+		mi: &metainfo.MetaInfo{},
+	}
 	ci := &connInfo{
-		t:         &Torrent{},
+		t:         tr,
 		eventCh:   make(chan interface{}, eventChSize),
 		commandCh: make(chan interface{}, commandChSize),
 		dropped:   make(chan struct{}),
 		state:     newConnState(),
 	}
 
-	tr := &Torrent{}
 	//test if durationUploading changes when our state changes
 	tr.gotEvent(event{
 		conn: ci,
@@ -123,7 +121,7 @@ func TestLoadCompleteTorrent(t *testing.T) {
 	require.NoError(t, err)
 	tr, err := cl.AddFromFile(helloWorldTorrentFile)
 	require.NoError(t, err)
-	assert.Equal(t, true, tr.seeding)
+	assert.Equal(t, true, tr.haveAll())
 	data := make([]byte, tr.pieceLen(0))
 	tr.readBlock(data, 0, 0)
 	assert.EqualValues(t, 12, len(data))
@@ -162,8 +160,8 @@ func testDataTransfer(t *testing.T, opts dataTransferOpts) {
 	require.NoError(t, err)
 	seederTr, err := seeder.AddFromFile(opts.filename)
 	require.NoError(t, err)
-	assert.True(t, seederTr.seeding)
-	//require.Equal(t, err, seederTr.Download())
+	assert.True(t, seederTr.haveAll())
+	seederTr.Download() //start seeding
 	dataSeeder := make([]byte, seederTr.length)
 	//read whole contents
 	err = seederTr.readBlock(dataSeeder, 0, 0)
@@ -196,7 +194,7 @@ func testDataTransfer(t *testing.T, opts dataTransferOpts) {
 	wg.Wait()
 	for _, leecher := range leechers {
 		leecherTr := leecher.Torrents()[0]
-		assert.True(t, leecherTr.seeding)
+		assert.True(t, leecherTr.haveAll())
 		testContents(t, dataSeeder, leecherTr)
 	}
 }
@@ -235,7 +233,7 @@ func testThirdPartyDataTransfer(t *testing.T, torrentFile string) {
 	leecherTr.AddPeers(addrToPeer(seeder.ListenAddrs()[0].String(), SourceUser))
 	leecherTr.Download()
 
-	assert.True(t, leecherTr.seeding)
+	assert.True(t, leecherTr.haveAll())
 	testContentsThirdParty(t, seederTr, leecherTr)
 }
 
@@ -266,9 +264,10 @@ func TestThirdPartyMultiFileDataTransfer(t *testing.T) {
 //dummy tracker will always respond to announces with the same peer
 type dummyTracker struct {
 	//close  chan struct{}
-	myAddr string
-	t      *testing.T
-	peer   tracker.Peer
+	myAddr       string
+	t            *testing.T
+	peer         tracker.Peer
+	numAnnounces int
 }
 
 func (dt *dummyTracker) addr() string {
@@ -281,6 +280,13 @@ type httpAnnounceResponse struct {
 }
 
 func (dt *dummyTracker) announceHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	e, ok := q["event"]
+	if ok {
+		assert.Len(dt.t, e, 1)
+		assert.EqualValues(dt.t, "started", e[0])
+		assert.Equal(dt.t, 0, dt.numAnnounces)
+	}
 	bytes, _ := bencode.Encode(httpAnnounceResponse{
 		Interval: 1,
 		Peers: []tracker.Peer{
@@ -288,6 +294,7 @@ func (dt *dummyTracker) announceHandler(w http.ResponseWriter, r *http.Request) 
 		},
 	})
 	w.Write(bytes)
+	dt.numAnnounces++
 }
 
 func (dt *dummyTracker) serve() {
@@ -305,7 +312,6 @@ var localhost = "127.0.0.1"
 func TestTrackerAnnouncer(t *testing.T) {
 	cfg := testingConfig()
 	cfg.DisableTrackers = false
-	//cfg.DisableDHT = false
 	cfg.BaseDir = ".testdata/utopia"
 	cl, err := NewClient(cfg)
 	require.NoError(t, err)
@@ -323,7 +329,7 @@ func TestTrackerAnnouncer(t *testing.T) {
 	tr, err := cl.AddFromFile(helloWorldTorrentFile)
 	require.NoError(t, err)
 	tr.mi.Announce = dt.addr()
-	go tr.Download()
+	tr.download()
 	//we want to announce multiple times so sleep for a bit
 	time.Sleep(4 * time.Second)
 	defer cl.Close()
@@ -419,7 +425,8 @@ func TestWantConnsAndPeers(t *testing.T) {
 
 //In linux (and possibly in Windows) there is a limit to how many open file
 //discriptors a process can have. If we dont enforce the limit, all reads/writes
-//from sockets,files etc will fail, so eventually an error will occur
+//from sockets,files etc will fail, so eventually a fatal error will occur or the
+//timer will expire.
 func TestHalfOpenConnsLimit(t *testing.T) {
 	cfg := testingConfig()
 	cfg.DialTimeout = time.Millisecond
@@ -428,7 +435,7 @@ func TestHalfOpenConnsLimit(t *testing.T) {
 	tr, err := cl.AddFromFile(helloWorldTorrentFile)
 	require.NoError(t, err)
 	tr.download() //async download
-	addDummyPeers := func(invalidAddrPrefix string) {
+	addInvalidPeers := func(invalidAddrPrefix string) {
 		peers := []Peer{}
 		for i := 0; i <= 255; i++ {
 			peers = append(peers, addrToPeer(invalidAddrPrefix+strconv.Itoa(i)+":9090", SourceUser))
@@ -436,20 +443,77 @@ func TestHalfOpenConnsLimit(t *testing.T) {
 		require.NoError(t, tr.AddPeers(peers...))
 	}
 	//these are invalid IP addreses (https://stackoverflow.com/questions/10456044/what-is-a-good-invalid-ip-address-to-use-for-unit-tests)
-	addDummyPeers("192.0.2.")
-	addDummyPeers("198.51.100.")
-	addDummyPeers("203.0.113.")
+	addInvalidPeers("192.0.2.")
+	addInvalidPeers("198.51.100.")
+	addInvalidPeers("203.0.113.")
 	//wait until we have tried to connect to all peers
-	count := 0
+	failure := time.NewTimer(10 * time.Second)
 	for {
 		time.Sleep(100 * time.Millisecond)
-		sw, err := tr.Swarm()
-		require.NoError(t, err)
-		fmt.Println(len(sw))
+		sw := tr.Swarm()
 		if len(sw) == 0 {
 			break
 		}
-		require.Less(t, count, 100)
-		count++
+		select {
+		case <-failure.C:
+			t.FailNow()
+		default:
+		}
 	}
+}
+
+//Test that is safe to invoke methods on torrent simultaneously and that after close some
+//methods return errors as they should be.
+func TestTorrentParallelXported(t *testing.T) {
+	cfg := testingConfig()
+	cfg.BaseDir = "./leecher"
+	cl, err := NewClient(cfg)
+	defer cl.Close()
+	tr, err := cl.AddFromFile(helloWorldTorrentFile)
+	require.NoError(t, err)
+	require.NoError(t, tr.download())
+	//download twice gives error
+	require.Error(t, tr.download())
+	testXported := func(expectErr bool) {
+		wg := sync.WaitGroup{}
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			err := tr.AddPeers(Peer{})
+			if expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			var b bytes.Buffer
+			tr.WriteStatus(&b)
+			assert.Greater(t, b.Len(), 0)
+		}()
+		wg.Wait()
+	}
+	testXported(false)
+	tr.Close()
+	assert.True(t, tr.Closed())
+	testXported(true)
+}
+
+func TestTorrentParallelClose(t *testing.T) {
+	cfg := testingConfig()
+	cl, err := NewClient(cfg)
+	defer cl.Close()
+	tr, err := cl.AddFromFile(helloWorldTorrentFile)
+	require.NoError(t, err)
+	wg := sync.WaitGroup{}
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+			tr.Close()
+		}()
+	}
+	wg.Wait()
+	assert.True(t, tr.Closed())
 }

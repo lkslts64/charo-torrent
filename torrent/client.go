@@ -51,22 +51,25 @@ type Client struct {
 
 //Config provides configuration for a Client.
 type Config struct {
-	//max outstanding requests per connection we allow for a peer to have
+	//Max outstanding requests per connection we allow for a peer to have
 	MaxOnFlightReqs int
-	//TODO: move to torrent
+	//Max active/established connectioctions per torrent
 	MaxEstablishedConns int
 	//This option disables DHT also.
 	RejectIncomingConnections bool
 	DisableTrackers           bool
 	DisableDHT                bool
-	//directory to store the data
-	BaseDir          string
-	OpenStorage      storage.Open
-	DialTimeout      time.Duration
+	//Directory to store the data
+	BaseDir string
+	//Function to open the storage.Provide your own for a custom storage implementation
+	OpenStorage storage.Open
+	//Dials for new connections will fail after this duration
+	DialTimeout time.Duration
+	//BitTorrent handshakes will fail after this duration
 	HandshakeTiemout time.Duration
 }
 
-//NewClient creats a fresh new Client with the provided configuration.
+//NewClient creates a new Client with the provided configuration.
 //Use `NewClient(nil)` for the default configuration.
 func NewClient(cfg *Config) (*Client, error) {
 	var err error
@@ -102,7 +105,7 @@ func NewClient(cfg *Config) (*Client, error) {
 		cl.trackerAnnouncer = &trackerAnnouncer{
 			cl:                            cl,
 			trackerAnnouncerSubmitEventCh: make(chan trackerAnnouncerEvent, 5),
-			trackers:                      make(map[string]tracker.TrackerURL),
+			trackers:                      make(map[string]*trackerURL),
 		}
 		go cl.trackerAnnouncer.run()
 	}
@@ -123,7 +126,7 @@ func NewClient(cfg *Config) (*Client, error) {
 	return cl, nil
 }
 
-//Close calls Remove for all the torrents managed by the client.
+//Close calls torrent.Close for all the torrents managed by the client.
 func (cl *Client) Close() {
 	close(cl.close)
 	if cl.dhtServer != nil {
@@ -140,7 +143,7 @@ func (cl *Client) Close() {
 	wg.Wait()
 }
 
-//DefaultConfig Returns the default configuration for a client
+//DefaultConfig returns the default configuration for a client
 func DefaultConfig() (*Config, error) {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -170,7 +173,7 @@ func (cl *Client) AddFromFile(filename string) (*Torrent, error) {
 	return t, nil
 }
 
-//AddFromMagnet creates a torrent based on the magnet link provided
+//AddFromMagnet creates a torrent based on the magnet link provided (not implemented yet)
 func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
 	t, err := cl.add(&metainfo.MagnetParser{
 		URI: uri,
@@ -185,7 +188,7 @@ func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
 	return t, nil
 }
 
-//AddFromInfoHash creates a torrent based on it's infohash.
+//AddFromInfoHash creates a torrent based on it's infohash (not implemented yet)
 func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
 	t, err := cl.add(&metainfo.InfoHashParser{
 		InfoHash: infohash,
@@ -236,7 +239,7 @@ func (cl *Client) Torrents() []*Torrent {
 	return ts
 }
 
-//ListenPort returns the port that the we are listening for new connections
+//ListenPort returns the port that the client listens for new connections
 func (cl *Client) ListenPort() int {
 	return cl.port
 }
@@ -279,11 +282,11 @@ func addrToPeer(address string, source PeerSource) Peer {
 		panic(err)
 	}
 	return Peer{
-		tp: tracker.Peer{
+		P: tracker.Peer{
 			IP:   ap.ip,
 			Port: ap.port,
 		},
-		source: source,
+		Source: source,
 	}
 }
 
@@ -325,7 +328,7 @@ func (cl *Client) handshake(tcpConn net.Conn, hs *peer_wire.HandShake, peer Peer
 	if err != nil {
 		return nil, err
 	}
-	if peer.tp.ID != nil && !bytes.Equal(peer.tp.ID, hs.PeerID[:]) {
+	if peer.P.ID != nil && !bytes.Equal(peer.P.ID, hs.PeerID[:]) {
 		return nil, errors.New("peer ID not compatible with the one tracker gave us")
 	}
 	return hs, nil

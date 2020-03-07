@@ -45,7 +45,8 @@ var maxRequestBlockSz = 1 << 14
 
 const metadataPieceSz = 1 << 14
 
-//Torrent
+//Torrent represents a torrent and maintains state about it.Multiple goroutines may
+//invoke methods on a Torrent simultaneously.
 type Torrent struct {
 	cl          *Client
 	logger      *log.Logger
@@ -58,16 +59,14 @@ type Torrent struct {
 	halfOpenConns             map[string]Peer
 	maxHalfOpenConns          int
 	maxEstablishedConnections int
-	wantPeersThreshold        int
-
-	peers []Peer
+	//we should make effort to obtain new peers if they are below this threshold
+	wantPeersThreshold int
+	peers              []Peer
 	//These are the conns that we should try to connect after a call to Resume().
 	droppedPeers []Peer
 	newConnCh    chan *connInfo
 	pieces       *pieces
 	choker       *choker
-	//are we seeding
-	seeding bool
 	//the number of outstanding request messages we support
 	//without dropping any. The default in in libtorrent is 250.
 	reqq                          int
@@ -86,21 +85,22 @@ type Torrent struct {
 	dhtAnnounceTimer *time.Timer
 	canAnnounceDht   bool
 	numDhtAnnounces  int
-
+	//fires when an exported method wants to be invoked
 	userCh chan chan interface{}
-	//this bool is set true when its time to download the data
+	//this bool is set true when its time start transfering data.
 	downloadRequest bool
-	locker          torrentLocker
-	closed          chan struct{}
-	isClosed        bool
+	//closes when the torrent is closed
+	closed   chan struct{}
+	isClosed bool
 	//when this closes it signals all conns to exit
-	drop           chan struct{}
+	drop chan struct{}
+	//closes when we have all pieces
 	downloadedData chan struct{}
-	info           chan error
-	//for displaying the state of torrent and conns
-	displayCh             chan chan []byte
-	discarded             chan struct{}
-	pieceQueuedHashingCh  chan int
+	//closes when we get the info
+	info chan error
+	//channel to send requests to piece hasher goroutine
+	pieceQueuedHashingCh chan int
+	//response channel of piece hasher
 	pieceHashedCh         chan pieceHashed
 	queuedForVerification map[int]struct{}
 	//Info field of `mi` is nil if we dont have it.
@@ -118,8 +118,7 @@ type Torrent struct {
 	//frequency map of infoSizes we have received
 	infoSizeFreq freqMap
 	//length of data to be downloaded
-	length int
-	//
+	length         int
 	stats          Stats
 	eventsReceived int
 	commandsSent   int
@@ -134,7 +133,7 @@ func newTorrent(cl *Client) *Torrent {
 		newConnCh:                  make(chan *connInfo, maxEstablishedConnsDefault),
 		halfOpenConns:              make(map[string]Peer),
 		userCh:                     make(chan chan interface{}),
-		maxEstablishedConnections:  55,
+		maxEstablishedConnections:  cl.config.MaxEstablishedConns,
 		maxHalfOpenConns:           55,
 		wantPeersThreshold:         100,
 		drop:                       make(chan struct{}),
@@ -155,10 +154,6 @@ func newTorrent(cl *Client) *Torrent {
 		t.trackerAnnouncerSubmitEventCh = cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh
 	}
 	t.choker = newChoker(t)
-	t.locker = torrentLocker{
-		ch:     t.userCh,
-		closed: t.closed,
-	}
 	return t
 }
 
@@ -181,6 +176,7 @@ func (t *Torrent) close() {
 	t.newConnCh = nil
 	t.pieces = nil
 	t.infoBytes = nil
+	t.peers = nil
 	//t.logger = nil
 	//TODO: clear struct fields
 }
@@ -195,11 +191,8 @@ func (t *Torrent) dropAllConns() {
 	t.conns = nil
 }
 
-//jobs that we 'll send are proportional to the # of events we have received.
-//TODO:count max jobs we can send in an iteration (estimate < 10)
 func (t *Torrent) mainLoop() {
-	t.sendAnnounceToTracker(tracker.Started)
-	t.announceDht()
+	t.tryAnnounceAll()
 	t.choker.startTicker()
 	for {
 		select {
@@ -210,7 +203,7 @@ func (t *Torrent) mainLoop() {
 			t.pieceHashed(res.pieceIndex, res.ok)
 			if res.ok && t.pieces.haveAll() {
 				t.sendAnnounceToTracker(tracker.Completed)
-				t.startSeeding()
+				t.downloadedAll()
 			}
 		case ci := <-t.newConnCh: //we established a new connection
 			t.establishedConnection(ci)
@@ -231,22 +224,14 @@ func (t *Torrent) mainLoop() {
 			//close the previous one and try announce again (kind of weird but I think anacrolix does it that way)
 			t.closeDhtAnnounce()
 			t.tryAnnounceAll()
+		//an exported method wants to be invoked
 		case userDone := <-t.userCh:
 			<-userDone
 			if t.isClosed {
 				return
 			}
-			if t.downloadRequest {
-				t.downloadRequested()
-			}
 		}
 	}
-}
-
-func (t *Torrent) downloadRequested() {
-	t.broadcastCommand(downloadPieces{})
-	t.tryAnnounceAll()
-	t.dialConns()
 }
 
 func (t *Torrent) gotEvent(e event) {
@@ -278,13 +263,10 @@ func (t *Torrent) gotEvent(e event) {
 
 //true if we would like to initiate new connections
 func (t *Torrent) wantConns() bool {
-	return t.downloading() && len(t.conns) < t.maxEstablishedConnections
+	return len(t.conns) < t.maxEstablishedConnections && t.shouldTransferData()
 }
 
 func (t *Torrent) wantPeers() bool {
-	if !t.downloading() {
-		return false
-	}
 	wantPeersThreshold := t.wantPeersThreshold
 	//if we have many active conns reduce the wantPeersThreshold.
 	if len(t.conns) > 0 {
@@ -293,22 +275,35 @@ func (t *Torrent) wantPeers() bool {
 			wantPeersThreshold = int(float64(t.wantPeersThreshold) + (1/fullfilledConnSlotsRatio)*10)
 		}
 	}
-	return len(t.peers) < wantPeersThreshold
+	return len(t.peers) < wantPeersThreshold && t.shouldTransferData()
 }
 
+/*
 //true if we are interested in something to download (i.e info or data)
 func (t *Torrent) downloading() bool {
-	if t.seeding {
+	if t.haveAll() {
 		return false
 	}
 	if !t.haveInfo() {
 		return true
 	}
 	return t.downloadRequest
+}*/
+
+func (t *Torrent) seeding() bool {
+	return t.haveAll() && t.downloadRequest
 }
 
-func (t *Torrent) waitingForDownloadRequest() bool {
-	return t.haveInfo() && !t.seeding && !t.downloadRequest
+func (t *Torrent) haveAll() bool {
+	if !t.haveInfo() {
+		return false
+	}
+	return t.pieces.haveAll()
+}
+
+//true if we are allowed to download/upload torrent data or we need info
+func (t *Torrent) shouldTransferData() bool {
+	return !t.haveInfo() || t.downloadRequest
 }
 
 func (t *Torrent) sendAnnounceToTracker(event tracker.Event) {
@@ -333,8 +328,8 @@ func (t *Torrent) trackerAnnounced(tresp trackerAnnouncerResponse) {
 	peers := make([]Peer, len(tresp.resp.Peers))
 	for i := 0; i < len(peers); i++ {
 		peers[i] = Peer{
-			tp:     tresp.resp.Peers[i],
-			source: SourceTracker,
+			P:      tresp.resp.Peers[i],
+			Source: SourceTracker,
 		}
 	}
 	t.gotPeers(peers)
@@ -369,8 +364,12 @@ func (t *Torrent) announceDht() {
 		t.logger.Printf("dht error: %s", err)
 	}
 	t.dhtAnnounceResp = ann
-	if t.dhtAnnounceTimer.Stop() {
-		panic("dht timer hasn't expired")
+	if !t.dhtAnnounceTimer.Stop() {
+		select {
+		//TODO:shouldn't happen
+		case <-t.dhtAnnounceTimer.C:
+		default:
+		}
 	}
 	t.dhtAnnounceTimer.Reset(5 * time.Minute)
 	t.canAnnounceDht = false
@@ -384,11 +383,11 @@ func (t *Torrent) dhtAnnounced(pvs dht.PeersValues) {
 			continue
 		}
 		peers = append(peers, Peer{
-			tp: tracker.Peer{
+			P: tracker.Peer{
 				IP:   peer.IP,
 				Port: uint16(peer.Port),
 			},
-			source: SourceDHT,
+			Source: SourceDHT,
 		})
 	}
 	t.gotPeers(peers)
@@ -428,7 +427,7 @@ func (t *Torrent) dialConns() {
 		//TODO:
 		//if in black list?
 		//
-		t.halfOpenConns[peer.tp.String()] = peer
+		t.halfOpenConns[peer.P.String()] = peer
 		go t.cl.makeOutgoingConnection(t, peer)
 	}
 }
@@ -436,7 +435,7 @@ func (t *Torrent) dialConns() {
 //has peer the same addr with any active connection
 func (t *Torrent) peerInActiveConns(peer Peer) bool {
 	for _, ci := range t.conns {
-		if bytes.Equal(ci.peer.tp.IP, peer.tp.IP) && ci.peer.tp.Port == peer.tp.Port {
+		if bytes.Equal(ci.peer.P.IP, peer.P.IP) && ci.peer.P.Port == peer.P.Port {
 			return true
 		}
 	}
@@ -481,24 +480,35 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 	if t.lastAnnounceResp != nil {
 		b.WriteString(fmt.Sprintf("Seeders: %d\tLeechers: %d\tInterval: %d(secs)\n", t.lastAnnounceResp.Seeders, t.lastAnnounceResp.Seeders, t.lastAnnounceResp.Interval))
 	}
-	b.WriteString(fmt.Sprintf("Mode: %s\n", func() string {
-		if t.seeding {
-			return "seeding"
-		}
-		return "downloading"
-	}()))
+	b.WriteString(fmt.Sprintf("State: %s\n", t.state()))
 	b.WriteString(fmt.Sprintf("Downloaded: %s\tUploaded: %s\tRemaining: %s\n", humanize.Bytes(uint64(t.stats.BytesDownloaded)),
 		humanize.Bytes(uint64(t.stats.BytesUploaded)), humanize.Bytes(uint64(t.stats.BytesLeft))))
 	b.WriteString(fmt.Sprintf("Connected to %d peers\n", len(t.conns)))
 	tabWriter := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tabWriter, "Address\t%\tUp\tDown\t")
 	for _, ci := range t.conns {
-		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.peer.tp.IP.String(),
+		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.peer.P.IP.String(),
 			strconv.Itoa(int(float64(ci.peerBf.Len())/float64(t.numPieces())*100))+"%",
 			humanize.Bytes(uint64(ci.stats.uploadUsefulBytes)),
 			humanize.Bytes(uint64(ci.stats.downloadUsefulBytes)))
 	}
 	tabWriter.Flush()
+}
+
+func (t *Torrent) state() string {
+	if t.isClosed {
+		return "closed"
+	}
+	if t.seeding() {
+		return "seeding"
+	}
+	if !t.haveInfo() {
+		return "downloading info"
+	}
+	if t.downloadRequest {
+		return "downloading data"
+	}
+	return "waiting for downloading request"
 }
 
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
@@ -512,9 +522,9 @@ func (t *Torrent) blockUploaded(c *connInfo, b block) {
 	t.stats.blockUploaded(b.len)
 }
 
-func (t *Torrent) startSeeding() {
+func (t *Torrent) downloadedAll() {
 	close(t.downloadedData)
-	t.seeding = true
+	//t.seeding = true
 	t.broadcastCommand(seeding{})
 	for _, c := range t.conns {
 		c.notInterested()
@@ -572,7 +582,7 @@ func (t *Torrent) onPieceDownload(i int) {
 }
 
 func (t *Torrent) reviewInterestsOnPieceDownload(i int) {
-	if t.seeding {
+	if t.haveAll() {
 		return
 	}
 	for _, c := range t.conns {
@@ -592,25 +602,19 @@ func (t *Torrent) sendHaves(i int) {
 }
 
 func (t *Torrent) establishedConnection(ci *connInfo) bool {
-	if len(t.conns) >= t.maxEstablishedConnections {
+	if !t.wantConns() {
 		ci.commandCh <- drop{}
 		t.closeDhtAnnounce()
-		t.logger.Printf("rejected a connection with peer %v\n", ci.peer.tp)
+		t.logger.Printf("rejected a connection with peer %v\n", ci.peer.P)
 		return false
 	}
 	defer t.choker.reviewUnchokedPeers()
 	t.conns = append(t.conns, ci)
-	//notify conn that we have metainfo or we are seeding
+	//notify conn that we have metainfo
 	if t.haveInfo() {
 		ci.sendCommand(haveInfo{})
 	}
 	//TODO:minimize sends...
-	if t.downloadRequest {
-		ci.sendCommand(downloadPieces{})
-	}
-	if t.seeding {
-		ci.sendCommand(seeding{})
-	}
 	//
 	//TODO:send here extension msg
 	//
@@ -646,11 +650,11 @@ func (t *Torrent) droppedConn(ci *connInfo) bool {
 	defer t.choker.reviewUnchokedPeers()
 	defer t.dialConns()
 	t.removeConn(ci, i)
-	//If there is a large time gap between the time we get the info and before the user
+	//If there is a large time gap between the time we download the info and before the user
 	//requests to download the data we may lose some connections (seeders will close because
 	//we won't request any pieces). So, we may have to store the peers that droped us during
 	//that period in order to reconnect.
-	if t.waitingForDownloadRequest() {
+	if t.infoWasDownloaded() && !t.shouldTransferData() {
 		t.peers = append(t.peers, ci.peer)
 	}
 	return true
@@ -823,7 +827,6 @@ func (t *Torrent) gotInfoHash() {
 	t.logger = log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags)
 }
 
-//TODO:open storage & create pieces etc.
 func (t *Torrent) gotInfo() {
 	defer close(t.info)
 	t.length = t.mi.Info.TotalLength()
@@ -832,21 +835,22 @@ func (t *Torrent) gotInfo() {
 	t.pieces = newPieces(t)
 	t.pieceQueuedHashingCh = make(chan int, t.numPieces())
 	t.pieceHashedCh = make(chan pieceHashed, t.numPieces())
-	var seeding bool
-	t.storage, seeding = t.openStorage(t.mi, t.cl.config.BaseDir, t.pieces.blocks(), t.logger)
+	var haveAll bool
+	t.storage, haveAll = t.openStorage(t.mi, t.cl.config.BaseDir, t.pieces.blocks(), t.logger)
 	t.broadcastCommand(haveInfo{})
-	if seeding {
+	if haveAll {
 		//mark all bocks completed and do all apropriate things when a piece
 		//hashing is succesfull
 		for i, p := range t.pieces.pcs {
 			p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
 			t.pieceHashed(i, true)
 		}
-		t.startSeeding()
+		t.downloadedAll()
 	} else {
 		ph := pieceHasher{t: t}
 		go ph.Run()
 	}
+	//TODO:review interests
 }
 
 func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
@@ -878,4 +882,15 @@ func (t *Torrent) scrapeTracker() (*tracker.ScrapeResp, error) {
 
 func (t *Torrent) haveInfo() bool {
 	return t.mi.Info != nil
+}
+
+//true if we hadn't the info on start up and downloaded/downloadiing it via metadata extension.
+func (t *Torrent) infoWasDownloaded() bool {
+	return t.infoBytes != nil
+}
+
+func (t *Torrent) newLocker() *torrentLocker {
+	return &torrentLocker{
+		t: t,
+	}
 }

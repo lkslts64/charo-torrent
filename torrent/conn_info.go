@@ -127,7 +127,7 @@ func (cn *connInfo) peerChokeChanged() {
 
 //manages if we are interested in peer after a sending us bitfield msg
 func (cn *connInfo) reviewInterestsOnBitfield() {
-	if !cn.t.haveInfo() || cn.t.seeding {
+	if !cn.t.haveInfo() || cn.t.haveAll() {
 		return
 	}
 	for i := 0; i < cn.t.numPieces(); i++ {
@@ -142,7 +142,7 @@ func (cn *connInfo) reviewInterestsOnBitfield() {
 
 //manages if we are interested in peer after sending us a have msg
 func (cn *connInfo) reviewInterestsOnHave(i int) {
-	if !cn.t.haveInfo() || cn.t.seeding {
+	if !cn.t.haveInfo() || cn.t.haveAll() {
 		return
 	}
 	if !cn.t.pieces.ownedPieces.Get(i) {
@@ -194,7 +194,7 @@ func (cn *connInfo) stopUploading() {
 }
 
 func (cn *connInfo) isSnubbed() bool {
-	if cn.t.seeding {
+	if cn.t.haveAll() {
 		return false
 	}
 	return cn.stats.isSnubbed()
@@ -214,7 +214,7 @@ func (cn *connInfo) rate() float64 {
 		}
 		return bytes / dur
 	}
-	if cn.t.seeding {
+	if cn.t.haveAll() {
 		return safeDiv(float64(cn.stats.uploadUsefulBytes), float64(cn.durationUploading()))
 	}
 	return safeDiv(float64(cn.stats.downloadUsefulBytes), float64(cn.durationDownloading()))

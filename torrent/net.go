@@ -16,8 +16,8 @@ type dialer struct {
 
 func (d *dialer) dial() (*conn, error) {
 	var err error
-	defer d.t.removeHalfOpen(d.peer.tp.String())
-	tcpConn, err := net.DialTimeout("tcp", d.peer.tp.String(), d.cl.config.DialTimeout)
+	defer d.t.removeHalfOpen(d.peer.P.String())
+	tcpConn, err := net.DialTimeout("tcp", d.peer.P.String(), d.cl.config.DialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -32,7 +32,6 @@ func (d *dialer) dial() (*conn, error) {
 		InfoHash: d.t.mi.Info.Hash,
 	}, d.peer)
 	if err != nil {
-		d.cl.logger.Println(err)
 		return nil, err
 	}
 	return newConn(d.t, tcpConn, d.peer), nil
