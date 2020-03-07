@@ -59,16 +59,14 @@ type Torrent struct {
 	halfOpenConns             map[string]Peer
 	maxHalfOpenConns          int
 	maxEstablishedConnections int
-	wantPeersThreshold        int
-
-	peers []Peer
+	//we should make effort to obtain new peers if they are below this threshold
+	wantPeersThreshold int
+	peers              []Peer
 	//These are the conns that we should try to connect after a call to Resume().
 	droppedPeers []Peer
 	newConnCh    chan *connInfo
 	pieces       *pieces
 	choker       *choker
-	//are we seeding
-	//seeding bool
 	//the number of outstanding request messages we support
 	//without dropping any. The default in in libtorrent is 250.
 	reqq                          int
@@ -87,20 +85,22 @@ type Torrent struct {
 	dhtAnnounceTimer *time.Timer
 	canAnnounceDht   bool
 	numDhtAnnounces  int
-
+	//fires when an exported method wants to be invoked
 	userCh chan chan interface{}
-	//this bool is set true when its time to download the data
+	//this bool is set true when its time start transfering data.
 	downloadRequest bool
-	closed          chan struct{}
-	isClosed        bool
+	//closes when the torrent is closed
+	closed   chan struct{}
+	isClosed bool
 	//when this closes it signals all conns to exit
-	drop           chan struct{}
+	drop chan struct{}
+	//closes when we have all pieces
 	downloadedData chan struct{}
-	info           chan error
-	//for displaying the state of torrent and conns
-	displayCh             chan chan []byte
-	discarded             chan struct{}
-	pieceQueuedHashingCh  chan int
+	//closes when we get the info
+	info chan error
+	//channel to send requests to piece hasher goroutine
+	pieceQueuedHashingCh chan int
+	//response channel of piece hasher
 	pieceHashedCh         chan pieceHashed
 	queuedForVerification map[int]struct{}
 	//Info field of `mi` is nil if we dont have it.
@@ -118,8 +118,7 @@ type Torrent struct {
 	//frequency map of infoSizes we have received
 	infoSizeFreq freqMap
 	//length of data to be downloaded
-	length int
-	//
+	length         int
 	stats          Stats
 	eventsReceived int
 	commandsSent   int
@@ -329,8 +328,8 @@ func (t *Torrent) trackerAnnounced(tresp trackerAnnouncerResponse) {
 	peers := make([]Peer, len(tresp.resp.Peers))
 	for i := 0; i < len(peers); i++ {
 		peers[i] = Peer{
-			tp:     tresp.resp.Peers[i],
-			source: SourceTracker,
+			P:      tresp.resp.Peers[i],
+			Source: SourceTracker,
 		}
 	}
 	t.gotPeers(peers)
@@ -365,8 +364,12 @@ func (t *Torrent) announceDht() {
 		t.logger.Printf("dht error: %s", err)
 	}
 	t.dhtAnnounceResp = ann
-	if t.dhtAnnounceTimer.Stop() {
-		panic("dht timer hasn't expired")
+	if !t.dhtAnnounceTimer.Stop() {
+		select {
+		//TODO:shouldn't happen
+		case <-t.dhtAnnounceTimer.C:
+		default:
+		}
 	}
 	t.dhtAnnounceTimer.Reset(5 * time.Minute)
 	t.canAnnounceDht = false
@@ -380,11 +383,11 @@ func (t *Torrent) dhtAnnounced(pvs dht.PeersValues) {
 			continue
 		}
 		peers = append(peers, Peer{
-			tp: tracker.Peer{
+			P: tracker.Peer{
 				IP:   peer.IP,
 				Port: uint16(peer.Port),
 			},
-			source: SourceDHT,
+			Source: SourceDHT,
 		})
 	}
 	t.gotPeers(peers)
@@ -424,7 +427,7 @@ func (t *Torrent) dialConns() {
 		//TODO:
 		//if in black list?
 		//
-		t.halfOpenConns[peer.tp.String()] = peer
+		t.halfOpenConns[peer.P.String()] = peer
 		go t.cl.makeOutgoingConnection(t, peer)
 	}
 }
@@ -432,7 +435,7 @@ func (t *Torrent) dialConns() {
 //has peer the same addr with any active connection
 func (t *Torrent) peerInActiveConns(peer Peer) bool {
 	for _, ci := range t.conns {
-		if bytes.Equal(ci.peer.tp.IP, peer.tp.IP) && ci.peer.tp.Port == peer.tp.Port {
+		if bytes.Equal(ci.peer.P.IP, peer.P.IP) && ci.peer.P.Port == peer.P.Port {
 			return true
 		}
 	}
@@ -484,7 +487,7 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 	tabWriter := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tabWriter, "Address\t%\tUp\tDown\t")
 	for _, ci := range t.conns {
-		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.peer.tp.IP.String(),
+		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\t\n", ci.peer.P.IP.String(),
 			strconv.Itoa(int(float64(ci.peerBf.Len())/float64(t.numPieces())*100))+"%",
 			humanize.Bytes(uint64(ci.stats.uploadUsefulBytes)),
 			humanize.Bytes(uint64(ci.stats.downloadUsefulBytes)))
@@ -602,7 +605,7 @@ func (t *Torrent) establishedConnection(ci *connInfo) bool {
 	if !t.wantConns() {
 		ci.commandCh <- drop{}
 		t.closeDhtAnnounce()
-		t.logger.Printf("rejected a connection with peer %v\n", ci.peer.tp)
+		t.logger.Printf("rejected a connection with peer %v\n", ci.peer.P)
 		return false
 	}
 	defer t.choker.reviewUnchokedPeers()
