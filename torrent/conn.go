@@ -56,8 +56,6 @@ type conn struct {
 	onFlightReqs   map[block]struct{}
 	muPeerReqs     sync.Mutex
 	haveInfo       bool
-	//connection is allowed to send/receive blocks of pieces
-	pieceTransferAllowed bool
 
 	//
 	debugVerifications int
@@ -74,8 +72,8 @@ type conn struct {
 //just wraps a msg with an error
 func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 	logPrefix := t.cl.logger.Prefix() + "CN"
-	if peer.tp.ID != nil {
-		logPrefix += fmt.Sprintf("%x ", peer.tp.ID[14:])
+	if peer.P.ID != nil {
+		logPrefix += fmt.Sprintf("%x ", peer.P.ID[14:])
 	} else {
 		logPrefix += "------ "
 	}
@@ -658,9 +656,6 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		}
 		if !c.t.pieces.isValid(bl.pc) {
 			return errors.New("peer send piece doesn't exist")
-		}
-		if !c.pieceTransferAllowed {
-			return nil
 		}
 		//TODO: check if we have the particular block
 		if c.myBf.Get(bl.pc) {

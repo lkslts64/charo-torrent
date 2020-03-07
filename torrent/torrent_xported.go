@@ -35,7 +35,7 @@ func (t *Torrent) Swarm() []Peer {
 //After the download is complete, the Torrent transitions in seeding mode
 //(i.e altruistically upload) until it's closed.
 //If the data are already there,Download returns immediatly and Torrent
-//transists into seeding mode.
+//transists in seeding mode.
 func (t *Torrent) Download() error {
 	if err := t.download(); err != nil {
 		return err
@@ -58,14 +58,20 @@ func (t *Torrent) download() error {
 	if !t.haveInfo() {
 		return errors.New("can't download data without having the info first")
 	}
-	//order of if stmts matters
-	if t.seeding {
-		return errors.New("already seeding")
-	}
 	if t.downloadRequest {
-		return errors.New("already downloading data")
+		return errors.New("already downloading data or seeding")
 	}
 	t.downloadRequest = true
+	if !t.infoWasDownloaded() && len(t.conns) > 0 {
+		panic("why have conns?")
+	}
+	if !t.haveAll() {
+		//notify conns to start downloading
+		t.pieces.setDownloadAllowed()
+		t.broadcastCommand(requestsAvailable{})
+	}
+	t.tryAnnounceAll()
+	t.dialConns()
 	return nil
 }
 
@@ -85,6 +91,30 @@ func (t *Torrent) Metainfo() *metainfo.MetaInfo {
 	l.lock()
 	defer l.unlock()
 	return t.mi
+}
+
+//HaveAllPieces returns whether all torrent's data has been downloaded
+func (t *Torrent) HaveAllPieces() bool {
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	return t.haveAll()
+}
+
+//Seeding returns true if `HaveAllPieces` returns true and a call to `Download` has been made
+//for this torrent
+func (t *Torrent) Seeding() bool {
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	return t.seeding()
+}
+
+func (t *Torrent) Stats() Stats {
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	return t.stats
 }
 
 //Closed returns whether the torrent is closed or not.

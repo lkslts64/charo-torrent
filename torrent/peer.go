@@ -18,6 +18,6 @@ const (
 
 //Holds basic information about a peer
 type Peer struct {
-	tp     tracker.Peer
-	source PeerSource
+	P      tracker.Peer
+	Source PeerSource
 }

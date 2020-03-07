@@ -282,11 +282,11 @@ func addrToPeer(address string, source PeerSource) Peer {
 		panic(err)
 	}
 	return Peer{
-		tp: tracker.Peer{
+		P: tracker.Peer{
 			IP:   ap.ip,
 			Port: ap.port,
 		},
-		source: source,
+		Source: source,
 	}
 }
 
@@ -328,7 +328,7 @@ func (cl *Client) handshake(tcpConn net.Conn, hs *peer_wire.HandShake, peer Peer
 	if err != nil {
 		return nil, err
 	}
-	if peer.tp.ID != nil && !bytes.Equal(peer.tp.ID, hs.PeerID[:]) {
+	if peer.P.ID != nil && !bytes.Equal(peer.P.ID, hs.PeerID[:]) {
 		return nil, errors.New("peer ID not compatible with the one tracker gave us")
 	}
 	return hs, nil
