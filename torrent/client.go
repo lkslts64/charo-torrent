@@ -105,7 +105,7 @@ func NewClient(cfg *Config) (*Client, error) {
 		cl.trackerAnnouncer = &trackerAnnouncer{
 			cl:                            cl,
 			trackerAnnouncerSubmitEventCh: make(chan trackerAnnouncerEvent, 5),
-			trackers:                      make(map[string]tracker.TrackerURL),
+			trackers:                      make(map[string]*trackerURL),
 		}
 		go cl.trackerAnnouncer.run()
 	}

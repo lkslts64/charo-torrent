@@ -13,8 +13,32 @@ type trackerAnnouncer struct {
 	//All Torrents send events to tracker via this chan
 	trackerAnnouncerSubmitEventCh chan trackerAnnouncerEvent
 	//the trackerURLs that we maintain
-	trackers map[string]tracker.TrackerURL
+	trackers map[string]*trackerURL
 	close    chan chan struct{}
+}
+
+//wrapper for tracker.TrackerURL
+type trackerURL struct {
+	tu           tracker.TrackerURL
+	numAnnounces int
+}
+
+func newTrackerURL(url string) (*trackerURL, error) {
+	tu, err := tracker.NewTrackerURL(url)
+	if err != nil {
+		return nil, err
+	}
+	return &trackerURL{
+		tu: tu,
+	}, nil
+}
+
+func (tu *trackerURL) Announce(ctx context.Context, req tracker.AnnounceReq) (*tracker.AnnounceResp, error) {
+	if req.Event == tracker.None && tu.numAnnounces == 0 {
+		req.Event = tracker.Started
+	}
+	tu.numAnnounces++
+	return tu.tu.Announce(ctx, req)
 }
 
 //The logic is simple but if we start supporting AnnounceList extension then it 'll be more
@@ -50,7 +74,7 @@ func (t *trackerAnnouncer) announce(te trackerAnnouncerEvent) (*tracker.Announce
 	}
 	url := te.t.mi.Announce
 	if _, ok := t.trackers[url]; !ok {
-		trackerURL, err := tracker.NewTrackerURL(url)
+		trackerURL, err := newTrackerURL(url)
 		if err != nil {
 			return nil, err
 		}
