@@ -23,22 +23,6 @@ import (
 	"github.com/lkslts64/charo-torrent/tracker"
 )
 
-//Active conns are the ones that we download/upload from/to
-//Passive are the ones that we are not-interested/choking or not-interested/choked
-
-//Every conn is managed on a seperate goroutine
-
-//Concurency:
-//when master wants to send something at peerconns
-//he should try to send it (without blocking) because
-//a peerconn may be closed or reading/writing to db
-//So, we should hold a queue of jobs and try send them
-//every time or !!!reflect.SelectCase!!!
-
-//Every goroutine is associated with a chan of Events.
-//When master gouritine wants to change state of a particular
-//conn goroutine it sends an Event through this channel.
-
 var maxEstablishedConnsDefault = 55
 
 var maxRequestBlockSz = 1 << 14
