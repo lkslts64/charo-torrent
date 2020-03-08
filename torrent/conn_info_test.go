@@ -10,10 +10,10 @@ import (
 func TestConnInfoDuration(t *testing.T) {
 	ci := connInfo{}
 	testDuration(t, &ci, connInfoFuncs{
-		ci.stopDownloading, ci.startDownloading, ci.durationDownloading, revertMyInterest,
+		ci.stoppedDownloading, ci.startedDownloading, ci.durationDownloading, revertMyInterest,
 	})
 	testDuration(t, &ci, connInfoFuncs{
-		ci.stopUploading, ci.startUploading, ci.durationUploading, revertPeerInterest,
+		ci.stoppedUploading, ci.startedUploading, ci.durationUploading, revertPeerInterest,
 	})
 }
 

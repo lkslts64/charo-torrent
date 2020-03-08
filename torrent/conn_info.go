@@ -44,7 +44,7 @@ func (cn *connInfo) choke() {
 		})
 		cn.state.amChoking = !cn.state.amChoking
 		if cn.state.isInterested {
-			cn.stopUploading()
+			cn.stoppedUploading()
 		}
 	}
 }
@@ -55,7 +55,7 @@ func (cn *connInfo) unchoke() {
 			Kind: peer_wire.Unchoke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
-		cn.startUploading()
+		cn.startedUploading()
 	}
 }
 
@@ -65,7 +65,7 @@ func (cn *connInfo) interested() {
 			Kind: peer_wire.Interested,
 		})
 		cn.state.amInterested = !cn.state.amInterested
-		cn.startDownloading()
+		cn.startedDownloading()
 	}
 }
 
@@ -76,7 +76,7 @@ func (cn *connInfo) notInterested() {
 		})
 		cn.state.amInterested = !cn.state.amInterested
 		if !cn.state.isChoking {
-			cn.stopDownloading()
+			cn.stoppedDownloading()
 		}
 	}
 }
@@ -105,11 +105,11 @@ func (cn *connInfo) peerInterestChanged() {
 		if !cn.state.amChoking {
 			cn.t.choker.reviewUnchokedPeers()
 		}
-		cn.startUploading()
+		cn.startedUploading()
 	} else {
 		if !cn.state.amChoking {
 			cn.t.choker.reviewUnchokedPeers()
-			cn.stopUploading()
+			cn.stoppedUploading()
 		}
 	}
 }
@@ -118,10 +118,10 @@ func (cn *connInfo) peerChokeChanged() {
 	cn.state.isChoking = !cn.state.isChoking
 	if cn.state.isChoking {
 		if cn.state.amInterested {
-			cn.stopDownloading()
+			cn.stoppedDownloading()
 		}
 	} else {
-		cn.startDownloading()
+		cn.startedDownloading()
 	}
 }
 
@@ -167,7 +167,7 @@ func (cn *connInfo) durationUploading() time.Duration {
 	return cn.stats.sumUploading
 }
 
-func (cn *connInfo) startDownloading() {
+func (cn *connInfo) startedDownloading() {
 	if cn.state.canDownload() {
 		cn.stats.lastStartedDownloading = time.Now()
 		//Set last piece msg the first time we get into `downloading` state.
@@ -179,17 +179,17 @@ func (cn *connInfo) startDownloading() {
 	}
 }
 
-func (cn *connInfo) startUploading() {
+func (cn *connInfo) startedUploading() {
 	if cn.state.canUpload() {
 		cn.stats.lastStartedUploading = time.Now()
 	}
 }
 
-func (cn *connInfo) stopDownloading() {
+func (cn *connInfo) stoppedDownloading() {
 	cn.stats.stopDownloading()
 }
 
-func (cn *connInfo) stopUploading() {
+func (cn *connInfo) stoppedUploading() {
 	cn.stats.stopUploading()
 }
 
