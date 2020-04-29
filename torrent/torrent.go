@@ -32,56 +32,57 @@ const metadataPieceSz = 1 << 14
 //Torrent represents a torrent and maintains state about it.Multiple goroutines may
 //invoke methods on a Torrent simultaneously.
 type Torrent struct {
-	cl          *Client
-	logger      *log.Logger
-	events      chan event
+	cl     *Client
+	logger *log.Logger
+	//channel we receive messages from conns
+	recvC       chan msgWithConn
 	openStorage storage.Open
 	storage     storage.Storage
 	//These are active connections
 	conns                     []*connInfo
 	halfOpenmu                sync.Mutex
-	halfOpenConns             map[string]Peer
+	halfOpen                  map[string]Peer
 	maxHalfOpenConns          int
 	maxEstablishedConnections int
 	//we should make effort to obtain new peers if they are below this threshold
 	wantPeersThreshold int
 	peers              []Peer
-	newConnCh          chan *connInfo
+	newConnC           chan *connInfo
 	pieces             *pieces
 	choker             *choker
 	//the number of outstanding request messages we support
 	//without dropping any. The default in in libtorrent is 250.
-	reqq                          int
-	blockRequestSize              int
-	trackerAnnouncerTimer         *time.Timer
-	canAnnounceTracker            bool
-	trackerAnnouncerResponseCh    chan trackerAnnouncerResponse
-	trackerAnnouncerSubmitEventCh chan trackerAnnouncerEvent
-	lastAnnounceResp              *tracker.AnnounceResp
-	numAnnounces                  int
-	numTrackerAnnouncesSend       int
+	reqq                         int
+	blockRequestSize             int
+	trackerAnnouncerTimer        *time.Timer
+	canAnnounceTracker           bool
+	trackerAnnouncerResponseC    chan trackerAnnouncerResponse
+	trackerAnnouncerSubmitEventC chan trackerAnnouncerEvent
+	lastAnnounceResp             *tracker.AnnounceResp
+	numAnnounces                 int
+	numTrackerAnnouncesSend      int
 	//
 	dhtAnnounceResp  *dht.Announce
 	dhtAnnounceTimer *time.Timer
 	canAnnounceDht   bool
 	numDhtAnnounces  int
 	//fires when an exported method wants to be invoked
-	userCh chan chan interface{}
+	userC chan chan interface{}
 	//this bool is set true when its time start transfering data.
 	downloadRequest bool
 	//closes when the torrent is closed
 	closed   chan struct{}
 	isClosed bool
 	//when this closes it signals all conns to exit
-	drop chan struct{}
+	dropC chan struct{}
 	//closes when we have all pieces
-	downloadedData chan struct{}
-	//closes when we get the info
-	info chan error
+	downloadedDataC chan struct{}
+	//closes when we get the infoC
+	infoC chan error
 	//channel to send requests to piece hasher goroutine
-	pieceQueuedHashingCh chan int
+	pieceQueuedHashingC chan int
 	//response channel of piece hasher
-	pieceHashedCh         chan pieceHashed
+	pieceHashedC          chan pieceHashed
 	queuedForVerification map[int]struct{}
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
@@ -100,38 +101,38 @@ type Torrent struct {
 	//length of data to be downloaded
 	length         int
 	stats          Stats
-	eventsReceived int
-	commandsSent   int
+	connMsgsRecv   int
+	msgsSentToConn int
 }
 
 func newTorrent(cl *Client) *Torrent {
 	t := &Torrent{
-		cl:                         cl,
-		openStorage:                cl.config.OpenStorage,
-		reqq:                       250, //libtorent also has this default
-		events:                     make(chan event, maxEstablishedConnsDefault*eventChSize),
-		newConnCh:                  make(chan *connInfo, maxEstablishedConnsDefault),
-		halfOpenConns:              make(map[string]Peer),
-		userCh:                     make(chan chan interface{}),
-		maxEstablishedConnections:  cl.config.MaxEstablishedConns,
-		maxHalfOpenConns:           55,
-		wantPeersThreshold:         100,
-		drop:                       make(chan struct{}),
-		downloadedData:             make(chan struct{}),
-		info:                       make(chan error),
-		closed:                     make(chan struct{}),
-		trackerAnnouncerResponseCh: make(chan trackerAnnouncerResponse, 1),
-		trackerAnnouncerTimer:      newExpiredTimer(),
-		dhtAnnounceTimer:           newExpiredTimer(),
-		dhtAnnounceResp:            new(dht.Announce),
-		queuedForVerification:      make(map[int]struct{}),
-		infoSizeFreq:               newFreqMap(),
-		logger:                     log.New(cl.logger.Writer(), "torrent", log.LstdFlags),
-		canAnnounceDht:             true,
-		canAnnounceTracker:         true,
+		cl:                        cl,
+		openStorage:               cl.config.OpenStorage,
+		reqq:                      250, //libtorent also has this default
+		recvC:                     make(chan msgWithConn, maxEstablishedConnsDefault*sendCSize),
+		newConnC:                  make(chan *connInfo, maxEstablishedConnsDefault),
+		halfOpen:                  make(map[string]Peer),
+		userC:                     make(chan chan interface{}),
+		maxEstablishedConnections: cl.config.MaxEstablishedConns,
+		maxHalfOpenConns:          55,
+		wantPeersThreshold:        100,
+		dropC:                     make(chan struct{}),
+		downloadedDataC:           make(chan struct{}),
+		infoC:                     make(chan error),
+		closed:                    make(chan struct{}),
+		trackerAnnouncerResponseC: make(chan trackerAnnouncerResponse, 1),
+		trackerAnnouncerTimer:     newExpiredTimer(),
+		dhtAnnounceTimer:          newExpiredTimer(),
+		dhtAnnounceResp:           new(dht.Announce),
+		queuedForVerification:     make(map[int]struct{}),
+		infoSizeFreq:              newFreqMap(),
+		logger:                    log.New(cl.logger.Writer(), "torrent", log.LstdFlags),
+		canAnnounceDht:            true,
+		canAnnounceTracker:        true,
 	}
 	if t.cl.trackerAnnouncer != nil {
-		t.trackerAnnouncerSubmitEventCh = cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh
+		t.trackerAnnouncerSubmitEventC = cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh
 	}
 	t.choker = newChoker(t)
 	return t
@@ -151,9 +152,9 @@ func (t *Torrent) close() {
 	t.trackerAnnouncerTimer.Stop()
 	t.dhtAnnounceTimer.Stop()
 	t.choker = nil
-	t.trackerAnnouncerResponseCh = nil
-	t.events = nil
-	t.newConnCh = nil
+	t.trackerAnnouncerResponseC = nil
+	t.recvC = nil
+	t.newConnC = nil
 	t.pieces = nil
 	t.infoBytes = nil
 	t.peers = nil
@@ -164,9 +165,9 @@ func (t *Torrent) close() {
 func (t *Torrent) dropAllConns() {
 	t.closeDhtAnnounce()
 	//signal conns to close and wait until all conns actually close
-	close(t.drop)
+	close(t.dropC)
 	for _, c := range t.conns {
-		<-c.dropped
+		<-c.droppedC
 	}
 	t.conns = nil
 }
@@ -176,20 +177,20 @@ func (t *Torrent) mainLoop() {
 	t.choker.startTicker()
 	for {
 		select {
-		case e := <-t.events:
-			t.gotEvent(e)
-			t.eventsReceived++
-		case res := <-t.pieceHashedCh:
+		case e := <-t.recvC:
+			t.onConnMsg(e)
+			t.connMsgsRecv++
+		case res := <-t.pieceHashedC:
 			t.pieceHashed(res.pieceIndex, res.ok)
 			if res.ok && t.pieces.haveAll() {
 				t.sendAnnounceToTracker(tracker.Completed)
 				t.downloadedAll()
 			}
-		case ci := <-t.newConnCh: //we established a new connection
+		case ci := <-t.newConnC: //we established a new connection
 			t.establishedConnection(ci)
 		case <-t.choker.ticker.C:
 			t.choker.reviewUnchokedPeers()
-		case tresp := <-t.trackerAnnouncerResponseCh:
+		case tresp := <-t.trackerAnnouncerResponseC:
 			t.trackerAnnounced(tresp)
 		case <-t.trackerAnnouncerTimer.C:
 			t.canAnnounceTracker = true
@@ -205,7 +206,7 @@ func (t *Torrent) mainLoop() {
 			t.closeDhtAnnounce()
 			t.tryAnnounceAll()
 		//an exported method wants to be invoked
-		case userDone := <-t.userCh:
+		case userDone := <-t.userC:
 			<-userDone
 			if t.isClosed {
 				return
@@ -214,7 +215,7 @@ func (t *Torrent) mainLoop() {
 	}
 }
 
-func (t *Torrent) gotEvent(e event) {
+func (t *Torrent) onConnMsg(e msgWithConn) {
 	switch v := e.val.(type) {
 	case *peer_wire.Msg:
 		switch v.Kind {
@@ -248,8 +249,8 @@ func (t *Torrent) wantConns() bool {
 
 func (t *Torrent) wantPeers() bool {
 	wantPeersThreshold := t.wantPeersThreshold
-	//if we have many active conns reduce the wantPeersThreshold.
 	if len(t.conns) > 0 {
+		//if we have many active conns increase the wantPeersThreshold.
 		fullfilledConnSlotsRatio := float64(t.maxEstablishedConnections / len(t.conns))
 		if fullfilledConnSlotsRatio < 10/9 {
 			wantPeersThreshold = int(float64(t.wantPeersThreshold) + (1/fullfilledConnSlotsRatio)*10)
@@ -290,7 +291,7 @@ func (t *Torrent) sendAnnounceToTracker(event tracker.Event) {
 	if t.cl.config.DisableTrackers || t.cl.trackerAnnouncer == nil || t.mi.Announce == "" {
 		return
 	}
-	t.trackerAnnouncerSubmitEventCh <- trackerAnnouncerEvent{t, event, t.stats}
+	t.trackerAnnouncerSubmitEventC <- trackerAnnouncerEvent{t, event, t.stats}
 	t.numTrackerAnnouncesSend++
 	t.canAnnounceTracker = false
 }
@@ -399,7 +400,7 @@ func (t *Torrent) dialConns() {
 	defer t.tryAnnounceAll()
 	t.halfOpenmu.Lock()
 	defer t.halfOpenmu.Unlock()
-	for len(t.peers) > 0 && len(t.halfOpenConns) < t.maxHalfOpenConns {
+	for len(t.peers) > 0 && len(t.halfOpen) < t.maxHalfOpenConns {
 		peer := t.popPeer()
 		if t.peerInActiveConns(peer) {
 			continue
@@ -407,7 +408,7 @@ func (t *Torrent) dialConns() {
 		//TODO:
 		//if in black list?
 		//
-		t.halfOpenConns[peer.P.String()] = peer
+		t.halfOpen[peer.P.String()] = peer
 		go t.cl.makeOutgoingConnection(t, peer)
 	}
 }
@@ -436,7 +437,7 @@ func (t *Torrent) swarm() (peers []Peer) {
 	func() {
 		t.halfOpenmu.Lock()
 		defer t.halfOpenmu.Unlock()
-		for _, p := range t.halfOpenConns {
+		for _, p := range t.halfOpen {
 			peers = append(peers, p)
 		}
 	}()
@@ -503,7 +504,7 @@ func (t *Torrent) blockUploaded(c *connInfo, b block) {
 }
 
 func (t *Torrent) downloadedAll() {
-	close(t.downloadedData)
+	close(t.downloadedDataC)
 	//t.seeding = true
 	t.broadcastCommand(seeding{})
 	for _, c := range t.conns {
@@ -518,7 +519,7 @@ func (t *Torrent) queuePieceForHashing(i int) {
 	}
 	t.queuedForVerification[i] = struct{}{}
 	select {
-	case t.pieceQueuedHashingCh <- i:
+	case t.pieceQueuedHashingC <- i:
 	default:
 		panic("queue piece hash: should not block")
 	}
@@ -538,8 +539,8 @@ func (t *Torrent) pieceHashed(i int, correct bool) {
 //when we close eventCh of conn, the goroutine
 //exits
 func (t *Torrent) aggregateEvents(ci *connInfo) {
-	for e := range ci.eventCh {
-		t.events <- event{ci, e}
+	for e := range ci.recvC {
+		t.recvC <- msgWithConn{ci, e}
 	}
 }
 
@@ -583,7 +584,7 @@ func (t *Torrent) sendHaves(i int) {
 
 func (t *Torrent) establishedConnection(ci *connInfo) bool {
 	if !t.wantConns() {
-		ci.commandCh <- drop{}
+		ci.sendC <- drop{}
 		t.closeDhtAnnounce()
 		t.logger.Printf("rejected a connection with peer %v\n", ci.peer.P)
 		return false
@@ -677,7 +678,7 @@ func (t *Torrent) removeConn(ci *connInfo, index int) {
 
 func (t *Torrent) removeHalfOpen(addr string) {
 	t.halfOpenmu.Lock()
-	delete(t.halfOpenConns, addr)
+	delete(t.halfOpen, addr)
 	t.halfOpenmu.Unlock()
 	t.dialConns()
 }
@@ -808,13 +809,13 @@ func (t *Torrent) gotInfoHash() {
 }
 
 func (t *Torrent) gotInfo() {
-	defer close(t.info)
+	defer close(t.infoC)
 	t.length = t.mi.Info.TotalLength()
 	t.stats.BytesLeft = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
-	t.pieceQueuedHashingCh = make(chan int, t.numPieces())
-	t.pieceHashedCh = make(chan pieceHashed, t.numPieces())
+	t.pieceQueuedHashingC = make(chan int, t.numPieces())
+	t.pieceHashedC = make(chan pieceHashed, t.numPieces())
 	var haveAll bool
 	t.storage, haveAll = t.openStorage(t.mi, t.cl.config.BaseDir, t.pieces.blocks(), t.logger)
 	t.broadcastCommand(haveInfo{})

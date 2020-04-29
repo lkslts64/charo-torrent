@@ -17,9 +17,9 @@ import (
 
 const (
 	//the size could be t.reqq?
-	readChSize    = 250
-	eventChSize   = 10
-	commandChSize = eventChSize
+	readCSize = 250
+	sendCSize = 10
+	recvCSize = sendCSize
 )
 
 const (
@@ -41,14 +41,10 @@ type conn struct {
 	//main goroutine also has this state - needs to be synced between
 	//the two goroutines
 	state connState
-	//chanel that we receive msgs to be sent (generally)
-	//commandCh chan job - infinite chan
-	//we want to avoid deadlocks between commandCh and eventCh.
-	//Also we dont want master to block until workers(peerConns)
-	//receive jobs (they are doing heavy I/O).
-	commandCh chan interface{}
-	//channel that we send received msgs
-	eventCh chan interface{}
+	//we receive messages from Torrent on this channel.
+	recvC chan interface{}
+	//we send messages to Torrent from this channel.
+	sendC chan interface{}
 	//chans to signal that conn should is dropped
 	dropped        chan struct{}
 	keepAliveTimer *time.Timer
@@ -59,7 +55,7 @@ type conn struct {
 
 	//
 	debugVerifications int
-	//An integer, the number of outstanding request messages this peer supports
+	//The number of outstanding request messages this peer supports
 	//without dropping any. The default in in libtorrent is 250.
 	peerReqq int
 	reserved peer_wire.Reserved
@@ -84,8 +80,8 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 		cn:           cn,
 		peer:         peer,
 		state:        newConnState(),
-		commandCh:    make(chan interface{}, commandChSize),
-		eventCh:      make(chan interface{}, eventChSize),
+		recvC:        make(chan interface{}, recvCSize),
+		sendC:        make(chan interface{}, sendCSize),
 		dropped:      make(chan struct{}),
 		onFlightReqs: make(map[block]struct{}),
 		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
@@ -96,9 +92,9 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 //inform Torrent about the new connection
 func (c *conn) informTorrent() error {
 	select {
-	case c.t.newConnCh <- c.connInfo():
+	case c.t.newConnC <- c.connInfo():
 		return nil
-	case <-c.t.drop:
+	case <-c.t.dropC:
 		return errors.New("torrent closed")
 	case <-time.After(time.Minute):
 		panic("conn: couldn't inform torrent about the connection")
@@ -107,13 +103,14 @@ func (c *conn) informTorrent() error {
 
 func (c *conn) connInfo() *connInfo {
 	return &connInfo{
-		t:         c.t,
-		commandCh: c.commandCh,
-		eventCh:   c.eventCh,
-		dropped:   c.dropped,
-		peer:      c.peer,
-		reserved:  c.reserved,
-		state:     c.state,
+		t: c.t,
+		// Torrent should see c.recvC as its send channel and c.sendC as its receive channel.
+		sendC:    c.recvC,
+		recvC:    c.sendC,
+		droppedC: c.dropped,
+		peer:     c.peer,
+		reserved: c.reserved,
+		state:    c.state,
 	}
 }
 
@@ -127,15 +124,15 @@ func (c *conn) close() {
 	}
 	//because we closed `dropped`, there is no deadlock possibility
 	select {
-	case <-c.t.drop:
-	case c.eventCh <- discardedRequests{}:
+	case <-c.t.dropC:
+	case c.sendC <- discardedRequests{}:
 	}
 	select {
-	case <-c.t.drop:
-	case c.eventCh <- connDroped{}:
+	case <-c.t.dropC:
+	case c.sendC <- connDroped{}:
 	}
 	//close chan - avoid leak goroutines
-	close(c.eventCh)
+	close(c.sendC)
 }
 
 type readResult struct {
@@ -145,8 +142,8 @@ type readResult struct {
 
 func (c *conn) mainLoop() error {
 	var err error
-	readCh := make(chan *peer_wire.Msg, readChSize)
-	readErrCh := make(chan error, 1)
+	readC := make(chan *peer_wire.Msg, readCSize)
+	readErrC := make(chan error, 1)
 	//we need o quit chan in order to not leak readMsgs goroutine
 	quit := make(chan struct{})
 	defer func() {
@@ -154,18 +151,18 @@ func (c *conn) mainLoop() error {
 		c.close()
 		err = nilOnEOF(err)
 	}()
-	go c.readPeerMsgs(readCh, quit, readErrCh)
+	go c.readPeerMsgs(readC, quit, readErrC)
 	c.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
 	//debugTick := time.NewTicker(2 * time.Second)
 	//defer debugTick.Stop()
 	for {
 		select {
-		case cmd := <-c.commandCh:
+		case cmd := <-c.recvC:
 			err = c.gotCommand(cmd)
-		case msg := <-readCh:
+		case msg := <-readC:
 			err = c.parsePeerMsg(msg)
-		case err = <-readErrCh:
-		case <-c.t.drop:
+		case err = <-readErrC:
+		case <-c.t.dropC:
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
@@ -185,13 +182,13 @@ func nilOnEOF(err error) error {
 
 //read msgs from remote peer
 //run on seperate goroutine
-func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
-	errCh chan error) {
+func (c *conn) readPeerMsgs(readC chan<- *peer_wire.Msg, quit chan struct{},
+	errC chan error) {
 	for {
 		c.cn.SetReadDeadline(time.Now().Add(keepAliveInterval + time.Minute)) //lets be forbearing
 		msg, err := peer_wire.Read(c.cn)
 		if err != nil {
-			errCh <- err
+			errC <- err
 			return
 		}
 		//break from loops in not required
@@ -228,7 +225,7 @@ func (c *conn) readPeerMsgs(readCh chan<- *peer_wire.Msg, quit chan struct{},
 		}
 		if sendToChan {
 			select {
-			case readCh <- msg:
+			case readC <- msg:
 			case <-quit: //we must care for quit here
 				return
 			}
@@ -351,7 +348,7 @@ func (c *conn) gotCommand(cmd interface{}) (err error) {
 		}
 		err = c.sendMsg(&peer_wire.Msg{
 			Kind: peer_wire.Bitfield,
-			Bf:   c.encodeBitMap(c.myBf),
+			Bf:   c.bitfield(c.myBf),
 		})
 	case requestsAvailable:
 		c.sendRequests()
@@ -392,7 +389,7 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 			return nil
 		}
 		*currState = futureState
-		return c.sendPeerEvent(msg)
+		return c.sendMsgToTorrent(msg)
 	}
 	switch msg.Kind {
 	case peer_wire.KeepAlive:
@@ -427,17 +424,17 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		if c.haveInfo {
 			c.t.pieces.onHave(int(msg.Index))
 		}
-		err = c.sendPeerEvent(msg)
+		err = c.sendMsgToTorrent(msg)
 	case peer_wire.Bitfield:
 		if !c.peerBf.IsEmpty() {
 			err = errors.New("peer: send bitfield twice or have before bitfield")
 			return
 		}
-		var tmp *bitmap.Bitmap
-		if tmp, err = c.decodeBitfield(msg.Bf); err != nil {
+		var peerBfPtr *bitmap.Bitmap
+		if peerBfPtr, err = c.bitmap(msg.Bf); err != nil {
 			return
 		}
-		c.peerBf = *tmp
+		c.peerBf = *peerBfPtr
 		if c.notUseful() {
 			err = io.EOF
 			return
@@ -445,7 +442,7 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 		if c.haveInfo {
 			c.t.pieces.onBitfield(c.peerBf)
 		}
-		err = c.sendPeerEvent(c.peerBf.Copy())
+		err = c.sendMsgToTorrent(c.peerBf.Copy())
 	case peer_wire.Extended:
 		c.onExtended(msg)
 	case peer_wire.Port:
@@ -465,25 +462,24 @@ func (c *conn) parsePeerMsg(msg *peer_wire.Msg) (err error) {
 	return
 }
 
-//e is guranteed to be sent in eventCh even if error occurs
-func (c *conn) sendPeerEvent(e interface{}) error {
+func (c *conn) sendMsgToTorrent(e interface{}) error {
 	var err error
 	for {
 		//we dont just send e to eventCh because if the former chan is full,
 		//then commandCh may also become full and we will deadlock.
 		select {
-		case c.eventCh <- e:
+		case c.sendC <- e:
 			return nil
 		default:
 			//receive command while waiting for event to be send, we dont want
 			//to deadlock.
 			select {
-			case cmd := <-c.commandCh:
+			case cmd := <-c.recvC:
 				err = c.gotCommand(cmd)
-			case c.eventCh <- e:
+			case c.sendC <- e:
 				return nil
-			//pretend we lost connection
-			case <-c.t.drop:
+			case <-c.t.dropC:
+				//pretend we lost connection
 				err = io.EOF
 			case <-c.keepAliveTimer.C:
 				err = c.sendKeepAlive()
@@ -491,26 +487,27 @@ func (c *conn) sendPeerEvent(e interface{}) error {
 		}
 		if err != nil {
 			close(c.dropped)
-			//no deadlock possibility because we closed dropped chan
+			//e is guranteed to be sent in sendC even if error occurs.
+			//No deadlock possibility because we closed dropped chan
 			select {
-			case <-c.t.drop:
-			case c.eventCh <- e:
+			case <-c.t.dropC:
+			case c.sendC <- e:
 			}
 			return err
 		}
 	}
 }
 
-func (c *conn) encodeBitMap(bm bitmap.Bitmap) (bf peer_wire.BitField) {
-	bf = peer_wire.NewBitField(c.t.numPieces())
+func (c *conn) bitfield(bm bitmap.Bitmap) peer_wire.BitField {
+	bf := peer_wire.NewBitField(c.t.numPieces())
 	bm.IterTyped(func(piece int) bool {
 		bf.SetPiece(piece)
 		return true
 	})
-	return
+	return bf
 }
 
-func (c *conn) decodeBitfield(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
+func (c *conn) bitmap(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
 	var bm bitmap.Bitmap
 	if c.haveInfo && !bf.Valid(c.t.numPieces()) {
 		return nil, errors.New("bf length is not valid")
@@ -542,7 +539,7 @@ func (c *conn) onExtended(msg *peer_wire.Msg) (err error) {
 		c.exts, err = v.Extensions()
 		if _, ok := c.exts[peer_wire.ExtMetadataName]; ok {
 			if msize, ok := v.MetadataSize(); ok {
-				if err = c.sendPeerEvent(metainfoSize(msize)); err != nil {
+				if err = c.sendMsgToTorrent(metainfoSize(msize)); err != nil {
 					//error
 				}
 			}
@@ -581,7 +578,7 @@ func (c *conn) discardBlocks(notifyTorrent bool) error {
 		c.onFlightReqs = make(map[block]struct{})
 		var err error
 		if notifyTorrent {
-			err = c.sendPeerEvent(discardedRequests{})
+			err = c.sendMsgToTorrent(discardedRequests{})
 		}
 		return err
 	}
@@ -632,7 +629,7 @@ func (c *conn) upload(msg *peer_wire.Msg) error {
 		Begin: msg.Begin,
 		Block: data,
 	})
-	return c.sendPeerEvent(uploadedBlock(bl))
+	return c.sendMsgToTorrent(uploadedBlock(bl))
 }
 
 func (c *conn) isCanceled(b block) bool {
@@ -696,7 +693,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		c.t.logger.Fatalf("storage write err %s\n", err)
 		return err
 	}
-	return c.sendPeerEvent(downloadedBlock(bl))
+	return c.sendMsgToTorrent(downloadedBlock(bl))
 }
 
 //TODO: master hold piece struct and manages them.

@@ -16,9 +16,9 @@ type connInfo struct {
 	peer     Peer
 	reserved peer_wire.Reserved
 	//we communicate with conn with these channels - conn also has them
-	commandCh chan interface{}
-	eventCh   chan interface{}
-	dropped   chan struct{}
+	sendC    chan interface{}
+	recvC    chan interface{}
+	droppedC chan struct{}
 	//peer's bitmap
 	peerBf  bitmap.Bitmap //also conn has this
 	numWant int           //how many pieces are we interested to download from peer
@@ -28,11 +28,11 @@ type connInfo struct {
 
 //As implemented now,we realize that we dropped a conn when we try to send to it.
 //Maybe we want to drop conn immediatly
-func (cn *connInfo) sendCommand(cmd interface{}) {
+func (cn *connInfo) sendCommand(msg interface{}) {
 	select {
-	case cn.commandCh <- cmd:
-		cn.t.commandsSent++
-	case <-cn.dropped:
+	case cn.sendC <- msg:
+		cn.t.msgsSentToConn++
+	case <-cn.droppedC:
 		cn.t.droppedConn(cn)
 	}
 }

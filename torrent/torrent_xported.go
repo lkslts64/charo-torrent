@@ -41,7 +41,7 @@ func (t *Torrent) Download() error {
 		return err
 	}
 	select {
-	case <-t.downloadedData:
+	case <-t.downloadedDataC:
 		return nil
 	case <-t.closed:
 		return errTorrentClosed
@@ -106,6 +106,9 @@ func (t *Torrent) HaveAllPieces() bool {
 func (t *Torrent) Seeding() bool {
 	l := t.newLocker()
 	l.lock()
+	if l.closed {
+		return false
+	}
 	defer l.unlock()
 	return t.seeding()
 }

@@ -33,7 +33,7 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 		Bf:   bf,
 	}).Write(w)
 	//get events from eventCH
-	e := <-cn.eventCh
+	e := <-cn.sendC
 	bm := e.(bitmap.Bitmap)
 	assert.Equal(t, 2, bm.Len())
 	assert.Equal(t, bm.Get(7), true)
@@ -45,7 +45,7 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 		}).Write(w)
 	}
 	for i := 0; i < 30*2; i += 2 {
-		e := <-cn.eventCh
+		e := <-cn.sendC
 		msg := e.(*peer_wire.Msg)
 		assert.Equal(t, peer_wire.Have, msg.Kind)
 		assert.EqualValues(t, i, msg.Index)
@@ -69,10 +69,10 @@ func TestConnState(t *testing.T) {
 	(&peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
 	}).Write(w)
-	cn.commandCh <- &peer_wire.Msg{
+	cn.recvC <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}
-	e := <-cn.eventCh
+	e := <-cn.sendC
 	msg := e.(*peer_wire.Msg)
 	assert.Equal(t, peer_wire.Unchoke, msg.Kind)
 }
@@ -120,7 +120,7 @@ func TestPeerRequestAndCancel(t *testing.T) {
 	count := 0
 	ch := make(chan struct{})
 	go func() {
-		for e := range cn.eventCh {
+		for e := range cn.sendC {
 			switch e.(type) {
 			case uploadedBlock:
 			default:
@@ -173,7 +173,7 @@ func BenchmarkPeerPieceMsg(b *testing.B) {
 		n, err = w.Write(msgBytes)
 		require.NoError(b, err)
 		assert.Equal(b, n, len(msgBytes))
-		<-cn.eventCh
+		<-cn.sendC
 	}
 }
 
@@ -197,7 +197,7 @@ func loadTorrentFile(t testing.TB, w, r net.Conn, filename string) (*conn, *Torr
 	tr.mi, err = metainfo.LoadMetainfoFile(filename)
 	require.NoError(t, err)
 	tr.logger = log.New(os.Stdout, "test_logger", log.LstdFlags)
-	cn.commandCh <- haveInfo{}
+	cn.recvC <- haveInfo{}
 	go func() {
 		require.NoError(t, cn.mainLoop())
 	}()
@@ -208,19 +208,19 @@ func allowUpload(cn *conn, w net.Conn) {
 	(&peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}).Write(w)
-	cn.commandCh <- &peer_wire.Msg{
+	cn.recvC <- &peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
 	}
-	<-cn.eventCh
+	<-cn.sendC
 }
 
 func allowDownload(cn *conn, w net.Conn) {
 	(&peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
 	}).Write(w)
-	cn.commandCh <- &peer_wire.Msg{
+	cn.recvC <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}
 	w.Read(make([]byte, 50))
-	<-cn.eventCh
+	<-cn.sendC
 }

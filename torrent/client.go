@@ -44,9 +44,9 @@ type Client struct {
 	trackerAnnouncer *trackerAnnouncer
 	dhtServer        *dht.Server
 	//the reserved bytes we'll send at every handshake
-	reserved                peer_wire.Reserved
-	trackerAnnouncerCloseCh chan chan struct{}
-	port                    int
+	reserved               peer_wire.Reserved
+	trackerAnnouncerCloseC chan chan struct{}
+	port                   int
 }
 
 //Config provides configuration for a Client.
@@ -182,7 +182,7 @@ func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
 		return nil, err
 	}
 	go t.mainLoop()
-	if err = <-t.info; err != nil {
+	if err = <-t.infoC; err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -197,7 +197,7 @@ func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
 		return nil, err
 	}
 	go t.mainLoop()
-	if err = <-t.info; err != nil {
+	if err = <-t.infoC; err != nil {
 		return nil, err
 	}
 	return t, nil

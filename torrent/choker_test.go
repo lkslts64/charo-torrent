@@ -17,7 +17,7 @@ func TestChoker(t *testing.T) {
 			t: &Torrent{
 				mi: &metainfo.MetaInfo{},
 			},
-			commandCh: make(chan interface{}, 50), //ensure we have length
+			sendC: make(chan interface{}, 50), //ensure we have length
 			state: connState{
 				isInterested: true,
 				amChoking:    true,

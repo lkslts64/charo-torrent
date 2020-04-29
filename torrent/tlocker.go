@@ -4,17 +4,17 @@ package torrent
 //Torrent. Synchronization is implemented with channels
 type torrentLocker struct {
 	t      *Torrent
-	syncCh chan interface{}
+	syncC  chan interface{}
 	v      interface{}
 	closed bool
 }
 
 func (l *torrentLocker) lock() {
-	l.syncCh = make(chan interface{})
+	l.syncC = make(chan interface{})
 	select {
 	case <-l.t.closed:
 		l.closed = true
-	case l.t.userCh <- l.syncCh:
+	case l.t.userC <- l.syncC:
 	}
 }
 
@@ -25,7 +25,7 @@ func (l *torrentLocker) unlock() {
 	}
 	select {
 	case <-l.t.closed: //fires only if Close methods is invoked.
-	case l.syncCh <- l.v:
+	case l.syncC <- l.v:
 	}
 }
 

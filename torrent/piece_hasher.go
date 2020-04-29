@@ -8,9 +8,9 @@ type pieceHasher struct {
 func (p *pieceHasher) Run() {
 	for {
 		select {
-		case piece := <-p.t.pieceQueuedHashingCh:
+		case piece := <-p.t.pieceQueuedHashingC:
 			correct := p.t.storage.HashPiece(piece, p.t.pieceLen(uint32(piece)))
-			p.t.pieceHashedCh <- pieceHashed{
+			p.t.pieceHashedC <- pieceHashed{
 				pieceIndex: piece,
 				ok:         correct,
 			}

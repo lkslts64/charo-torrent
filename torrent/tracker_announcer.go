@@ -48,7 +48,7 @@ func (t *trackerAnnouncer) run() {
 		select {
 		case te := <-t.trackerAnnouncerSubmitEventCh:
 			resp, err := t.announce(te)
-			te.t.trackerAnnouncerResponseCh <- trackerAnnouncerResponse{
+			te.t.trackerAnnouncerResponseC <- trackerAnnouncerResponse{
 				resp: resp,
 				err:  err,
 			}

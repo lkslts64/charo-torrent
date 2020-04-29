@@ -32,18 +32,18 @@ func TestTorrentNewConnection(t *testing.T) {
 	go tr.mainLoop()
 	for i := 0; i < tr.maxEstablishedConnections; i++ {
 		ci := &connInfo{
-			t:         tr,
-			eventCh:   make(chan interface{}, eventChSize),
-			commandCh: make(chan interface{}, commandChSize),
-			dropped:   make(chan struct{}),
+			t:        tr,
+			recvC:    make(chan interface{}, sendCSize),
+			sendC:    make(chan interface{}, recvCSize),
+			droppedC: make(chan struct{}),
 		}
-		tr.newConnCh <- ci
-		switch (<-ci.commandCh).(type) {
+		tr.newConnC <- ci
+		switch (<-ci.sendC).(type) {
 		case haveInfo:
 		default:
 			t.Fail()
 		}
-		switch (<-ci.commandCh).(type) {
+		switch (<-ci.sendC).(type) {
 		case bitmap.Bitmap:
 		default:
 			t.Fail()
@@ -57,15 +57,15 @@ func TestStatsUpdate(t *testing.T) {
 		mi: &metainfo.MetaInfo{},
 	}
 	ci := &connInfo{
-		t:         tr,
-		eventCh:   make(chan interface{}, eventChSize),
-		commandCh: make(chan interface{}, commandChSize),
-		dropped:   make(chan struct{}),
-		state:     newConnState(),
+		t:        tr,
+		recvC:    make(chan interface{}, sendCSize),
+		sendC:    make(chan interface{}, recvCSize),
+		droppedC: make(chan struct{}),
+		state:    newConnState(),
 	}
 
 	//test if durationUploading changes when our state changes
-	tr.gotEvent(event{
+	tr.onConnMsg(msgWithConn{
 		conn: ci,
 		val: &peer_wire.Msg{
 			Kind: peer_wire.Interested,
@@ -83,7 +83,7 @@ func TestStatsUpdate(t *testing.T) {
 	//test how the download changes as time passes and as we download bytes
 	assert.EqualValues(t, int64(0), int64(ci.durationDownloading()))
 	ci.interested()
-	tr.gotEvent(event{
+	tr.onConnMsg(msgWithConn{
 		conn: ci,
 		val: &peer_wire.Msg{
 			Kind: peer_wire.Unchoke,
