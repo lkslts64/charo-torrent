@@ -68,7 +68,7 @@ func (t *Torrent) download() error {
 	if !t.haveAll() {
 		//notify conns to start downloading
 		t.pieces.setDownloadAllowed()
-		t.broadcastCommand(requestsAvailable{})
+		t.broadcastToConns(requestsAvailable{})
 	}
 	t.tryAnnounceAll()
 	t.dialConns()

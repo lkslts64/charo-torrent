@@ -28,7 +28,7 @@ type connInfo struct {
 
 //As implemented now,we realize that we dropped a conn when we try to send to it.
 //Maybe we want to drop conn immediatly
-func (cn *connInfo) sendCommand(msg interface{}) {
+func (cn *connInfo) sendMsgToConn(msg interface{}) {
 	select {
 	case cn.sendC <- msg:
 		cn.t.msgsSentToConn++
@@ -39,7 +39,7 @@ func (cn *connInfo) sendCommand(msg interface{}) {
 
 func (cn *connInfo) choke() {
 	if !cn.state.amChoking {
-		cn.sendCommand(&peer_wire.Msg{
+		cn.sendMsgToConn(&peer_wire.Msg{
 			Kind: peer_wire.Choke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
@@ -51,7 +51,7 @@ func (cn *connInfo) choke() {
 
 func (cn *connInfo) unchoke() {
 	if cn.state.amChoking {
-		cn.sendCommand(&peer_wire.Msg{
+		cn.sendMsgToConn(&peer_wire.Msg{
 			Kind: peer_wire.Unchoke,
 		})
 		cn.state.amChoking = !cn.state.amChoking
@@ -61,7 +61,7 @@ func (cn *connInfo) unchoke() {
 
 func (cn *connInfo) interested() {
 	if !cn.state.amInterested {
-		cn.sendCommand(&peer_wire.Msg{
+		cn.sendMsgToConn(&peer_wire.Msg{
 			Kind: peer_wire.Interested,
 		})
 		cn.state.amInterested = !cn.state.amInterested
@@ -71,7 +71,7 @@ func (cn *connInfo) interested() {
 
 func (cn *connInfo) notInterested() {
 	if cn.state.amInterested {
-		cn.sendCommand(&peer_wire.Msg{
+		cn.sendMsgToConn(&peer_wire.Msg{
 			Kind: peer_wire.NotInterested,
 		})
 		cn.state.amInterested = !cn.state.amInterested
@@ -82,18 +82,18 @@ func (cn *connInfo) notInterested() {
 }
 
 func (cn *connInfo) have(i int) {
-	cn.sendCommand(&peer_wire.Msg{
+	cn.sendMsgToConn(&peer_wire.Msg{
 		Kind:  peer_wire.Have,
 		Index: uint32(i),
 	})
 }
 
 func (cn *connInfo) sendBitfield() {
-	cn.sendCommand(cn.t.pieces.ownedPieces.Copy())
+	cn.sendMsgToConn(cn.t.pieces.ownedPieces.Copy())
 }
 
 func (cn *connInfo) sendPort() {
-	cn.sendCommand(&peer_wire.Msg{
+	cn.sendMsgToConn(&peer_wire.Msg{
 		Kind: peer_wire.Port,
 		Port: cn.t.cl.dhtPort(),
 	})

@@ -238,7 +238,7 @@ func (t *Torrent) onConnMsg(e msgWithConn) {
 	case connDroped:
 		t.droppedConn(e.conn)
 	case discardedRequests:
-		t.broadcastCommand(requestsAvailable{})
+		t.broadcastToConns(requestsAvailable{})
 	}
 }
 
@@ -506,7 +506,7 @@ func (t *Torrent) blockUploaded(c *connInfo, b block) {
 func (t *Torrent) downloadedAll() {
 	close(t.downloadedDataC)
 	//t.seeding = true
-	t.broadcastCommand(seeding{})
+	t.broadcastToConns(seeding{})
 	for _, c := range t.conns {
 		c.notInterested()
 	}
@@ -545,14 +545,14 @@ func (t *Torrent) aggregateEvents(ci *connInfo) {
 }
 
 //careful when using this, we might send over nil chan
-func (t *Torrent) broadcastCommand(cmd interface{}) {
+func (t *Torrent) broadcastToConns(cmd interface{}) {
 	for _, ci := range t.conns {
-		ci.sendCommand(cmd)
+		ci.sendMsgToConn(cmd)
 	}
 }
 
 func (t *Torrent) sendCancels(b block) {
-	t.broadcastCommand(b.cancelMsg())
+	t.broadcastToConns(b.cancelMsg())
 }
 
 //TODO: make iter around t.conns and dont iterate twice over conns
@@ -593,7 +593,7 @@ func (t *Torrent) establishedConnection(ci *connInfo) bool {
 	t.conns = append(t.conns, ci)
 	//notify conn that we have metainfo
 	if t.haveInfo() {
-		ci.sendCommand(haveInfo{})
+		ci.sendMsgToConn(haveInfo{})
 	}
 	//TODO:minimize sends...
 	//
@@ -612,7 +612,7 @@ func (t *Torrent) establishedConnection(ci *connInfo) bool {
 
 //we would like to drop the conn
 func (t *Torrent) punishPeer(i int) {
-	t.conns[i].sendCommand(drop{})
+	t.conns[i].sendMsgToConn(drop{})
 	t.removeConn(t.conns[i], i)
 	t.choker.reviewUnchokedPeers()
 	//TODO: black list in some way?
@@ -818,7 +818,7 @@ func (t *Torrent) gotInfo() {
 	t.pieceHashedC = make(chan pieceHashed, t.numPieces())
 	var haveAll bool
 	t.storage, haveAll = t.openStorage(t.mi, t.cl.config.BaseDir, t.pieces.blocks(), t.logger)
-	t.broadcastCommand(haveInfo{})
+	t.broadcastToConns(haveInfo{})
 	if haveAll {
 		//mark all bocks completed and do all apropriate things when a piece
 		//hashing is succesfull

@@ -3,6 +3,7 @@ package torrent
 import (
 	"bytes"
 	"errors"
+	"expvar"
 	"fmt"
 	"log"
 	"net"
@@ -30,23 +31,15 @@ type Client struct {
 	torrents map[[20]byte]*Torrent
 	close    chan struct{}
 
-	mu sync.Mutex
-	//torrents map[[20]byte]Torrent
-	//a set of info_hashes that clients is
-	//responsible for - easy access
-	//this will be set in initialaztion
-	//no  mutex needed
-	//TODO:it is dupicate
-	//extensionsSupported map[string]int
-	listener listener
-	//when this channel closes, all Torrents and conns that the client is managing will close.
-	//close                   chan chan struct{}
+	mu               sync.Mutex
+	listener         listener
 	trackerAnnouncer *trackerAnnouncer
 	dhtServer        *dht.Server
 	//the reserved bytes we'll send at every handshake
 	reserved               peer_wire.Reserved
 	trackerAnnouncerCloseC chan chan struct{}
 	port                   int
+	counters               *expvar.Map
 }
 
 //Config provides configuration for a Client.
@@ -89,6 +82,7 @@ func NewClient(cfg *Config) (*Client, error) {
 		close:    make(chan struct{}),
 		torrents: make(map[[20]byte]*Torrent),
 	}
+	cl.counters = expvar.NewMap("counters" + string(cl.peerID[:]))
 	logPrefix := fmt.Sprintf("client%x ", cl.peerID[14:]) //last 6 bytes of peerID
 	cl.logger = log.New(logFile, logPrefix, log.LstdFlags)
 	if !cl.config.RejectIncomingConnections {

@@ -2,23 +2,7 @@ package torrent
 
 import (
 	"fmt"
-
-	"go.uber.org/atomic"
 )
-
-//these are cancels that peers send to us but it was too late because
-//we had already processed the request
-var latecomerCancels atomic.Uint32
-
-var duplicateBlocksReceived atomic.Uint32
-
-var duplicateRequestsReceived atomic.Uint32
-
-var nonUsefulRequestReads atomic.Uint64
-
-var sendRequestWhenChoked atomic.Uint64
-
-var lostBlocksDueToSync atomic.Uint64
 
 //Stats contains statistics about a Torrent
 type Stats struct {

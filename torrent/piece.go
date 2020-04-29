@@ -167,7 +167,7 @@ func (p *pieces) makeBlockComplete(i int, off int, ci *connInfo) {
 			p.t.queuePieceForHashing(i)
 		}
 		if transitionIntoEndGame {
-			p.t.broadcastCommand(requestsAvailable{})
+			p.t.broadcastToConns(requestsAvailable{})
 			//No need to send cancels just after entered end game
 			return
 		}

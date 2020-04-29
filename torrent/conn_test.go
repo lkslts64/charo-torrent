@@ -105,12 +105,12 @@ func TestPeerRequestAndCancel(t *testing.T) {
 	tr.storage = dummyStorage{}
 	allowUpload(cn, w)
 	numPieces := 200
-	//If a piece is uploaded we ll get notified at eventCh.But if we send
+	//If a piece is uploaded we ll get notified at sendC.But if we send
 	//a Cancel for a Request, then we dont know if the conn will upload the
-	//block or it will se the Cancel first and ignore it.So, we are not sure
-	//about how many values eventCh will send (which is not wanted).As a
+	//block or it will se the Cancel first and ignore it. So, we are not sure
+	//about how many values sendC will send (which is not wanted).As a
 	//workaround we send a Cancel for a piece that we don't own so a value
-	//won't be send to eventCh in all cases.
+	//won't be send to sendC in all cases.
 	for i := 0; i < numPieces; i++ {
 		if i == numPieces-2 { //skip this piece, we 'll send Cancel for it
 			continue
@@ -149,7 +149,7 @@ func TestPeerRequestAndCancel(t *testing.T) {
 		}
 	}
 	<-ch
-	assert.EqualValues(t, 0, latecomerCancels.Load())
+	assert.Nil(t, tr.cl.counters.Get("latecomerCancels"))
 }
 
 func BenchmarkPeerPieceMsg(b *testing.B) {
