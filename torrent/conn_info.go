@@ -197,7 +197,11 @@ func (cn *connInfo) isSnubbed() bool {
 	if cn.t.haveAll() {
 		return false
 	}
-	return cn.stats.isSnubbed()
+	prev, curr := cn.stats.snubbed, cn.stats.isSnubbed()
+	if curr != prev {
+		cn.t.cl.counters.Add("snubbed", 1)
+	}
+	return curr
 }
 
 func (cn *connInfo) peerSeeding() bool {
