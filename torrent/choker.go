@@ -1,7 +1,6 @@
 package torrent
 
 import (
-	"math"
 	"math/rand"
 	"sort"
 	"time"
@@ -25,7 +24,7 @@ type choker struct {
 func newChoker(t *Torrent) *choker {
 	return &choker{
 		t:                t,
-		maxUploadSlots:   defaultMaxUploadSlots, //-1 because we will maintain an extra slot for optimistic
+		maxUploadSlots:   defaultMaxUploadSlots,
 		enableOptimistic: true,
 	}
 }
@@ -75,49 +74,88 @@ func (c *choker) reviewUnchokedPeers() {
 	if c.enableOptimistic && c.currRound%5 == 0 {
 		c.pickOptimisticUnchoke()
 	}
+	if c.optimistic != nil {
+		c.optimistic.unchoke()
+	}
+	// We will try to unchoke `c.maxUploadSlots` conns which have the best upload rate and are
+	// interested (excluding optimistic one which is already unchoked). We name these
+	// conns 'downloaders'. If 'downloaders' are not sufficient, then we'll select the
+	// remaining ones randomly. If the optimistic is one among the `downloaders` we'll pick another
+	// optimistic randomly.
 	bestPeers, optimisticCandidates := []*connInfo{}, []*connInfo{}
 	for _, conn := range c.t.conns {
-		if conn.peerSeeding() {
+		switch {
+		case conn.peerSeeding():
 			conn.choke()
-		}
-		if conn.isSnubbed() || !conn.state.isInterested {
+		case conn.isSnubbed() || !conn.state.isInterested:
 			optimisticCandidates = append(optimisticCandidates, conn)
-		} else {
+		default:
 			bestPeers = append(bestPeers, conn)
+
 		}
 	}
 	sort.Sort(byRate(bestPeers))
-	uploadSlots := int(math.Min(float64(c.maxUploadSlots), float64(len(bestPeers))))
-	optimisticCandidates = append(optimisticCandidates, bestPeers[uploadSlots:]...)
-	//peers that have best upload rates (optimistic may belong to bestPeers)
-	bestPeers = bestPeers[:uploadSlots]
-	for _, conn := range bestPeers {
-		conn.unchoke()
-	}
-	numOptimistics := boolToInt(c.enableOptimistic) + (c.maxUploadSlots - uploadSlots)
-	var optimisticCount int
-	if containsConn(optimisticCandidates, c.optimistic) { //optimistic belongs to optimisticCandidates.
-		c.optimistic.unchoke()
-		optimisticCount++
-	}
-	//unchoke optimistics in random order and choke the remaining ones.
-	indices := rand.Perm(len(optimisticCandidates))
-	for _, i := range indices {
-		if c.optimistic != nil && c.optimistic == optimisticCandidates[i] {
-			//we've already unchoked optimistic
+	toUnchoke := c.maxUploadSlots
+	i := 0
+	for ; i < len(bestPeers) && i < c.maxUploadSlots; i++ {
+		conn := bestPeers[i]
+		if conn == c.optimistic {
 			continue
 		}
-		if optimisticCount >= numOptimistics {
-			optimisticCandidates[i].choke()
-		} else {
-			//we'll get here only if bestPeers are not sufficient or if
-			//optimistic belonged in bestPeers
-			optimisticCandidates[i].unchoke()
-			if optimisticCandidates[i].state.isInterested {
-				optimisticCount++
+		conn.unchoke()
+		toUnchoke--
+	}
+	optimisticCandidates = append(optimisticCandidates, bestPeers[i:]...)
+	//TODO: maybe we could not unchoke randomly but based on upload rate again?
+	for _, i := range rand.Perm(len(optimisticCandidates)) {
+		switch conn := optimisticCandidates[i]; {
+		case c.optimistic == conn:
+			// we have unchoked optimistic already
+		case toUnchoke <= 0:
+			conn.choke()
+		default:
+			//we'll get here only if `len(bestPeers) < c.maxUploadSlots`
+			// or if optimistic belonged in bestPeers
+			conn.unchoke()
+			if conn.state.isInterested {
+				toUnchoke--
 			}
 		}
 	}
+
+	/*
+		uploadSlots := int(math.Min(float64(c.maxUploadSlots), float64(len(bestPeers))))
+		optimisticCandidates = append(optimisticCandidates, bestPeers[uploadSlots:]...)
+		//peers that have best upload rates (optimistic may belong to bestPeers)
+		bestPeers = bestPeers[:uploadSlots]
+		for _, conn := range bestPeers {
+			conn.unchoke()
+		}
+		numOptimistics := boolToInt(c.enableOptimistic) + (c.maxUploadSlots - uploadSlots)
+		var optimisticCount int
+		if containsConn(optimisticCandidates, c.optimistic) { //optimistic belongs to optimisticCandidates.
+			c.optimistic.unchoke()
+			optimisticCount++
+		}
+		//unchoke optimistics in random order and choke the remaining ones.
+		indices := rand.Perm(len(optimisticCandidates))
+		for _, i := range indices {
+			if c.optimistic != nil && c.optimistic == optimisticCandidates[i] {
+				//we've already unchoked optimistic
+				continue
+			}
+			if optimisticCount >= numOptimistics {
+				optimisticCandidates[i].choke()
+			} else {
+				//we'll get here only if bestPeers are not sufficient or if
+				//optimistic belonged in bestPeers
+				optimisticCandidates[i].unchoke()
+				if optimisticCandidates[i].state.isInterested {
+					optimisticCount++
+				}
+			}
+		}
+	*/
 }
 
 func containsConn(conns []*connInfo, cand *connInfo) bool {
