@@ -54,3 +54,10 @@ func parseAddr(address string) (*addrPort, error) {
 		port: uint16(port),
 	}, nil
 }
+
+func min(a, b int) int {
+	if a <= b {
+		return a
+	}
+	return b
+}

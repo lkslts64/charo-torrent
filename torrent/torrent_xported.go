@@ -51,17 +51,17 @@ func (t *Torrent) Download() error {
 func (t *Torrent) download() error {
 	l := t.newLocker()
 	l.lock()
+	defer l.unlock()
 	if l.closed {
 		return errTorrentClosed
 	}
-	defer l.unlock()
 	if !t.haveInfo() {
 		return errors.New("can't download data without having the info first")
 	}
-	if t.downloadRequest {
+	if t.enableDataTransfer {
 		return errors.New("already downloading data or seeding")
 	}
-	t.downloadRequest = true
+	t.enableDataTransfer = true
 	if !t.infoWasDownloaded() && len(t.conns) > 0 {
 		panic("why have conns?")
 	}
@@ -118,6 +118,57 @@ func (t *Torrent) Stats() Stats {
 	l.lock()
 	defer l.unlock()
 	return t.stats
+}
+
+//Pieces returns all pieces of the torrent. If Info is not available or t is closed it returns nil.
+func (t *Torrent) Pieces() []Piece {
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	if t.pieces == nil {
+		return nil
+	}
+	p := t.pieces
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ret := make([]Piece, len(p.pcs))
+	for i, piece := range p.pcs {
+		ret[i] = *piece
+	}
+	return ret
+}
+
+// SetMaxInFlightPieces caps the number of different pieces that are requested simultaneously
+// requested at any given time. It requires that Info is available.
+// For unlimited, provide n >= t.NumPieces(). Provide n == 0 to stop all outgouing requests.
+// Initially this value is set to t.NumPieces().
+func (t *Torrent) SetMaxInFlightPieces(n int) error {
+	if n < 0 {
+		return errors.New("n should be positive")
+	}
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	if t.pieces == nil {
+		return errors.New("info required or torrent is closed")
+	}
+	p := t.pieces
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.maxInFlightPieces == n {
+		return nil
+	}
+	if p.maxInFlightPieces > t.numPieces() {
+		n = t.numPieces()
+	}
+	if p.maxInFlightPieces == 0 {
+		// notify conns that they can start requesting again.
+		// It doesn't matter that we set the value after the broadcast,
+		// conns won't see it in the meantime as we have the lock acquired.
+		t.broadcastToConns(requestsAvailable{})
+	}
+	p.maxInFlightPieces = n
+	return nil
 }
 
 //Closed returns whether the torrent is closed or not.
