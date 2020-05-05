@@ -31,13 +31,15 @@ func (t *Torrent) Swarm() []Peer {
 	return t.swarm()
 }
 
-//Download downloads all the torrent's data. It requires the info first.
-//After the download is complete, the Torrent transitions in seeding mode
+//TransferData enables downloading/uploading the torrent's data.
+// It should be called once for each Torrent.
+// It requires the info first.
+//After the download is complete, the Torrent transits in seeding mode
 //(i.e altruistically upload) until it's closed.
-//If the data are already there,Download returns immediatly and Torrent
-//transists in seeding mode.
-func (t *Torrent) Download() error {
-	if err := t.download(); err != nil {
+//If the data are already there,TransferData returns immediatly and
+//seeds the torrent.
+func (t *Torrent) TransferData() error {
+	if err := t.transferData(); err != nil {
 		return err
 	}
 	select {
@@ -48,7 +50,7 @@ func (t *Torrent) Download() error {
 	}
 }
 
-func (t *Torrent) download() error {
+func (t *Torrent) transferData() error {
 	l := t.newLocker()
 	l.lock()
 	defer l.unlock()
@@ -58,16 +60,16 @@ func (t *Torrent) download() error {
 	if !t.haveInfo() {
 		return errors.New("can't download data without having the info first")
 	}
-	if t.enableDataTransfer {
+	if t.uploadEnabled || t.downloadEnabled {
 		return errors.New("already downloading data or seeding")
 	}
-	t.enableDataTransfer = true
+	t.uploadEnabled, t.downloadEnabled = true, true
 	if !t.infoWasDownloaded() && len(t.conns) > 0 {
 		panic("why have conns?")
 	}
 	if !t.haveAll() {
 		//notify conns to start downloading
-		t.pieces.setDownloadAllowed()
+		t.pieces.setDownloadEnabled(true)
 		t.broadcastToConns(requestsAvailable{})
 	}
 	t.tryAnnounceAll()
@@ -138,6 +140,7 @@ func (t *Torrent) Pieces() []Piece {
 	return ret
 }
 
+/*
 // SetMaxInFlightPieces caps the number of different pieces that are requested simultaneously
 // requested at any given time. It requires that Info is available.
 // For unlimited, provide n >= t.NumPieces(). Provide n == 0 to stop all outgouing requests.
@@ -168,6 +171,49 @@ func (t *Torrent) SetMaxInFlightPieces(n int) error {
 		t.broadcastToConns(requestsAvailable{})
 	}
 	p.maxInFlightPieces = n
+	return nil
+}
+*/
+
+// EnableDataDownload re-enables downloading the torrent's data.
+// To bootstrap the data downloading, one should call TransferData first.
+// It is an error to call this before calling TransferData.
+// Usually EnableDataDownload is called after a call to DisableDataDownload.
+func (t *Torrent) EnableDataDownload() error {
+	return t.setDataDownloadEnable(true)
+}
+
+// DisableDataDownload pauses the process of downloading the torrent's data.
+// It is an error to call this before calling TransferData.
+func (t *Torrent) DisableDataDownload() error {
+	return t.setDataDownloadEnable(false)
+}
+
+func (t *Torrent) setDataDownloadEnable(v bool) error {
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	if t.pieces == nil {
+		return errors.New("info required or torrent is closed")
+	}
+	p := t.pieces
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.setDownloadEnabled(v)
+	if p.downloadEnabled == v {
+		return nil
+	}
+	p.downloadEnabled = v
+	for _, c := range t.conns {
+		if v {
+			c.interested()
+		} else {
+			c.notInterested()
+		}
+	}
+	if v {
+		t.broadcastToConns(requestsAvailable{})
+	}
 	return nil
 }
 

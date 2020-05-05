@@ -68,8 +68,10 @@ type Torrent struct {
 	numDhtAnnounces  int
 	//fires when an exported method wants to be invoked
 	userC chan chan interface{}
-	//this bool is set true when its time start transfering data.
-	downloadRequest bool
+	//these bools are set true when we should actively download/upload the torrent's data.
+	//the download of the info is not controled with this variable
+	uploadEnabled   bool
+	downloadEnabled bool
 	//closes when the torrent is closed
 	closed   chan struct{}
 	isClosed bool
@@ -165,6 +167,7 @@ func (t *Torrent) close() {
 func (t *Torrent) dropAllConns() {
 	t.closeDhtAnnounce()
 	//signal conns to close and wait until all conns actually close
+	//maybe we don't want to wait?
 	close(t.dropC)
 	for _, c := range t.conns {
 		<-c.droppedC
@@ -182,7 +185,7 @@ func (t *Torrent) mainLoop() {
 			t.connMsgsRecv++
 		case res := <-t.pieceHashedC:
 			t.pieceHashed(res.pieceIndex, res.ok)
-			if res.ok && t.pieces.haveAll() {
+			if t.pieces.haveAll() {
 				t.sendAnnounceToTracker(tracker.Completed)
 				t.downloadedAll()
 			}
@@ -244,7 +247,7 @@ func (t *Torrent) onConnMsg(e msgWithConn) {
 
 //true if we would like to initiate new connections
 func (t *Torrent) wantConns() bool {
-	return len(t.conns) < t.maxEstablishedConnections && t.shouldTransferData()
+	return len(t.conns) < t.maxEstablishedConnections && t.dataTransferAllowed()
 }
 
 func (t *Torrent) wantPeers() bool {
@@ -256,23 +259,11 @@ func (t *Torrent) wantPeers() bool {
 			wantPeersThreshold = int(float64(t.wantPeersThreshold) + (1/fullfilledConnSlotsRatio)*10)
 		}
 	}
-	return len(t.peers) < wantPeersThreshold && t.shouldTransferData()
+	return len(t.peers) < wantPeersThreshold && t.dataTransferAllowed()
 }
 
-/*
-//true if we are interested in something to download (i.e info or data)
-func (t *Torrent) downloading() bool {
-	if t.haveAll() {
-		return false
-	}
-	if !t.haveInfo() {
-		return true
-	}
-	return t.downloadRequest
-}*/
-
 func (t *Torrent) seeding() bool {
-	return t.haveAll() && t.downloadRequest
+	return t.haveAll() && t.uploadEnabled
 }
 
 func (t *Torrent) haveAll() bool {
@@ -283,8 +274,8 @@ func (t *Torrent) haveAll() bool {
 }
 
 //true if we are allowed to download/upload torrent data or we need info
-func (t *Torrent) shouldTransferData() bool {
-	return !t.haveInfo() || t.downloadRequest
+func (t *Torrent) dataTransferAllowed() bool {
+	return !t.haveInfo() || t.uploadEnabled || t.downloadEnabled
 }
 
 func (t *Torrent) sendAnnounceToTracker(event tracker.Event) {
@@ -486,7 +477,12 @@ func (t *Torrent) state() string {
 	if !t.haveInfo() {
 		return "downloading info"
 	}
-	if t.downloadRequest {
+	switch {
+	case t.uploadEnabled && t.downloadEnabled:
+		return "transfering data"
+	case t.uploadEnabled:
+		return "uploading data"
+	case t.downloadEnabled:
 		return "downloading data"
 	}
 	return "waiting for downloading request"
@@ -495,7 +491,7 @@ func (t *Torrent) state() string {
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
 	c.stats.onBlockDownload(b.len)
 	t.stats.blockDownloaded(b.len)
-	t.pieces.makeBlockComplete(b.pc, b.off, c)
+	t.pieces.setBlockComplete(b.pc, b.off, c)
 }
 
 func (t *Torrent) blockUploaded(c *connInfo, b block) {
@@ -505,8 +501,6 @@ func (t *Torrent) blockUploaded(c *connInfo, b block) {
 
 func (t *Torrent) downloadedAll() {
 	close(t.downloadedDataC)
-	//t.seeding = true
-	t.broadcastToConns(seeding{})
 	for _, c := range t.conns {
 		c.notInterested()
 	}
@@ -527,11 +521,9 @@ func (t *Torrent) queuePieceForHashing(i int) {
 
 func (t *Torrent) pieceHashed(i int, correct bool) {
 	delete(t.queuedForVerification, i)
+	t.pieces.pieceHashed(i, correct)
 	if correct {
-		t.pieces.pieceVerified(i)
 		t.onPieceDownload(i)
-	} else {
-		t.pieces.pieceVerificationFailed(i)
 	}
 }
 
@@ -635,7 +627,7 @@ func (t *Torrent) droppedConn(ci *connInfo) bool {
 	//requests to download the data we may lose some connections (seeders will close because
 	//we won't request any pieces). So, we may have to store the peers that droped us during
 	//that period in order to reconnect.
-	if t.infoWasDownloaded() && !t.shouldTransferData() {
+	if t.infoWasDownloaded() && !t.dataTransferAllowed() {
 		t.peers = append(t.peers, ci.peer)
 	}
 	return true

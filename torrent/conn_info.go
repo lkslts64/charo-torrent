@@ -26,8 +26,6 @@ type connInfo struct {
 	stats   connStats
 }
 
-//As implemented now,we realize that we dropped a conn when we try to send to it.
-//Maybe we want to drop conn immediatly
 func (cn *connInfo) sendMsgToConn(msg interface{}) {
 	select {
 	case cn.sendC <- msg:
@@ -50,7 +48,7 @@ func (cn *connInfo) choke() {
 }
 
 func (cn *connInfo) unchoke() {
-	if cn.state.amChoking {
+	if cn.state.amChoking && cn.t.uploadEnabled {
 		cn.sendMsgToConn(&peer_wire.Msg{
 			Kind: peer_wire.Unchoke,
 		})
@@ -60,7 +58,10 @@ func (cn *connInfo) unchoke() {
 }
 
 func (cn *connInfo) interested() {
-	if !cn.state.amInterested {
+	if cn.numWant <= 0 {
+		return
+	}
+	if !cn.state.amInterested && cn.t.downloadEnabled {
 		cn.sendMsgToConn(&peer_wire.Msg{
 			Kind: peer_wire.Interested,
 		})

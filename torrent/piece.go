@@ -27,9 +27,9 @@ type pieces struct {
 	prioritizedPcs []*Piece
 	endGame        bool
 	// caps the number of different pieces that are requested simultaneously.
-	maxInFlightPieces int
+	//maxInFlightPieces int
 	//if false we shouldn't make any requests
-	downloadAllowed bool
+	downloadEnabled bool
 }
 
 func newPieces(t *Torrent) *pieces {
@@ -41,11 +41,11 @@ func newPieces(t *Torrent) *pieces {
 	sorted := make([]*Piece, numPieces)
 	copy(sorted, pcs)
 	p := &pieces{
-		t:                 t,
-		pcs:               pcs,
-		prioritizedPcs:    sorted,
-		selector:          t.cl.config.SelectorF(),
-		maxInFlightPieces: t.numPieces(),
+		t:              t,
+		pcs:            pcs,
+		prioritizedPcs: sorted,
+		selector:       t.cl.config.SelectorF(),
+		//maxInFlightPieces: t.numPieces(),
 	}
 	p.selector.SetTorrent(t)
 	return p
@@ -66,9 +66,9 @@ func (p *pieces) onBitfield(bm bitmap.Bitmap) {
 	})
 }
 
-func (p *pieces) setDownloadAllowed() {
+func (p *pieces) setDownloadEnabled(v bool) {
 	p.mu.Lock()
-	p.downloadAllowed = true
+	p.downloadEnabled = v
 	p.mu.Unlock()
 }
 
@@ -76,10 +76,10 @@ func (p *pieces) setDownloadAllowed() {
 func (p *pieces) fillRequests(peerPieces bitmap.Bitmap, requests []block) (n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.downloadAllowed {
+	if !p.downloadEnabled {
 		return
 	}
-	if p.maxInFlightPieces <= 0 {
+	/*if p.maxInFlightPieces <= 0 {
 		return
 	}
 	pending := filterPieces(p.pcs, func(p *Piece) bool {
@@ -87,7 +87,7 @@ func (p *pieces) fillRequests(peerPieces bitmap.Bitmap, requests []block) (n int
 	})
 	if len(pending) > p.maxInFlightPieces {
 		panic("we shouldn't have that much pending pieces")
-	}
+	}*/
 	unrequested := filterPieces(p.pcs, func(p *Piece) bool {
 		return p.UnrequestedBlocks() > 0 && peerPieces.Get(p.index)
 	})
@@ -100,7 +100,8 @@ func (p *pieces) fillRequests(peerPieces bitmap.Bitmap, requests []block) (n int
 		p2 := unrequested[j]
 		return p.selector.Less(p1, p2)
 	})
-	inFlightToAdd := p.maxInFlightPieces - len(pending)
+	//Ignore p.maxInFlightPieces for the time...
+	/*inFlightToAdd := p.maxInFlightPieces - len(pending)
 	unrequested = filterPieces(unrequested, func(p *Piece) bool {
 		if p.PendingBlocks() > 0 {
 			return true
@@ -110,7 +111,7 @@ func (p *pieces) fillRequests(peerPieces bitmap.Bitmap, requests []block) (n int
 		//(or we are going to schedule) p.maxInFlightRecs requests in flight
 		//then don't request it
 		return inFlightToAdd >= 0
-	})
+	})*/
 	var unreq []block
 	total, _n := len(requests), 0
 	for _, piece := range unrequested {
@@ -158,9 +159,8 @@ func (p *pieces) setBlockComplete(i int, off int, ci *connInfo) {
 	piece := p.pcs[i]
 	p.mu.Lock()
 	defer func() {
-		p.mu.Unlock()
 		//send to channels without acquiring the lock
-		//
+		p.mu.Unlock()
 		if piece.complete() {
 			p.t.queuePieceForHashing(i)
 		}
@@ -313,17 +313,17 @@ func (p *Piece) Blocks() int {
 	return p.blocks
 }
 
-//PendingBlocks returns the number of pendingBlocks the piece has
+//PendingBlocks returns the number of pendingBlocks blocks of p
 func (p *Piece) PendingBlocks() int {
 	return p.blocks - (p.unrequestedBlocks.Len() + p.completeBlocks.Len())
 }
 
-//UnrequestedBlocks returns the number of unrequested the piece has
+//UnrequestedBlocks returns the number of unrequested blocks of p
 func (p *Piece) UnrequestedBlocks() int {
 	return p.unrequestedBlocks.Len()
 }
 
-//CompletedBlocks returns the number of completed the piece has
+//CompletedBlocks returns the number of completed blocks of p
 func (p *Piece) CompletedBlocks() int {
 	return p.completeBlocks.Len()
 }

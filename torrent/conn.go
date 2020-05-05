@@ -116,7 +116,7 @@ func (c *conn) connInfo() *connInfo {
 }
 
 func (c *conn) close() {
-	c.discardBlocks(false)
+	c.discardBlocks(false, false)
 	//notify Torrent that conn closed
 	select {
 	case <-c.dropped:
@@ -192,7 +192,6 @@ func (c *conn) readPeerMsgs(readC chan<- *peer_wire.Msg, quit chan struct{},
 			errC <- err
 			return
 		}
-		//break from loops in not required
 		var sendToChan bool
 		switch msg.Kind {
 		case peer_wire.Request:
@@ -250,7 +249,7 @@ func (c *conn) sendRequests() {
 		panic("on flight queue is full")
 	}
 	requests := make([]block, sz)
-	n := c.t.pieces.getRequests(c.peerBf, requests)
+	n := c.t.pieces.fillRequests(c.peerBf, requests)
 	if n == 0 {
 		if (requests[0] != block{}) {
 			panic("send requests")
@@ -314,7 +313,7 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 			//due to inconsistent states between Torrent and conn we may have requests on flight
 			//which we'll be lost (hopefully I think this doesn't happen too much)
 			c.cl.counters.Add("lostBlocksDueToSync", int64(len(c.onFlightReqs)))
-			err = c.discardBlocks(true)
+			err = c.discardBlocks(true, true)
 			if err != nil {
 				return err
 			}
@@ -405,7 +404,7 @@ func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
 	case peer_wire.NotInterested:
 		err = stateChange(&c.state.isInterested, false)
 	case peer_wire.Choke:
-		err = c.discardBlocks(true)
+		err = c.discardBlocks(true, false)
 		if err != nil {
 			return err
 		}
@@ -575,10 +574,13 @@ func (c *conn) onExtended(msg *peer_wire.Msg) (err error) {
 	return nil
 }
 
-func (c *conn) discardBlocks(notifyTorrent bool) error {
+func (c *conn) discardBlocks(notifyTorrent, sendCancels bool) error {
 	if len(c.onFlightReqs) > 0 {
 		unsatisfiedRequests := []block{}
 		for req := range c.onFlightReqs {
+			if sendCancels {
+				c.sendMsgToPeer(req.cancelMsg())
+			}
 			unsatisfiedRequests = append(unsatisfiedRequests, req)
 		}
 		c.t.pieces.discardRequests(unsatisfiedRequests)

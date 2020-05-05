@@ -7,13 +7,11 @@ import (
 //Torrent sends this when info is available
 type haveInfo struct{}
 
-//Torrent broadcasts this when it transits in seeding mode
-type seeding struct{}
-
 //Torrent sends this to signal a conn to be dropped
 type drop struct{}
 
-//Torrent broadcasts this to conns after receiving a `discardedRequests` message
+//Torrent broadcasts this to conns when it need to signal conns that they should
+// try to request some blocks
 type requestsAvailable struct{}
 
 //obsolete?
