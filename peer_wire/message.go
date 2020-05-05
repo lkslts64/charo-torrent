@@ -13,7 +13,7 @@ import (
 
 const (
 	Proto        = "BitTorrent protocol"
-	maxMsgLength = (1 << 14) // 64KiB
+	maxMsgLength = (1 << 10) * 256 // 256KiB
 )
 
 type MessageKind int8
