@@ -196,6 +196,7 @@ func (c *conn) readPeerMsgs(readC chan<- *peer_wire.Msg, quit chan struct{},
 			errC <- err
 			return
 		}
+		c.cl.counters.Add(fmt.Sprintf("%s received", msg.Kind.String()), 1)
 		var sendToChan bool
 		switch msg.Kind {
 		case peer_wire.Request:
@@ -420,7 +421,7 @@ func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
 	case peer_wire.Piece:
 		err = c.onPieceMsg(msg)
 	case peer_wire.Request:
-		err = c.upload(msg)
+		err = c.upload()
 	case peer_wire.Have:
 		if c.peerBf.Get(int(msg.Index)) {
 			//c.logger.Printf("peer send duplicate Have msg of piece %d\n", msg.Index)
@@ -600,7 +601,7 @@ func (c *conn) discardBlocks(notifyTorrent, sendCancels bool) error {
 }
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
-func (c *conn) upload(msg *peer_wire.Msg) error {
+func (c *conn) upload() error {
 	c.muPeerReqs.Lock()
 	defer c.muPeerReqs.Unlock()
 	for req := range c.peerReqs {
@@ -615,7 +616,7 @@ func (c *conn) upload(msg *peer_wire.Msg) error {
 			continue
 		}
 		if req.len > maxRequestBlockSz {
-			return fmt.Errorf("request length out of range: %d", msg.Len)
+			return fmt.Errorf("request length out of range: %d", req.len)
 		}
 		//check that we have the requested piece
 		if !c.myBf.Get(req.pc) {
@@ -634,8 +635,8 @@ func (c *conn) upload(msg *peer_wire.Msg) error {
 			}
 			c.sendMsgToPeer(&peer_wire.Msg{
 				Kind:  peer_wire.Piece,
-				Index: msg.Index,
-				Begin: msg.Begin,
+				Index: uint32(req.pc),
+				Begin: uint32(req.off),
 				Block: data,
 			})
 			return c.sendMsgToTorrent(uploadedBlock(req))
