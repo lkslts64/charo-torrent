@@ -28,10 +28,10 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 	bf := peer_wire.NewBitField(numPieces)
 	bf.SetPiece(7)
 	bf.SetPiece(91)
-	(&peer_wire.Msg{
+	w.Write((&peer_wire.Msg{
 		Kind: peer_wire.Bitfield,
 		Bf:   bf,
-	}).Write(w)
+	}).Encode())
 	//get events from eventCH
 	e := <-cn.sendC
 	bm := e.(bitmap.Bitmap)
@@ -39,10 +39,10 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 	assert.Equal(t, bm.Get(7), true)
 	assert.Equal(t, bm.Get(91), true)
 	for i := 0; i < 30*2; i += 2 {
-		(&peer_wire.Msg{
+		w.Write((&peer_wire.Msg{
 			Kind:  peer_wire.Have,
 			Index: uint32(i),
-		}).Write(w)
+		}).Encode())
 	}
 	for i := 0; i < 30*2; i += 2 {
 		e := <-cn.sendC
@@ -62,13 +62,13 @@ func TestConnState(t *testing.T) {
 	go cn.mainLoop()
 	go readForever(w)
 	//we dont expect conn to send an event since state didn't change
-	(&peer_wire.Msg{
+	w.Write((&peer_wire.Msg{
 		Kind: peer_wire.NotInterested,
-	}).Write(w)
+	}).Encode())
 	//now we expect
-	(&peer_wire.Msg{
+	w.Write((&peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
-	}).Write(w)
+	}).Encode())
 	cn.recvC <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}
@@ -134,18 +134,18 @@ func TestPeerRequestAndCancel(t *testing.T) {
 		}
 	}()
 	for i := 0; i < numPieces-1; i++ {
-		(&peer_wire.Msg{
+		w.Write((&peer_wire.Msg{
 			Kind:  peer_wire.Request,
 			Index: uint32(i),
 			Len:   1 << 14,
-		}).Write(w)
+		}).Encode())
 		//send cancel for the piece we dont have
 		if i == numPieces-2 {
-			(&peer_wire.Msg{
+			w.Write((&peer_wire.Msg{
 				Kind:  peer_wire.Cancel,
 				Index: uint32(i),
 				Len:   1 << 14,
-			}).Write(w)
+			}).Encode())
 		}
 	}
 	<-ch
@@ -164,7 +164,7 @@ func BenchmarkPeerPieceMsg(b *testing.B) {
 		Kind:  peer_wire.Piece,
 		Block: make([]byte, 1<<14),
 	}
-	msgBytes, err := msg.EncodeBinary()
+	msgBytes := msg.Encode()
 	require.NoError(b, err)
 	b.SetBytes(int64(len(msg.Block)))
 	var n int
@@ -205,9 +205,9 @@ func loadTorrentFile(t testing.TB, w, r net.Conn, filename string) (*conn, *Torr
 }
 
 func allowUpload(cn *conn, w net.Conn) {
-	(&peer_wire.Msg{
+	w.Write((&peer_wire.Msg{
 		Kind: peer_wire.Interested,
-	}).Write(w)
+	}).Encode())
 	cn.recvC <- &peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
 	}
@@ -215,9 +215,9 @@ func allowUpload(cn *conn, w net.Conn) {
 }
 
 func allowDownload(cn *conn, w net.Conn) {
-	(&peer_wire.Msg{
+	w.Write((&peer_wire.Msg{
 		Kind: peer_wire.Unchoke,
-	}).Write(w)
+	}).Encode())
 	cn.recvC <- &peer_wire.Msg{
 		Kind: peer_wire.Interested,
 	}

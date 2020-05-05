@@ -13,13 +13,13 @@ import (
 
 const (
 	Proto        = "BitTorrent protocol"
-	maxMsgLength = (1 << 10) * 50 //50KiB
+	maxMsgLength = (1 << 14) // 64KiB
 )
 
-type MessageID int8
+type MessageKind int8
 
 const (
-	Choke MessageID = iota
+	Choke MessageKind = iota
 	Unchoke
 	Interested
 	NotInterested
@@ -34,8 +34,40 @@ const (
 	Extended = 20
 )
 
+func (id MessageKind) String() string {
+	switch id {
+	case Choke:
+		return "Choke"
+	case Unchoke:
+		return "Unchoke"
+	case Interested:
+		return "Interested"
+	case NotInterested:
+		return "NotInterested"
+	case Have:
+		return "Have"
+	case Bitfield:
+		return "Bitfield"
+	case Request:
+		return "Request"
+	case Piece:
+		return "Piece"
+	case Cancel:
+		return "Cancel"
+	case Port:
+		return "Port"
+	case KeepAlive:
+		return "Keepalive"
+	case Extended:
+		return "Extended"
+	default:
+		return "Unknown"
+	}
+}
+
+//Msg represents a BitTorrent message to be sent over wire.
 type Msg struct {
-	Kind        MessageID
+	Kind        MessageKind
 	Index       uint32
 	Begin       uint32
 	Len         uint32
@@ -46,39 +78,8 @@ type Msg struct {
 	ExtendedMsg interface{}
 }
 
-func (m *Msg) Write(conn io.Writer) (err error) {
-	try := func(err error) {
-		if err != nil {
-			panic(err)
-		}
-	}
-	var b bytes.Buffer
-	switch m.Kind {
-	case KeepAlive:
-	case Choke, Unchoke, Interested, NotInterested:
-		try(writeBinary(&b, m.Kind))
-	case Have:
-		try(writeBinary(&b, m.Kind, m.Index))
-	case Bitfield:
-		try(writeBinary(&b, m.Kind, m.Bf))
-	case Request, Cancel:
-		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Len))
-	case Piece:
-		try(writeBinary(&b, m.Kind, m.Index, m.Begin, m.Block))
-	case Port:
-		try(writeBinary(&b, m.Kind, m.Port))
-	case Extended:
-		try(writeBinary(&b, m.Kind, m.ExtendedID, writeExtension(m)))
-	default:
-		panic("Unknown kind of msg to send")
-	}
-	var msgLen [4]byte
-	binary.BigEndian.PutUint32(msgLen[:], uint32(b.Len()))
-	_, err = conn.Write(append(msgLen[:], b.Bytes()...))
-	return
-}
-
-func (m *Msg) EncodeBinary() ([]byte, error) {
+//Encode m as BitTorrent protocol specifies.
+func (m *Msg) Encode() []byte {
 	try := func(err error) {
 		if err != nil {
 			panic(err)
@@ -107,10 +108,11 @@ func (m *Msg) EncodeBinary() ([]byte, error) {
 	var msgLen [4]byte
 	binary.BigEndian.PutUint32(msgLen[:], uint32(b.Len()))
 	buf := append(msgLen[:], b.Bytes()...)
-	return buf, nil
+	return buf
 }
 
-func Read(conn io.Reader) (*Msg, error) {
+//Decode reads from r an encoded BitTorrent message and decode it as the protocol specifies.
+func Decode(r io.Reader) (*Msg, error) {
 	msg := new(Msg)
 	checkRead := func(err error) {
 		if err != nil {
@@ -118,7 +120,7 @@ func Read(conn io.Reader) (*Msg, error) {
 		}
 	}
 	msgLen := make([]byte, 4)
-	_, err := io.ReadFull(conn, msgLen)
+	_, err := io.ReadFull(r, msgLen)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +133,7 @@ func Read(conn io.Reader) (*Msg, error) {
 		return msg, nil
 	}
 	buf := make([]byte, _msgLen)
-	_, err = io.ReadFull(conn, buf)
+	_, err = io.ReadFull(r, buf)
 	if err != nil {
 		return nil, err
 	}

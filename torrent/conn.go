@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +26,6 @@ const (
 
 const (
 	keepAliveInterval time.Duration = 2 * time.Minute
-	keepAliveSendFreq               = keepAliveInterval - 10*time.Second
 )
 
 //conn represents a peer connection.
@@ -36,9 +36,10 @@ type conn struct {
 	t      *Torrent
 	logger *log.Logger
 	//tcp connection with peer
-	cn   net.Conn
-	peer Peer
-	exts peer_wire.Extensions
+	cn      net.Conn
+	bwriter *bufio.Writer
+	peer    Peer
+	exts    peer_wire.Extensions
 	//main goroutine also has this state - needs to be synced between
 	//the two goroutines
 	state connState
@@ -46,7 +47,7 @@ type conn struct {
 	recvC chan interface{}
 	//we send messages to Torrent from this channel.
 	sendC chan interface{}
-	//chans to signal that conn should is dropped
+	//chan to signal that conn should is dropped
 	dropped        chan struct{}
 	keepAliveTimer *time.Timer
 	peerReqs       map[block]struct{}
@@ -60,10 +61,9 @@ type conn struct {
 	//without dropping any. The default in in libtorrent is 250.
 	peerReqq int
 	reserved peer_wire.Reserved
-	//TODO: we 'll need this later.
-	peerBf bitmap.Bitmap
-	myBf   bitmap.Bitmap
-	peerID []byte
+	peerBf   bitmap.Bitmap
+	myBf     bitmap.Bitmap
+	peerID   []byte
 }
 
 //just wraps a msg with an error
@@ -79,6 +79,7 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 		t:            t,
 		logger:       log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags),
 		cn:           cn,
+		bwriter:      bufio.NewWriter(cn),
 		peer:         peer,
 		state:        newConnState(),
 		recvC:        make(chan interface{}, recvCSize),
@@ -153,7 +154,7 @@ func (c *conn) mainLoop() error {
 		err = nilOnEOF(err)
 	}()
 	go c.readPeerMsgs(readC, quit, readErrC)
-	c.keepAliveTimer = time.NewTimer(keepAliveSendFreq)
+	c.keepAliveTimer = time.NewTimer(keepAliveInterval)
 	//debugTick := time.NewTicker(2 * time.Second)
 	//defer debugTick.Stop()
 	for {
@@ -169,6 +170,9 @@ func (c *conn) mainLoop() error {
 			err = c.sendKeepAlive()
 		}
 		if err != nil {
+			return err
+		}
+		if err = c.flushWriter(); err != nil {
 			return err
 		}
 	}
@@ -187,7 +191,7 @@ func (c *conn) readPeerMsgs(readC chan<- *peer_wire.Msg, quit chan struct{},
 	errC chan error) {
 	for {
 		c.cn.SetReadDeadline(time.Now().Add(keepAliveInterval + time.Minute)) //lets be forbearing
-		msg, err := peer_wire.Read(c.cn)
+		msg, err := peer_wire.Decode(c.cn)
 		if err != nil {
 			errC <- err
 			return
@@ -240,7 +244,7 @@ func (c *conn) wantBlocks() bool {
 		c.peerBf.Len() > 0 && len(c.onFlightReqs) < maxOnFlight/2
 }
 
-func (c *conn) sendRequests() {
+func (c *conn) maybeSendRequests() {
 	if !c.wantBlocks() {
 		return
 	}
@@ -290,14 +294,9 @@ func (c *conn) amSeeding() bool {
 }
 
 func (c *conn) sendKeepAlive() error {
-	err := (&peer_wire.Msg{
+	return c.sendMsgToPeer(&peer_wire.Msg{
 		Kind: peer_wire.KeepAlive,
-	}).Write(c.cn)
-	if err != nil {
-		return err
-	}
-	c.keepAliveTimer.Reset(keepAliveSendFreq)
-	return nil
+	})
 }
 
 func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
@@ -307,7 +306,7 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 		case peer_wire.Port:
 		case peer_wire.Interested:
 			c.state.amInterested = true
-			defer c.sendRequests()
+			defer c.maybeSendRequests()
 		case peer_wire.NotInterested:
 			c.state.amInterested = false
 			//due to inconsistent states between Torrent and conn we may have requests on flight
@@ -357,7 +356,7 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 			Bf:   c.bitfield(c.myBf),
 		})
 	case requestsAvailable:
-		c.sendRequests()
+		c.maybeSendRequests()
 	case haveInfo:
 		c.haveInfo = true
 		if c.peerBf.Len() > 0 {
@@ -370,23 +369,29 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 }
 
 func (c *conn) sendMsgToPeer(msg *peer_wire.Msg) error {
-	//is mandatory to stop timer and recv from chan
-	//in order to reset it
-	if !c.keepAliveTimer.Stop() {
-		<-c.keepAliveTimer.C
-		err := (&peer_wire.Msg{
-			Kind: peer_wire.KeepAlive,
-		}).Write(c.cn)
-		if err != nil {
-			return err
-		}
+	limit := 1 << 16 //64KiB
+	n, err := c.bwriter.Write(msg.Encode())
+	if n > 0 {
+		c.cl.counters.Add(fmt.Sprintf("%s sent", msg.Kind.String()), 1)
 	}
-	c.keepAliveTimer.Reset(keepAliveSendFreq)
-	err := msg.Write(c.cn)
 	if err != nil {
 		return err
 	}
+	if c.bwriter.Buffered() > limit {
+		return c.flushWriter()
+	}
 	return nil
+}
+
+func (c *conn) flushWriter() error {
+	if c.bwriter.Buffered() <= 0 {
+		return nil
+	}
+	if !c.keepAliveTimer.Stop() {
+		<-c.keepAliveTimer.C
+	}
+	c.keepAliveTimer.Reset(keepAliveInterval)
+	return c.bwriter.Flush()
 }
 
 func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
@@ -411,7 +416,7 @@ func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
 		err = stateChange(&c.state.isChoking, true)
 	case peer_wire.Unchoke:
 		err = stateChange(&c.state.isChoking, false)
-		c.sendRequests()
+		c.maybeSendRequests()
 	case peer_wire.Piece:
 		err = c.onPieceMsg(msg)
 	case peer_wire.Request:
@@ -596,59 +601,59 @@ func (c *conn) discardBlocks(notifyTorrent, sendCancels bool) error {
 
 //TODO:Store bad peer so we wont accept them again if they try to reconnect
 func (c *conn) upload(msg *peer_wire.Msg) error {
-	bl := reqMsgToBlock(msg)
-	if c.isCanceled(bl) {
-		return nil
+	c.muPeerReqs.Lock()
+	defer c.muPeerReqs.Unlock()
+	for req := range c.peerReqs {
+		delete(c.peerReqs, req)
+		if !c.haveInfo {
+			return errors.New("peer send requested and we dont have info dict")
+		}
+		if !c.state.canUpload() {
+			//maybe we have choked the peer, but he hasnt been informed and
+			//thats why he send us request, dont drop conn just ignore the req
+			c.logger.Print("peer send request msg while choked\n")
+			continue
+		}
+		if req.len > maxRequestBlockSz {
+			return fmt.Errorf("request length out of range: %d", msg.Len)
+		}
+		//check that we have the requested piece
+		if !c.myBf.Get(req.pc) {
+			return fmt.Errorf("peer requested piece we do not have")
+		}
+		//ensure the we dont exceed the end of the piece
+		if endOff := req.off + req.len; endOff > c.t.pieceLen(uint32(req.pc)) {
+			return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
+		}
+		data := make([]byte, req.len)
+		err := func() error {
+			c.muPeerReqs.Unlock()
+			defer c.muPeerReqs.Lock()
+			if err := c.t.readBlock(data, req.pc, req.off); err != nil {
+				return nil
+			}
+			c.sendMsgToPeer(&peer_wire.Msg{
+				Kind:  peer_wire.Piece,
+				Index: msg.Index,
+				Begin: msg.Begin,
+				Block: data,
+			})
+			return c.sendMsgToTorrent(uploadedBlock(req))
+		}()
+		if err != nil {
+			return err
+		}
 	}
-	//ensure we delete the request at every case
-	defer func() {
-		c.muPeerReqs.Lock()
-		defer c.muPeerReqs.Unlock()
-		delete(c.peerReqs, bl)
-	}()
-	if !c.haveInfo {
-		return errors.New("peer send requested and we dont have info dict")
-	}
-	if !c.state.canUpload() {
-		//maybe we have choked the peer, but he hasnt been informed and
-		//thats why he send us request, dont drop conn just ignore the req
-		c.logger.Print("peer send request msg while choked\n")
-		return nil
-	}
-	if bl.len > maxRequestBlockSz {
-		return fmt.Errorf("request length out of range: %d", msg.Len)
-	}
-	//check that we have the requested piece
-	if !c.myBf.Get(bl.pc) {
-		return fmt.Errorf("peer requested piece we do not have")
-	}
-	//ensure the we dont exceed the end of the piece
-	if endOff := bl.off + bl.len; endOff > c.t.pieceLen(uint32(bl.pc)) {
-		return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
-	}
-	//read from db
-	//and write to conn
-	data := make([]byte, bl.len)
-	if err := c.t.readBlock(data, bl.pc, bl.off); err != nil {
-		return nil
-	}
-	c.sendMsgToPeer(&peer_wire.Msg{
-		Kind:  peer_wire.Piece,
-		Index: msg.Index,
-		Begin: msg.Begin,
-		Block: data,
-	})
-	return c.sendMsgToTorrent(uploadedBlock(bl))
+	return nil
 }
 
-func (c *conn) isCanceled(b block) bool {
+func (c *conn) requestCanceldOrFullfiled(b block) bool {
 	c.muPeerReqs.Lock()
 	defer c.muPeerReqs.Unlock()
 	_, ok := c.peerReqs[b]
 	return !ok
 }
 
-//store block and send another request if request queuer permits it.
 func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	//var ready block
 	var ok bool
@@ -691,7 +696,7 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	}
 	if ok {
 		delete(c.onFlightReqs, bl)
-		c.sendRequests()
+		c.maybeSendRequests()
 	}
 	if err := c.t.writeBlock(msg.Block, bl.pc, bl.off); err != nil {
 		if errors.Is(err, storage.ErrAlreadyWritten) {

@@ -14,9 +14,10 @@ func TestWriteUnchoke(t *testing.T) {
 	defer r.Close()
 	go func() {
 		defer w.Close()
-		require.NoError(t, (&Msg{
+		_, err := w.Write((&Msg{
 			Kind: Unchoke,
-		}).Write(w))
+		}).Encode())
+		require.NoError(t, err)
 	}()
 	b := make([]byte, 5)
 	_, err := r.Read(b)
@@ -31,8 +32,7 @@ func TestReadChoke(t *testing.T) {
 		defer w.Close()
 		w.Write([]byte{0, 0, 0, 1, 0})
 	}()
-	//b := make([]byte, 5)
-	msg, err := Read(r)
+	msg, err := Decode(r)
 	require.NoError(t, err)
 	assert.EqualValues(t, &Msg{
 		Kind: Choke,
@@ -44,9 +44,10 @@ func ReadWrite(t *testing.T, expect *Msg) {
 	defer r.Close()
 	go func() {
 		defer w.Close()
-		require.NoError(t, expect.Write(w))
+		_, err := w.Write(expect.Encode())
+		require.NoError(t, err)
 	}()
-	msg, err := Read(r)
+	msg, err := Decode(r)
 	require.NoError(t, err)
 	assert.EqualValues(t, expect, msg)
 }
@@ -72,11 +73,11 @@ func TestWriteExtension(t *testing.T) {
 	defer r.Close()
 	defer w.Close()
 	write := func(extID ExtensionID, extMsg interface{}) {
-		(&Msg{
+		w.Write((&Msg{
 			Kind:        Extended,
 			ExtendedID:  extID, //handshake
 			ExtendedMsg: extMsg,
-		}).Write(w)
+		}).Encode())
 	}
 	test := func(extID byte, expected string) {
 		b := make([]byte, 4+1+1+len(expected))
@@ -117,7 +118,7 @@ func TestReadExtension(t *testing.T) {
 		w.Write(buf)
 	}
 	go write(byte(ExtHandshakeID), expected)
-	msg, err := Read(r)
+	msg, err := Decode(r)
 	require.NoError(t, err)
 	dict := msg.ExtendedMsg.(ExtHandshakeDict)
 	//anon val is a dict
@@ -135,7 +136,7 @@ func TestReadExtension(t *testing.T) {
 	//ext metadata
 	expected = "d8:msg_typei0e5:piecei2e10:total_sizei3452ee"
 	go write(byte(ExtMetadataID), expected)
-	msg, err = Read(r)
+	msg, err = Decode(r)
 	require.NoError(t, err)
 	metaExt := msg.ExtendedMsg.(MetadataExtMsg)
 	assert.EqualValues(t, metaExt.Kind, 0)
@@ -144,7 +145,7 @@ func TestReadExtension(t *testing.T) {
 	//ext metadata data msg
 	expected = "d8:msg_typei1e5:piecei2e10:total_sizei3452ee\x00\x11\x22\x33\x44"
 	go write(byte(ExtMetadataID), expected)
-	msg, err = Read(r)
+	msg, err = Decode(r)
 	require.NoError(t, err)
 	metaExt = msg.ExtendedMsg.(MetadataExtMsg)
 	assert.EqualValues(t, metaExt.Kind, 1)
