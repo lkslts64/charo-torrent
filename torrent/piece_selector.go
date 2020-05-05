@@ -4,12 +4,7 @@ import "math/rand"
 
 // PieceSelector is responsible for selecting the order in which the
 // torrent's pieces will be requested. Note that this is not the order
-// in which they will be downloaded and in some cases it isn't event the exact order
-// in which they will be requested (see Torrent.SetMaxInFlightPieces). For example,
-// if MaxInFlightPieces == 1, the client has requested some blocks for piece 5 (and
-// no other piece) and piece 4 gets prioritized over 5, then the client wont't make
-// requests for piece 4 with respect to MaxInFlightPieces and
-// it will continue to request blocks for piece 5 which has lower priority.
+// in which they will be downloaded.
 type PieceSelector interface {
 	// Less reports whether p1 should be prioritized over p2.
 	// p1 and p2 have both unrequested blocks.
@@ -20,6 +15,7 @@ type PieceSelector interface {
 	// another reason to keep its execution time short-.
 	Less(p1, p2 *Piece) bool
 	// This is called when a piece is fully downloaded (and verified).
+	// i is the index of the downloaded piece.
 	// Useful if PieceSelector wants to change state after such an event.
 	OnPieceDownload(i int)
 	// Called when the PieceSelector is associated with a specific Torrent.
@@ -27,7 +23,6 @@ type PieceSelector interface {
 	SetTorrent(t *Torrent)
 }
 
-//DefaultPieceSelector is
 type DefaultPieceSelector struct {
 	next    nextF
 	pausedC chan bool
@@ -43,7 +38,7 @@ func NewDefaultPieceSelector() PieceSelector {
 //completed blocks have the highest priority.
 //If the two pieces have both all blocks unrequested then:
 // i) If no other piece in the Torrent has been downloaded, then we prioritize randomly.
-// ii) Otherwise, by comparing their rarities. The one with the lower rarity gets
+// ii) Otherwise, by comparing their rarities. The one that is more rare gets
 // prioritized.
 func (dfs *DefaultPieceSelector) Less(p1, p2 *Piece) bool {
 	switch {
@@ -75,3 +70,24 @@ func nextRand(p1, p2 *Piece) bool {
 func nextByRarity(p1, p2 *Piece) bool {
 	return p1.rarity < p2.rarity
 }
+
+/*
+type StreamerSelector struct {
+	//which part of the video the user is watching (corresponds to a torrent piece)
+	cursor int
+}
+
+func (ss *StreamerSelector) Less(p1, p2 *Piece) bool {
+	dist1 := p1.Index() - ss.cursor
+	dist2 := p2.Index() - ss.cursor
+	if dist1 < 0 {
+		return false
+	}
+	if dist2 < 0 {
+		return true
+	}
+	return dist1 < dist2
+}
+
+func (ss *StreamerSelector) OnPieceDownload(_ int) {}
+*/

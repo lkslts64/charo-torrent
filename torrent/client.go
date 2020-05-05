@@ -44,6 +44,8 @@ type Client struct {
 
 //Config provides configuration for a Client.
 type Config struct {
+	//Returns a new PieceSelector instantiated for each torrent the client manages
+	SelectorF func() PieceSelector
 	//Max outstanding requests per connection we allow for a peer to have
 	MaxOnFlightReqs int
 	//Max active/established connectioctions per torrent
@@ -144,6 +146,7 @@ func DefaultConfig() (*Config, error) {
 		return nil, err
 	}
 	return &Config{
+		SelectorF:           NewDefaultPieceSelector,
 		MaxOnFlightReqs:     250,
 		MaxEstablishedConns: 55,
 		BaseDir:             dir,
