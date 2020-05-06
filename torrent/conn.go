@@ -47,8 +47,10 @@ type conn struct {
 	recvC chan interface{}
 	//we send messages to Torrent from this channel.
 	sendC chan interface{}
-	//chan to signal that conn should is dropped
-	dropped        chan struct{}
+	//chan to signal that conn is dropped
+	droppedC chan struct{}
+	//the last message a conn may be willing to set to Torrent.
+	lastMsg        interface{}
 	keepAliveTimer *time.Timer
 	peerReqs       map[block]struct{}
 	onFlightReqs   map[block]struct{}
@@ -84,7 +86,7 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 		state:        newConnState(),
 		recvC:        make(chan interface{}, recvCSize),
 		sendC:        make(chan interface{}, sendCSize),
-		dropped:      make(chan struct{}),
+		droppedC:     make(chan struct{}),
 		onFlightReqs: make(map[block]struct{}),
 		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
 		peerReqs:     make(map[block]struct{}),
@@ -109,7 +111,7 @@ func (c *conn) connInfo() *connInfo {
 		// Torrent should see c.recvC as its send channel and c.sendC as its receive channel.
 		sendC:    c.recvC,
 		recvC:    c.sendC,
-		droppedC: c.dropped,
+		droppedC: c.droppedC,
 		peer:     c.peer,
 		reserved: c.reserved,
 		state:    c.state,
@@ -119,12 +121,12 @@ func (c *conn) connInfo() *connInfo {
 func (c *conn) close() {
 	c.discardBlocks(false, false)
 	//notify Torrent that conn closed
-	select {
-	case <-c.dropped:
-	default:
-		close(c.dropped)
-	}
+	close(c.droppedC)
 	//because we closed `dropped`, there is no deadlock possibility
+	select {
+	case <-c.t.dropC:
+	case c.sendC <- c.lastMsg:
+	}
 	select {
 	case <-c.t.dropC:
 	case c.sendC <- discardedRequests{}:
@@ -498,13 +500,8 @@ func (c *conn) sendMsgToTorrent(e interface{}) error {
 			}
 		}
 		if err != nil {
-			close(c.dropped)
-			//e is guranteed to be sent in sendC even if error occurs.
-			//No deadlock possibility because we closed dropped chan
-			select {
-			case <-c.t.dropC:
-			case c.sendC <- e:
-			}
+			//save the msg we couldn't send to conn.
+			c.lastMsg = e
 			return err
 		}
 	}
