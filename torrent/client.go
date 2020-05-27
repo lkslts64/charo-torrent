@@ -31,7 +31,6 @@ type Client struct {
 	torrents map[[20]byte]*Torrent
 	close    chan struct{}
 
-	mu               sync.Mutex
 	listener         listener
 	trackerAnnouncer *trackerAnnouncer
 	dhtServer        *dht.Server
@@ -40,6 +39,8 @@ type Client struct {
 	trackerAnnouncerCloseC chan chan struct{}
 	port                   int
 	counters               *expvar.Map
+	mu                     sync.Mutex //guards following
+	blackList              []net.IP
 }
 
 //Config provides configuration for a Client.
@@ -48,7 +49,7 @@ type Config struct {
 	SelectorF func() PieceSelector
 	//Max outstanding requests per connection we allow for a peer to have
 	MaxOnFlightReqs int
-	//Max active/established connectioctions per torrent
+	//Max active/established connections per torrent
 	MaxEstablishedConns int
 	//This option disables DHT also.
 	RejectIncomingConnections bool
@@ -74,18 +75,19 @@ func NewClient(cfg *Config) (*Client, error) {
 			return nil, err
 		}
 	}
-	logFile, err := os.Create(path.Join(os.TempDir(), logFileName))
-	if err != nil {
-		return nil, err
-	}
 	cl := &Client{
-		peerID:   newPeerID(),
-		config:   cfg,
-		close:    make(chan struct{}),
-		torrents: make(map[[20]byte]*Torrent),
+		peerID:    newPeerID(),
+		config:    cfg,
+		close:     make(chan struct{}),
+		torrents:  make(map[[20]byte]*Torrent),
+		blackList: make([]net.IP, 0),
 	}
 	cl.counters = expvar.NewMap("counters" + string(cl.peerID[:]))
 	logPrefix := fmt.Sprintf("client%x ", cl.peerID[14:]) //last 6 bytes of peerID
+	logFile, err := os.Create(path.Join(os.TempDir(), logFileName+logPrefix))
+	if err != nil {
+		return nil, err
+	}
 	cl.logger = log.New(logFile, logPrefix, log.LstdFlags)
 	if !cl.config.RejectIncomingConnections {
 		if cl.listener, err = listen(cl); err != nil {
@@ -179,7 +181,7 @@ func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
 		return nil, err
 	}
 	go t.mainLoop()
-	if err = <-t.infoC; err != nil {
+	if err = <-t.InfoC; err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -194,7 +196,7 @@ func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
 		return nil, err
 	}
 	go t.mainLoop()
-	if err = <-t.infoC; err != nil {
+	if err = <-t.InfoC; err != nil {
 		return nil, err
 	}
 	return t, nil
@@ -221,8 +223,6 @@ func (cl *Client) dropTorrent(infohash [20]byte) error {
 	if _, ok := cl.torrents[infohash]; !ok {
 		return errors.New("torrent doesn't exist")
 	}
-	cl.mu.Lock()
-	defer cl.mu.Unlock()
 	delete(cl.torrents, infohash)
 	return nil
 }
@@ -263,11 +263,13 @@ func (cl *Client) dhtPort() uint16 {
 	return ap.port
 }
 
+//TODO: don't leak this goroutine on client.Close
 func (cl *Client) acceptForEver() error {
 	for {
 		conn, err := cl.listener.Accept()
 		if err != nil {
 			cl.logger.Println(err)
+			continue
 		}
 		go cl.runConnection(conn)
 	}
@@ -295,11 +297,23 @@ func (cl *Client) runConnection(c *conn) {
 			cl.logger.Println(err)
 		}
 		c.cn.Close()
+		cl.counters.Add("closed connections", 1)
 	}()
 	if err = c.informTorrent(); err != nil {
 		return
 	}
 	err = c.mainLoop()
+	if c.ban {
+		cl.banIP(c.peer.P.IP)
+	}
+}
+
+func (cl *Client) banIP(ip net.IP) {
+	cl.counters.Add("banned IPs", 1)
+	cl.logger.Printf("banned ip %s", ip.String())
+	cl.mu.Lock()
+	cl.blackList = append(cl.blackList, ip)
+	cl.mu.Unlock()
 }
 
 func (cl *Client) makeOutgoingConnection(t *Torrent, peer Peer) {
@@ -309,6 +323,7 @@ func (cl *Client) makeOutgoingConnection(t *Torrent, peer Peer) {
 		peer: peer,
 	}).dial()
 	if err != nil {
+		cl.counters.Add("could not dial", 1)
 		return
 	}
 	cl.runConnection(c)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -72,15 +73,15 @@ type Torrent struct {
 	//the download of the info is not controled with this variable
 	uploadEnabled   bool
 	downloadEnabled bool
-	//closes when the torrent is closed
-	closed   chan struct{}
+	//closes when the Torrent closes
+	ClosedC  chan struct{}
 	isClosed bool
 	//when this closes it signals all conns to exit
 	dropC chan struct{}
-	//closes when we have all pieces
-	downloadedDataC chan struct{}
-	//closes when we get the infoC
-	infoC chan error
+	//closes when all pieces have been downloaded
+	DownloadedDataC chan struct{}
+	//fires when we get the info dictionary
+	InfoC chan error
 	//channel to send requests to piece hasher goroutine
 	pieceQueuedHashingC chan int
 	//response channel of piece hasher
@@ -120,9 +121,9 @@ func newTorrent(cl *Client) *Torrent {
 		maxHalfOpenConns:          55,
 		wantPeersThreshold:        100,
 		dropC:                     make(chan struct{}),
-		downloadedDataC:           make(chan struct{}),
-		infoC:                     make(chan error),
-		closed:                    make(chan struct{}),
+		DownloadedDataC:           make(chan struct{}),
+		InfoC:                     make(chan error),
+		ClosedC:                   make(chan struct{}),
 		trackerAnnouncerResponseC: make(chan trackerAnnouncerResponse, 1),
 		trackerAnnouncerTimer:     newExpiredTimer(),
 		dhtAnnounceTimer:          newExpiredTimer(),
@@ -146,7 +147,7 @@ func (t *Torrent) close() {
 		panic("attempt to close torrent but is already closed")
 	}
 	defer func() {
-		close(t.closed)
+		close(t.ClosedC)
 		t.isClosed = true
 	}()
 	t.dropAllConns()
@@ -176,6 +177,11 @@ func (t *Torrent) dropAllConns() {
 }
 
 func (t *Torrent) mainLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			t.logger.Fatal(r)
+		}
+	}()
 	t.tryAnnounceAll()
 	t.choker.startTicker()
 	for {
@@ -375,12 +381,16 @@ func (t *Torrent) closeDhtAnnounce() {
 }
 
 func (t *Torrent) gotPeers(peers []Peer) {
+	t.cl.mu.Lock()
 	t.addFilteredPeers(peers, func(peer Peer) bool {
-		//
-		//TODO:check for blacklist ips
-		//
+		for _, ip := range t.cl.blackList {
+			if ip.Equal(peer.P.IP) {
+				return false
+			}
+		}
 		return true
 	})
+	t.cl.mu.Unlock()
 	t.dialConns()
 }
 
@@ -396,9 +406,6 @@ func (t *Torrent) dialConns() {
 		if t.peerInActiveConns(peer) {
 			continue
 		}
-		//TODO:
-		//if in black list?
-		//
 		t.halfOpen[peer.P.String()] = peer
 		go t.cl.makeOutgoingConnection(t, peer)
 	}
@@ -479,11 +486,11 @@ func (t *Torrent) state() string {
 	}
 	switch {
 	case t.uploadEnabled && t.downloadEnabled:
-		return "transfering data"
+		return "uploading/downloading"
 	case t.uploadEnabled:
-		return "uploading data"
+		return "uploading only"
 	case t.downloadEnabled:
-		return "downloading data"
+		return "downloading only"
 	}
 	return "waiting for downloading request"
 }
@@ -500,7 +507,7 @@ func (t *Torrent) blockUploaded(c *connInfo, b block) {
 }
 
 func (t *Torrent) downloadedAll() {
-	close(t.downloadedDataC)
+	close(t.DownloadedDataC)
 	for _, c := range t.conns {
 		c.notInterested()
 	}
@@ -524,6 +531,8 @@ func (t *Torrent) pieceHashed(i int, correct bool) {
 	t.pieces.pieceHashed(i, correct)
 	if correct {
 		t.onPieceDownload(i)
+	} else {
+		t.banPeer()
 	}
 }
 
@@ -602,12 +611,20 @@ func (t *Torrent) establishedConnection(ci *connInfo) bool {
 	return true
 }
 
-//we would like to drop the conn
-func (t *Torrent) punishPeer(i int) {
-	t.conns[i].sendMsgToConn(drop{})
-	t.removeConn(t.conns[i], i)
-	t.choker.reviewUnchokedPeers()
-	//TODO: black list in some way?
+func (t *Torrent) banPeer() {
+	max := math.MinInt32
+	var toBan *connInfo
+	for _, c := range t.conns {
+		if m := c.stats.malliciousness(); m > max {
+			max = m
+			toBan = c
+		}
+	}
+	if toBan == nil {
+		return
+	}
+	t.cl.banIP(toBan.peer.P.IP)
+	toBan.sendMsgToConn(drop{})
 }
 
 //conn notified us that it was dropped
@@ -801,7 +818,7 @@ func (t *Torrent) gotInfoHash() {
 }
 
 func (t *Torrent) gotInfo() {
-	defer close(t.infoC)
+	defer close(t.InfoC)
 	t.length = t.mi.Info.TotalLength()
 	t.stats.BytesLeft = t.length
 	t.blockRequestSize = t.blockSize()

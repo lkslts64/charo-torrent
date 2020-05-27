@@ -50,7 +50,9 @@ type conn struct {
 	//chan to signal that conn is dropped
 	droppedC chan struct{}
 	//the last message a conn may be willing to set to Torrent.
-	lastMsg        interface{}
+	lastMsg interface{}
+	//whether we should black list the peer after close of connection
+	ban            bool
 	keepAliveTimer *time.Timer
 	peerReqs       map[block]struct{}
 	onFlightReqs   map[block]struct{}
@@ -101,7 +103,8 @@ func (c *conn) informTorrent() error {
 	case <-c.t.dropC:
 		return errors.New("torrent closed")
 	case <-time.After(time.Minute):
-		panic("conn: couldn't inform torrent about the connection")
+		c.cl.logger.Println("conn: couldn't inform torrent about the connection")
+		return errors.New("inform timeout")
 	}
 }
 
@@ -151,6 +154,9 @@ func (c *conn) mainLoop() error {
 	//we need o quit chan in order to not leak readMsgs goroutine
 	quit := make(chan struct{})
 	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Println(r)
+		}
 		close(quit)
 		c.close()
 		err = nilOnEOF(err)
@@ -391,14 +397,17 @@ func (c *conn) flushWriter() error {
 		return nil
 	}
 	if !c.keepAliveTimer.Stop() {
-		<-c.keepAliveTimer.C
+		select {
+		case <-c.keepAliveTimer.C:
+		default:
+		}
 	}
 	c.keepAliveTimer.Reset(keepAliveInterval)
 	return c.bwriter.Flush()
 }
 
 func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
-	stateChange := func(currState *bool, futureState bool) error {
+	changeState := func(currState *bool, futureState bool) error {
 		if *currState == futureState {
 			return nil
 		}
@@ -408,17 +417,17 @@ func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
 	switch msg.Kind {
 	case peer_wire.KeepAlive:
 	case peer_wire.Interested:
-		err = stateChange(&c.state.isInterested, true)
+		err = changeState(&c.state.isInterested, true)
 	case peer_wire.NotInterested:
-		err = stateChange(&c.state.isInterested, false)
+		err = changeState(&c.state.isInterested, false)
 	case peer_wire.Choke:
 		err = c.discardBlocks(true, false)
 		if err != nil {
 			return err
 		}
-		err = stateChange(&c.state.isChoking, true)
+		err = changeState(&c.state.isChoking, true)
 	case peer_wire.Unchoke:
-		err = stateChange(&c.state.isChoking, false)
+		err = changeState(&c.state.isChoking, false)
 		c.maybeSendRequests()
 	case peer_wire.Piece:
 		err = c.onPieceMsg(msg)
@@ -519,6 +528,7 @@ func (c *conn) bitfield(bm bitmap.Bitmap) peer_wire.BitField {
 func (c *conn) bitmap(bf peer_wire.BitField) (*bitmap.Bitmap, error) {
 	var bm bitmap.Bitmap
 	if c.haveInfo && !bf.Valid(c.t.numPieces()) {
+		c.ban = true
 		return nil, errors.New("bf length is not valid")
 	}
 	for i := 0; i < len(bf)*8; i++ {
@@ -604,6 +614,7 @@ func (c *conn) upload() error {
 	for req := range c.peerReqs {
 		delete(c.peerReqs, req)
 		if !c.haveInfo {
+			c.ban = true
 			return errors.New("peer send requested and we dont have info dict")
 		}
 		if !c.state.canUpload() {
@@ -613,14 +624,17 @@ func (c *conn) upload() error {
 			continue
 		}
 		if req.len > maxRequestBlockSz {
+			c.ban = true
 			return fmt.Errorf("request length out of range: %d", req.len)
 		}
 		//check that we have the requested piece
+		//dont ban we may have dropped a piece
 		if !c.myBf.Get(req.pc) {
 			return fmt.Errorf("peer requested piece we do not have")
 		}
 		//ensure the we dont exceed the end of the piece
 		if endOff := req.off + req.len; endOff > c.t.pieceLen(uint32(req.pc)) {
+			c.ban = true
 			return fmt.Errorf("peer request exceeded length of piece: %d", endOff)
 		}
 		data := make([]byte, req.len)
@@ -662,9 +676,11 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 		//maybe because of network inconsistencies (latency).
 		c.cl.counters.Add("unexpectedBlockRecv", 1)
 		if !c.haveInfo {
+			c.ban = true
 			return errors.New("peer send piece while we dont have info")
 		}
 		if !c.t.pieces.isValid(bl.pc) {
+			c.ban = true
 			return errors.New("peer send piece doesn't exist")
 		}
 		//TODO: check if we have the particular block

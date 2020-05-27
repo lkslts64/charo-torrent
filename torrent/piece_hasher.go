@@ -20,7 +20,7 @@ func (p *pieceHasher) Run() {
 					return
 				}
 			}
-		case <-p.t.closed:
+		case <-p.t.ClosedC:
 			return
 		}
 	}
