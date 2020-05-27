@@ -5,7 +5,8 @@ add a torrent and then download it.
 
 	cl, _ := torrent.NewClient(nil)
 	t, _ := cl.AddFromFile("example.torrent")
-	t.Download()
+	t.StartDataTransfer()
+	<-t.DownloadedDataC
 	fmt.Println("torrent downloaded!")
 */
 package torrent
