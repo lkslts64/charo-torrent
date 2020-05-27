@@ -12,7 +12,7 @@ type torrentLocker struct {
 func (l *torrentLocker) lock() {
 	l.syncC = make(chan interface{})
 	select {
-	case <-l.t.closed:
+	case <-l.t.ClosedC:
 		l.closed = true
 	case l.t.userC <- l.syncC:
 	}
@@ -24,7 +24,7 @@ func (l *torrentLocker) unlock() {
 		return
 	}
 	select {
-	case <-l.t.closed: //fires only if Close methods is invoked.
+	case <-l.t.ClosedC: //fires only if Close methods is invoked.
 	case l.syncC <- l.v:
 	}
 }

@@ -31,15 +31,8 @@ func (t *Torrent) Swarm() []Peer {
 	return t.swarm()
 }
 
-//TransferData enables downloading/uploading the torrent's data.
-// It should be called once for each Torrent.
-// It requires the info first.
-//After the download is complete, the Torrent transits in seeding mode
-//(i.e altruistically upload) until it's closed.
-//If the data are already there,TransferData returns immediatly and
-//seeds the torrent.
-func (t *Torrent) TransferData() error {
-	if err := t.transferData(); err != nil {
+/*func (t *Torrent) StartDataTransfer() error {
+	if err := t.starDataTransfer(); err != nil {
 		return err
 	}
 	select {
@@ -48,9 +41,16 @@ func (t *Torrent) TransferData() error {
 	case <-t.closed:
 		return errTorrentClosed
 	}
-}
+}*/
 
-func (t *Torrent) transferData() error {
+//StartDataTransfer enables downloading/uploading the torrent's data.
+// It should be called once for each Torrent.
+// It requires the info first.
+//After the download is complete, the Torrent transits in seeding mode
+//(i.e altruistically upload) until it's closed.
+//If the data are already there, StartDataTransfer returns immediatly and
+//and seeds the torrent.
+func (t *Torrent) StartDataTransfer() error {
 	l := t.newLocker()
 	l.lock()
 	defer l.unlock()
@@ -87,12 +87,20 @@ func (t *Torrent) WriteStatus(w io.Writer) {
 	w.Write([]byte(b.String()))
 }
 
-//Metainfo returns the metainfo of the torrent or nil of its not available
+//Metainfo returns the metainfo of the torrent.
 func (t *Torrent) Metainfo() *metainfo.MetaInfo {
 	l := t.newLocker()
 	l.lock()
 	defer l.unlock()
 	return t.mi
+}
+
+//Info returns the info of the torrent or nil of its not available.
+func (t *Torrent) Info() *metainfo.InfoDict {
+	l := t.newLocker()
+	l.lock()
+	defer l.unlock()
+	return t.mi.Info
 }
 
 //HaveAllPieces returns whether all torrent's data has been downloaded
@@ -220,7 +228,7 @@ func (t *Torrent) setDataDownloadEnable(v bool) error {
 //Closed returns whether the torrent is closed or not.
 func (t *Torrent) Closed() bool {
 	select {
-	case <-t.closed:
+	case <-t.ClosedC:
 		return true
 	default:
 		return false

@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -19,6 +21,10 @@ var memprofile = flag.String("memprof", "", "write memory profile to `file`")
 
 func main() {
 	flag.Parse()
+	//runtime.SetBlockProfileRate(1)
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
@@ -46,28 +52,25 @@ func main() {
 	}
 	w := uilive.New()
 	w.Start()
+	err = t.StartDataTransfer()
+	if err != nil {
+		log.Fatal(err)
+	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-	ch := make(chan error)
-	go func() {
-		err := t.Download()
-		if err != nil {
-			ch <- err
-		}
-		fmt.Println("downloaded torrent. seeding for 1 hour")
-		time.Sleep(time.Hour)
-		ch <- nil
-	}()
+	var seedC <-chan time.Time
 loop:
 	for {
 		select {
-		case err := <-ch:
-			if err != nil {
-				fmt.Println(err)
-			}
-			break loop
+		case <-t.DownloadedDataC:
+			fmt.Println("Downloaded torrent. Will be seeding for 1 hour...")
+			seedC = time.NewTimer(time.Hour).C
 		case <-ticker.C:
 			t.WriteStatus(w)
+		case <-t.ClosedC:
+			log.Fatal("Torrent closed abnormally")
+		case <-seedC:
+			break loop
 		}
 	}
 	//
