@@ -31,18 +31,6 @@ func (t *Torrent) Swarm() []Peer {
 	return t.swarm()
 }
 
-/*func (t *Torrent) StartDataTransfer() error {
-	if err := t.starDataTransfer(); err != nil {
-		return err
-	}
-	select {
-	case <-t.downloadedDataC:
-		return nil
-	case <-t.closed:
-		return errTorrentClosed
-	}
-}*/
-
 //StartDataTransfer enables downloading/uploading the torrent's data.
 // It should be called once for each Torrent.
 // It requires the info first.
@@ -185,14 +173,14 @@ func (t *Torrent) SetMaxInFlightPieces(n int) error {
 
 // EnableDataDownload re-enables downloading the torrent's data.
 // To bootstrap the data downloading, one should call TransferData first.
-// It is an error to call this before calling TransferData.
+// It is an error to call this before calling StartDataTransfer.
 // Usually EnableDataDownload is called after a call to DisableDataDownload.
 func (t *Torrent) EnableDataDownload() error {
 	return t.setDataDownloadEnable(true)
 }
 
 // DisableDataDownload pauses the process of downloading the torrent's data.
-// It is an error to call this before calling TransferData.
+// It is an error to call this before calling StartDataTransfer.
 func (t *Torrent) DisableDataDownload() error {
 	return t.setDataDownloadEnable(false)
 }
