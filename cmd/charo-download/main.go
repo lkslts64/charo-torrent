@@ -59,12 +59,14 @@ func main() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	var seedC <-chan time.Time
+	downloadC := t.DownloadedDataC
 loop:
 	for {
 		select {
-		case <-t.DownloadedDataC:
+		case <-downloadC:
 			fmt.Println("Downloaded torrent. Will be seeding for 1 hour...")
 			seedC = time.NewTimer(time.Hour).C
+			downloadC = nil
 		case <-ticker.C:
 			t.WriteStatus(w)
 		case <-t.ClosedC:
