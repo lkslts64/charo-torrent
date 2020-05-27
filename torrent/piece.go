@@ -13,19 +13,16 @@ const (
 	randomPiecePickingStrategyThreshold = 1
 )
 
-//TODO:reconsider how we store pcs - maybe a map would be better?
-//and store them depending on their state (dispatched,unrequested etc).
+//accessed by conns and Torrent
 type pieces struct {
 	t           *Torrent
 	ownedPieces bitmap.Bitmap
 	//every conn can call getRequests and discardRequests.This mutex protects the fields
 	//that these methods access.
-	mu       sync.Mutex
+	mu       sync.Mutex //guards following
 	pcs      []*Piece
 	selector PieceSelector
-	//pieces sorted by their priority.All verified pieces are not present in this slice
-	prioritizedPcs []*Piece
-	endGame        bool
+	endGame  bool
 	// caps the number of different pieces that are requested simultaneously.
 	//maxInFlightPieces int
 	//if false we shouldn't make any requests
@@ -41,10 +38,10 @@ func newPieces(t *Torrent) *pieces {
 	sorted := make([]*Piece, numPieces)
 	copy(sorted, pcs)
 	p := &pieces{
-		t:              t,
-		pcs:            pcs,
-		prioritizedPcs: sorted,
-		selector:       t.cl.config.SelectorF(),
+		t:   t,
+		pcs: pcs,
+		//prioritizedPcs: sorted,
+		selector: t.cl.config.SelectorF(),
 		//maxInFlightPieces: t.numPieces(),
 	}
 	p.selector.SetTorrent(t)
@@ -187,22 +184,13 @@ func (p *pieces) pieceHashed(i int, correct bool) {
 	if correct {
 		p.ownedPieces.Set(i, true)
 		p.pcs[i].verificationSuccess()
-	}
-	p.mu.Lock()
-	if correct {
-		//Call this after unlocking to avoid starvation of other goroutines
-		defer p.selector.OnPieceDownload(i)
-		//remove the piece i from priotirzedPcs, we'll never make requests for it again.
-		for j, piece := range p.prioritizedPcs {
-			if piece.index == i {
-				p.prioritizedPcs = append(p.prioritizedPcs[:j], p.prioritizedPcs[j+1:]...)
-				break
-			}
-		}
+		p.selector.OnPieceDownload(i)
 	} else {
+		p.mu.Lock()
 		p.pcs[i].verificationFailed()
+		p.mu.Unlock()
 	}
-	p.mu.Unlock()
+	p.pcs[i].contributors = []*connInfo{}
 }
 
 func (p *pieces) maybeStartEndgame() bool {
@@ -456,7 +444,6 @@ func (p *Piece) verificationFailed() {
 		panic("pieceVerificationFailed: piece was not complete")
 	}
 	p.unrequestedBlocks, p.completeBlocks = p.completeBlocks, p.unrequestedBlocks
-	p.contributors = []*connInfo{}
 }
 
 func (p *Piece) verificationSuccess() {
