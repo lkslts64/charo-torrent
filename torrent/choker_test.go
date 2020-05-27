@@ -15,7 +15,8 @@ func TestChoker(t *testing.T) {
 	for i := 0; i < numConns; i++ {
 		ci := &connInfo{
 			t: &Torrent{
-				mi: &metainfo.MetaInfo{},
+				mi:            &metainfo.MetaInfo{},
+				uploadEnabled: true,
 			},
 			sendC: make(chan interface{}, 50), //ensure we have length
 			state: connState{
