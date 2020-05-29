@@ -14,6 +14,17 @@ type dialer struct {
 	peer Peer
 }
 
+func maybeSendExtHandshake(c *conn, t *Torrent) error {
+	if !c.reserved.SupportExtended() || !c.cl.reserved.SupportExtended() {
+		return nil
+	}
+	var infoSize int64
+	if ut := t.utmetadata.correct(); ut != nil {
+		infoSize = int64(len(ut.infoBytes))
+	}
+	return c.sendMsgToPeer(extensionHandshakeMsg(infoSize), true)
+}
+
 func (d *dialer) dial() (*conn, error) {
 	var err error
 	defer d.t.removeHalfOpen(d.peer.P.String())
@@ -26,7 +37,7 @@ func (d *dialer) dial() (*conn, error) {
 			tcpConn.Close()
 		}
 	}()
-	_, err = d.cl.handshake(tcpConn, &peer_wire.HandShake{
+	hs, err := d.cl.handshake(tcpConn, &peer_wire.HandShake{
 		Reserved: d.cl.reserved,
 		PeerID:   d.cl.peerID,
 		InfoHash: d.t.mi.Info.Hash,
@@ -34,7 +45,8 @@ func (d *dialer) dial() (*conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newConn(d.t, tcpConn, d.peer), nil
+	c := newConn(d.t, tcpConn, d.peer, hs.Reserved)
+	return c, maybeSendExtHandshake(c, d.t)
 }
 
 type listener interface {
@@ -105,5 +117,6 @@ func (btl *btListener) Accept() (*conn, error) {
 	if !ok {
 		return nil, errors.New("peer handshake contain infohash that client doesn't manage")
 	}
-	return newConn(t, tcpConn, peer), nil
+	c := newConn(t, tcpConn, peer, hs.Reserved)
+	return c, maybeSendExtHandshake(c, t)
 }
