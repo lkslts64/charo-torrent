@@ -25,11 +25,10 @@ const logFileName = "charo.log"
 
 //Client manages multiple torrents
 type Client struct {
-	config   *Config
-	peerID   [20]byte
-	logger   *log.Logger
-	torrents map[[20]byte]*Torrent
-	close    chan struct{}
+	config *Config
+	peerID [20]byte
+	logger *log.Logger
+	close  chan struct{}
 
 	listener         listener
 	trackerAnnouncer *trackerAnnouncer
@@ -41,6 +40,7 @@ type Client struct {
 	counters               *expvar.Map
 	mu                     sync.Mutex //guards following
 	blackList              []net.IP
+	torrents               map[[20]byte]*Torrent
 }
 
 //Config provides configuration for a Client.
@@ -121,6 +121,7 @@ func NewClient(cfg *Config) (*Client, error) {
 			cl.logger.Fatalf("error creating dht server: %s", err)
 		}
 	}
+	cl.reserved.SetExtended()
 	return cl, nil
 }
 
@@ -211,15 +212,19 @@ func (cl *Client) add(p metainfo.Parser) (*Torrent, error) {
 	}
 	t.gotInfoHash()
 	ihash := t.mi.Info.Hash
+	cl.mu.Lock()
 	if _, ok := cl.torrents[ihash]; ok {
 		return nil, errors.New("torrent already exists")
 	}
 	cl.torrents[ihash] = t
+	cl.mu.Unlock()
 	return t, nil
 }
 
 //dropTorrent removes the Torrent the  torrent with infohash `infohash`.
 func (cl *Client) dropTorrent(infohash [20]byte) error {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
 	if _, ok := cl.torrents[infohash]; !ok {
 		return errors.New("torrent doesn't exist")
 	}
@@ -304,7 +309,7 @@ func (cl *Client) runConnection(c *conn) {
 	}
 	err = c.mainLoop()
 	if c.ban {
-		cl.banIP(c.peer.P.IP)
+		c.t.banIP(c.peer.P.IP)
 	}
 }
 
@@ -314,6 +319,17 @@ func (cl *Client) banIP(ip net.IP) {
 	cl.mu.Lock()
 	cl.blackList = append(cl.blackList, ip)
 	cl.mu.Unlock()
+}
+
+func (cl *Client) containsInBlackList(ip net.IP) bool {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	for _, addr := range cl.blackList {
+		if addr.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (cl *Client) makeOutgoingConnection(t *Torrent, peer Peer) {
