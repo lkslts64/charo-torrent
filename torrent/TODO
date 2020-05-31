@@ -1,6 +1,4 @@
--> Consider how many peer reqs we should manage and inform peer at handhsake about it.
-->Perfomarnce: reduce channel sends at block dispatching (i.e collect all blocks to dispatching 
-in a buffer and then send them all)
--> Drop conns by maliciousness factor if verification of a piece fails. This includes 
-that we will maintain a blackList of peers
-->Add iter on pcs field of pieces (we do many iterations on many methods)
+- Avoid heavy usage of channels and use the sync package (now it is too late)
+- Fix security issue at peer_wire writeExtension func
+- Store in db completed pieces.
+
