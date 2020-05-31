@@ -22,7 +22,7 @@ func TestConnBitfieldThenHaveBombardism(t *testing.T) {
 	cl, err := NewClient(testingConfig())
 	require.NoError(t, err)
 	tr := newTorrent(cl)
-	cn := newConn(tr, r, Peer{})
+	cn := newConn(tr, r, Peer{}, peer_wire.Reserved{})
 	go cn.mainLoop()
 	numPieces := 100
 	bf := peer_wire.NewBitField(numPieces)
@@ -58,7 +58,7 @@ func TestConnState(t *testing.T) {
 	cl, err := NewClient(testingConfig())
 	require.NoError(t, err)
 	tr := newTorrent(cl)
-	cn := newConn(tr, r, Peer{})
+	cn := newConn(tr, r, Peer{}, peer_wire.Reserved{})
 	go cn.mainLoop()
 	go readForever(w)
 	//we dont expect conn to send an event since state didn't change
@@ -193,7 +193,7 @@ func loadTorrentFile(t testing.TB, w, r net.Conn, filename string) (*conn, *Torr
 	cl, err := NewClient(cfg)
 	require.NoError(t, err)
 	tr := newTorrent(cl)
-	cn := newConn(tr, r, Peer{})
+	cn := newConn(tr, r, Peer{}, peer_wire.Reserved{})
 	tr.mi, err = metainfo.LoadMetainfoFile(filename)
 	require.NoError(t, err)
 	tr.logger = log.New(os.Stdout, "test_logger", log.LstdFlags)

@@ -21,6 +21,10 @@ const (
 
 type Extensions map[ExtensionName]ExtensionID
 
+func NewExtensions() Extensions {
+	return make(map[ExtensionName]ExtensionID)
+}
+
 type ExtHandshakeDict map[string]interface{}
 
 func decodeExtHandshakeMsg(msg []byte) (d ExtHandshakeDict, err error) {
@@ -30,25 +34,23 @@ func decodeExtHandshakeMsg(msg []byte) (d ExtHandshakeDict, err error) {
 
 //return 'm' dict contents. we received d from a peer
 func (d ExtHandshakeDict) Extensions() (Extensions, error) {
-	var peerExt Extensions
+	peerExt := NewExtensions()
 	var ok bool
 	var _m interface{}
 	if _m, ok = d["m"]; !ok {
 		return nil, errors.New("ext hanshake doesn't contain 'm' dict")
 	}
-	if _m != nil {
-		var m map[string]interface{}
-		if m, ok = _m.(map[string]interface{}); !ok {
-			return nil, errors.New("ext handshake's 'm' isnt dict")
+	var m map[string]interface{}
+	if m, ok = _m.(map[string]interface{}); !ok {
+		return nil, errors.New("ext handshake's 'm' isnt dict")
+	}
+	var id int64
+	for k, v := range m {
+		if id, ok = v.(int64); !ok {
+			return nil, errors.New("value of 'm' dict isn't an integer")
 		}
-		var id int64
-		for k, v := range m {
-			if id, ok = v.(int64); !ok {
-				return nil, errors.New("value of 'm' dict isn't an integer")
-			}
-			//TODO: Maybe discard the extensions that we dont't care about?
-			peerExt[ExtensionName(k)] = ExtensionID(id)
-		}
+		//TODO: Maybe discard the extensions that we dont't care about?
+		peerExt[ExtensionName(k)] = ExtensionID(id)
 	}
 	return peerExt, nil
 }

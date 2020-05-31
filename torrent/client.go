@@ -162,55 +162,39 @@ func DefaultConfig() (*Config, error) {
 //AddFromFile creates a torrent based on the contents of filename.
 //The Torrent returned maybe be in seeding mode if all the data is already downloaded.
 func (cl *Client) AddFromFile(filename string) (*Torrent, error) {
-	t, err := cl.add(&metainfo.FileParser{
+	return cl.AddFromParser(&metainfo.FileParser{
 		Filename: filename,
 	})
-	if err != nil {
-		return nil, err
-	}
-	t.gotInfo()
-	go t.mainLoop()
-	return t, nil
 }
 
-//AddFromMagnet creates a torrent based on the magnet link provided (not implemented yet)
+//AddFromMagnet creates a torrent based on the magnet link provided
 func (cl *Client) AddFromMagnet(uri string) (*Torrent, error) {
-	t, err := cl.add(&metainfo.MagnetParser{
+	return cl.AddFromParser(&metainfo.MagnetParser{
 		URI: uri,
 	})
-	if err != nil {
-		return nil, err
-	}
-	go t.mainLoop()
-	if err = <-t.InfoC; err != nil {
-		return nil, err
-	}
-	return t, nil
 }
 
-//AddFromInfoHash creates a torrent based on it's infohash (not implemented yet)
+//AddFromInfoHash creates a torrent based on it's infohash
 func (cl *Client) AddFromInfoHash(infohash [20]byte) (*Torrent, error) {
-	t, err := cl.add(&metainfo.InfoHashParser{
+	return cl.AddFromParser(&metainfo.InfoHashParser{
 		InfoHash: infohash,
 	})
-	if err != nil {
-		return nil, err
-	}
-	go t.mainLoop()
-	if err = <-t.InfoC; err != nil {
-		return nil, err
-	}
-	return t, nil
 }
 
-func (cl *Client) add(p metainfo.Parser) (*Torrent, error) {
+//AddFromParser creates a torrent from the provided parser. See metainfo package for more.
+func (cl *Client) AddFromParser(p metainfo.Parser) (*Torrent, error) {
 	var err error
 	t := newTorrent(cl)
 	t.mi, err = p.Parse()
+	//cl.logger.Println(t.mi)
 	if err != nil {
 		return nil, err
 	}
 	t.gotInfoHash()
+	if t.mi.InfoBytes != nil {
+		t.gotInfo()
+	}
+	go t.mainLoop()
 	ihash := t.mi.Info.Hash
 	cl.mu.Lock()
 	if _, ok := cl.torrents[ihash]; ok {
@@ -234,6 +218,8 @@ func (cl *Client) dropTorrent(infohash [20]byte) error {
 
 //Torrents returns all torrents that the client manages.
 func (cl *Client) Torrents() []*Torrent {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
 	ts := []*Torrent{}
 	for _, t := range cl.torrents {
 		ts = append(ts, t)
@@ -249,15 +235,6 @@ func (cl *Client) ListenPort() int {
 //ID returns the Client's random ID
 func (cl *Client) ID() []byte {
 	return cl.peerID[:]
-}
-
-func (cl *Client) addTorrent(t *Torrent) error {
-	ihash := t.mi.Info.Hash
-	if _, ok := cl.torrents[ihash]; ok {
-		return errors.New("torrent already exists")
-	}
-	cl.torrents[ihash] = t
-	return nil
 }
 
 func (cl *Client) dhtPort() uint16 {
@@ -276,6 +253,7 @@ func (cl *Client) acceptForEver() error {
 			cl.logger.Println(err)
 			continue
 		}
+		cl.counters.Add("incoming connections", 1)
 		go cl.runConnection(conn)
 	}
 }
@@ -309,7 +287,9 @@ func (cl *Client) runConnection(c *conn) {
 	}
 	err = c.mainLoop()
 	if c.ban {
-		c.t.banIP(c.peer.P.IP)
+		//c.t.banIP(c.peer.P.IP) //we can't access torrent's conns
+		cl.banIP(c.peer.P.IP)
+
 	}
 }
 
@@ -340,8 +320,10 @@ func (cl *Client) makeOutgoingConnection(t *Torrent, peer Peer) {
 	}).dial()
 	if err != nil {
 		cl.counters.Add("could not dial", 1)
+		cl.logger.Println(err)
 		return
 	}
+	cl.counters.Add("outgoing connections", 1)
 	cl.runConnection(c)
 }
 

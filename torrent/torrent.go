@@ -1,13 +1,12 @@
 package torrent
 
 import (
-	"bytes"
 	"crypto/sha1"
-	"errors"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,17 +89,8 @@ type Torrent struct {
 	//Info field of `mi` is nil if we dont have it.
 	//Restrict access to metainfo before we get the
 	//whole mi.Info part.
-	mi       *metainfo.MetaInfo
-	infoSize int64
-	//we serve metadata only if we have it all.
-	//lock only when writing
-	infoMu sync.Mutex
-	//used only when we dont have infoDict part of metaInfo
-	infoBytes []byte
-	//TODO: change to bitmap
-	ownedInfoBlocks []bool
-	//frequency map of infoSizes we have received
-	infoSizeFreq freqMap
+	mi         *metainfo.MetaInfo
+	utmetadata *utMetadatas
 	//length of data to be downloaded
 	length         int
 	stats          Stats
@@ -129,10 +119,12 @@ func newTorrent(cl *Client) *Torrent {
 		dhtAnnounceTimer:          newExpiredTimer(),
 		dhtAnnounceResp:           new(dht.Announce),
 		queuedForVerification:     make(map[int]struct{}),
-		infoSizeFreq:              newFreqMap(),
 		logger:                    log.New(cl.logger.Writer(), "torrent", log.LstdFlags),
 		canAnnounceDht:            true,
 		canAnnounceTracker:        true,
+		utmetadata: &utMetadatas{
+			m: make(map[int64]*utMetadata),
+		},
 	}
 	if t.cl.trackerAnnouncer != nil {
 		t.trackerAnnouncerSubmitEventC = cl.trackerAnnouncer.trackerAnnouncerSubmitEventCh
@@ -159,7 +151,6 @@ func (t *Torrent) close() {
 	t.recvC = nil
 	t.newConnC = nil
 	t.pieces = nil
-	t.infoBytes = nil
 	t.peers = nil
 	//t.logger = nil
 	//TODO: clear struct fields
@@ -177,11 +168,11 @@ func (t *Torrent) dropAllConns() {
 }
 
 func (t *Torrent) mainLoop() {
-	defer func() {
+	/*defer func() {
 		if r := recover(); r != nil {
 			t.logger.Fatal(r)
 		}
-	}()
+	}()*/
 	t.tryAnnounceAll()
 	t.choker.startTicker()
 	for {
@@ -240,7 +231,8 @@ func (t *Torrent) onConnMsg(e msgWithConn) {
 		t.blockDownloaded(e.conn, block(v))
 	case uploadedBlock:
 		t.blockUploaded(e.conn, block(v))
-	case metainfoSize:
+	case downloadedMetadata:
+		t.metadataCompleted(int64(v))
 	case bitmap.Bitmap:
 		e.conn.peerBf = v
 		e.conn.reviewInterestsOnBitfield()
@@ -381,16 +373,9 @@ func (t *Torrent) closeDhtAnnounce() {
 }
 
 func (t *Torrent) gotPeers(peers []Peer) {
-	t.cl.mu.Lock()
 	t.addFilteredPeers(peers, func(peer Peer) bool {
-		for _, ip := range t.cl.blackList {
-			if ip.Equal(peer.P.IP) {
-				return false
-			}
-		}
-		return true
+		return !t.cl.containsInBlackList(peer.P.IP)
 	})
-	t.cl.mu.Unlock()
 	t.dialConns()
 }
 
@@ -403,7 +388,7 @@ func (t *Torrent) dialConns() {
 	defer t.halfOpenmu.Unlock()
 	for len(t.peers) > 0 && len(t.halfOpen) < t.maxHalfOpenConns {
 		peer := t.popPeer()
-		if t.peerInActiveConns(peer) {
+		if t.peerInActiveConns(peer) || t.cl.containsInBlackList(peer.P.IP) {
 			continue
 		}
 		t.halfOpen[peer.P.String()] = peer
@@ -414,7 +399,7 @@ func (t *Torrent) dialConns() {
 //has peer the same addr with any active connection
 func (t *Torrent) peerInActiveConns(peer Peer) bool {
 	for _, ci := range t.conns {
-		if bytes.Equal(ci.peer.P.IP, peer.P.IP) && ci.peer.P.Port == peer.P.Port {
+		if ci.peer.P.IP.Equal(peer.P.IP) && ci.peer.P.Port == peer.P.Port {
 			return true
 		}
 	}
@@ -536,6 +521,22 @@ func (t *Torrent) pieceHashed(i int, correct bool) {
 	}
 }
 
+func (t *Torrent) metadataCompleted(infoSize int64) {
+	ut := t.utmetadata.metadata(infoSize)
+	if sha1.Sum(ut.infoBytes) != t.mi.Info.Hash {
+		t.logger.Println("metadata didn't pass the verification")
+		//ban a random IP amongst the contributors
+		t.banIP(ut.contributors[rand.Intn(len(ut.contributors))])
+		t.broadcastToConns(requestsAvailable{})
+		t.utmetadata.reset(int(infoSize))
+	} else if err := bencode.Decode(ut.infoBytes, t.mi.Info); err != nil {
+		log.Fatal()
+	} else {
+		t.utmetadata.setCorrect(infoSize)
+		t.gotInfo()
+	}
+}
+
 //this func is started in its own goroutine.
 //when we close eventCh of conn, the goroutine
 //exits
@@ -584,8 +585,8 @@ func (t *Torrent) sendHaves(i int) {
 }
 
 func (t *Torrent) establishedConnection(ci *connInfo) bool {
-	if !t.wantConns() {
-		ci.sendC <- drop{}
+	if !t.wantConns() || t.cl.containsInBlackList(ci.peer.P.IP) {
+		ci.sendMsgToConn(drop{})
 		t.closeDhtAnnounce()
 		t.logger.Printf("rejected a connection with peer %v\n", ci.peer.P)
 		return false
@@ -596,12 +597,7 @@ func (t *Torrent) establishedConnection(ci *connInfo) bool {
 	if t.haveInfo() {
 		ci.sendMsgToConn(haveInfo{})
 	}
-	//TODO:minimize sends...
-	//
-	//TODO:send here extension msg
-	//
-	//if we have some pieces, we should sent a bitfield
-	if t.pieces.ownedPieces.Len() > 0 {
+	if t.pieces != nil && t.pieces.ownedPieces.Len() > 0 {
 		ci.sendBitfield()
 	}
 	if ci.reserved.SupportDHT() && t.cl.reserved.SupportDHT() && t.cl.dhtServer != nil {
@@ -623,8 +619,21 @@ func (t *Torrent) banPeer() {
 	if toBan == nil {
 		return
 	}
-	t.cl.banIP(toBan.peer.P.IP)
-	toBan.sendMsgToConn(drop{})
+	t.banIP(toBan.peer.P.IP)
+}
+
+func (t *Torrent) banIP(ip net.IP) {
+	//myAddr := t.cl.listener.Addr().(*net.TCPAddr)
+	myAddr := getOutboundIP()
+	if ip.Equal(myAddr) || ip.Equal(net.ParseIP("127.0.0.1")) {
+		return
+	}
+	t.cl.banIP(ip)
+	for _, c := range t.conns {
+		if c.peer.P.IP.Equal(ip) {
+			c.sendMsgToConn(drop{})
+		}
+	}
 }
 
 //conn notified us that it was dropped
@@ -724,94 +733,6 @@ func (t *Torrent) numPieces() int {
 	return t.mi.Info.NumPieces()
 }
 
-func (t *Torrent) downloadMetadata() bool {
-	//take the infoSize that we have seen most times from peers
-	infoSize := t.infoSizeFreq.max()
-	if infoSize == 0 || infoSize > 10000000 { //10MB,anacrolix pulled from his ass
-		return false
-	}
-	t.infoBytes = make([]byte, infoSize)
-	isLastSmaller := infoSize%metadataPieceSz != 0
-	numPieces := infoSize / metadataPieceSz
-	if isLastSmaller {
-		numPieces++
-	}
-	t.ownedInfoBlocks = make([]bool, numPieces)
-	//send requests to all conns
-	return true
-}
-
-func (t *Torrent) downloadedMetadata() bool {
-	for _, v := range t.ownedInfoBlocks {
-		if !v {
-			return false
-		}
-	}
-	return true
-}
-
-func (t *Torrent) writeMetadataPiece(b []byte, i int) error {
-	//tm.metadataMu.Lock()
-	//defer tm.metadataMu.Unlock()
-	if t.ownedInfoBlocks[i] {
-		return nil
-	}
-	//TODO:log this
-	if i*metadataPieceSz >= len(t.infoBytes) {
-		return errors.New("write metadata piece: out of range")
-	}
-	if len(b) > metadataPieceSz {
-		return errors.New("write metadata piece: length of of piece too big")
-	}
-	if len(b) != metadataPieceSz && i != len(t.ownedInfoBlocks)-1 {
-		return errors.New("write metadata piece:piece is not the last and length is not 16KB")
-	}
-	copy(t.infoBytes[i*metadataPieceSz:], b)
-	t.ownedInfoBlocks[i] = true
-	if t.downloadedMetadata() {
-		//TODO: verify should be done by Torrent goroutine
-		switch ok, err := t.verifyInfoDict(); {
-		case err != nil:
-			t.logger.Println(err)
-		case !ok:
-			//log
-		default:
-			t.gotInfo()
-		}
-	} else {
-		//pick the max freq `infoSize`
-	}
-	return nil
-}
-
-func (t *Torrent) readMetadataPiece(b []byte, i int) error {
-	if !t.haveInfo() {
-		panic("read metadata piece:we dont have info")
-	}
-	//out of range
-	if i*metadataPieceSz >= len(t.infoBytes) {
-		return errors.New("read metadata piece: out of range")
-	}
-
-	//last piece case
-	if (i+1)*metadataPieceSz >= len(t.infoBytes) {
-		b = t.infoBytes[i*metadataPieceSz:]
-	} else {
-		b = t.infoBytes[i*metadataPieceSz : (i+1)*metadataPieceSz]
-	}
-	return nil
-}
-
-func (t *Torrent) verifyInfoDict() (ok bool, err error) {
-	if sha1.Sum(t.infoBytes) != t.mi.Info.Hash {
-		return false, nil
-	}
-	if err := bencode.Decode(t.infoBytes, t.mi.Info); err != nil {
-		return false, errors.New("cant decode info dict")
-	}
-	return true, nil
-}
-
 func (t *Torrent) gotInfoHash() {
 	logPrefix := t.cl.logger.Prefix() + fmt.Sprintf("TR%x", t.mi.Info.Hash[14:])
 	t.logger = log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags)
@@ -819,15 +740,33 @@ func (t *Torrent) gotInfoHash() {
 
 func (t *Torrent) gotInfo() {
 	defer close(t.InfoC)
+	if t.mi.InfoBytes != nil {
+		//we had the info from start up. Create a utmetadata struct in order
+		//to upload if asked from a peer
+		if len(t.utmetadata.m) > 0 {
+			panic("got info")
+		}
+		infoBytes := t.mi.InfoBytes
+		ut := newUtMetadata(len(infoBytes))
+		// At this point, no connection has being made because t hasn't exposed its
+		// existance to Client (so no incoming connections) and we haven't actively try
+		// to connect to peers (outgoing) so it is safe to acess these without lock
+		t.utmetadata.correctSize = int64(len(infoBytes))
+		t.utmetadata.m[int64(len(infoBytes))] = ut
+		ut.infoBytes = t.mi.InfoBytes
+	} else {
+		//we downloaded info
+		t.logger.Println("info sucessfully downloaded")
+	}
 	t.length = t.mi.Info.TotalLength()
 	t.stats.BytesLeft = t.length
 	t.blockRequestSize = t.blockSize()
 	t.pieces = newPieces(t)
 	t.pieceQueuedHashingC = make(chan int, t.numPieces())
 	t.pieceHashedC = make(chan pieceHashed, t.numPieces())
+	t.broadcastToConns(haveInfo{})
 	var haveAll bool
 	t.storage, haveAll = t.openStorage(t.mi, t.cl.config.BaseDir, t.pieces.blocks(), t.logger)
-	t.broadcastToConns(haveInfo{})
 	if haveAll {
 		//mark all bocks completed and do all apropriate things when a piece
 		//hashing is succesfull
@@ -840,7 +779,6 @@ func (t *Torrent) gotInfo() {
 		ph := pieceHasher{t: t}
 		go ph.Run()
 	}
-	//TODO:review interests
 }
 
 func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
@@ -871,12 +809,14 @@ func (t *Torrent) scrapeTracker() (*tracker.ScrapeResp, error) {
 */
 
 func (t *Torrent) haveInfo() bool {
-	return t.mi.Info != nil
+	//return t.mi.Info != nil
+	//TODO: this is not good (but it is safe since only torrent can write to this variable)
+	return t.utmetadata.correctSize != 0
 }
 
 //true if we hadn't the info on start up and downloaded/downloadiing it via metadata extension.
 func (t *Torrent) infoWasDownloaded() bool {
-	return t.infoBytes != nil
+	return t.mi.InfoBytes == nil
 }
 
 func (t *Torrent) newLocker() *torrentLocker {

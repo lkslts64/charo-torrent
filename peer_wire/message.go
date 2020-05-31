@@ -168,7 +168,10 @@ func Decode(r io.Reader) (*Msg, error) {
 func writeExtension(msg *Msg) (b []byte) {
 	var err error
 	switch msg.ExtendedID {
-	case 0, ExtMetadataID:
+	//TODO: Really? change this for specific extension number (peer chooses them)
+	//add a field at msg struct to specify extended msg id
+	//currently we suupoort only metadata ext so this is sufficient but not safe and secure.
+	default:
 		b, err = bencode.Encode(&msg.ExtendedMsg)
 		if err != nil {
 			panic(err)
@@ -181,8 +184,9 @@ func writeExtension(msg *Msg) (b []byte) {
 			return
 		}
 		b = append(b, emsg.Data...)
-	default:
+		/*default:
 		panic("unknown extension id")
+		*/
 	}
 	return
 }

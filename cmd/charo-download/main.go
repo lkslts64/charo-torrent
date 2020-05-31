@@ -13,6 +13,7 @@ import (
 )
 
 var torrentFile = flag.String("torrentfile", "", "read the contents of the torrent `file`")
+var magnet = flag.String("magnet", "", "read the contents of the magnet")
 
 func main() {
 	flag.Parse()
@@ -29,11 +30,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	t, err := cl.AddFromFile(*torrentFile)
-	if err != nil {
-		log.Fatal(err)
+	var t *torrent.Torrent
+	if *torrentFile != "" {
+		t, err = cl.AddFromFile(*torrentFile)
+	} else if *magnet != "" {
+		t, err = cl.AddFromMagnet(*magnet)
+	} else {
+		log.Fatal("please provide file or magnet")
 	}
-	err = t.StartDataTransfer()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,11 +45,22 @@ func main() {
 	defer ticker.Stop()
 	var seedC <-chan time.Time
 	downloadC := t.DownloadedDataC
+	infoC := t.InfoC
 	w := uilive.New()
 	w.Start()
 loop:
 	for {
 		select {
+		case err := <-infoC:
+			if err != nil {
+				log.Fatal(err)
+			}
+			err = t.StartDataTransfer()
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println("downloaded info!")
+			infoC = nil
 		case <-downloadC:
 			fmt.Println("Downloaded torrent. Will be seeding for 1 hour...")
 			seedC = time.NewTimer(time.Hour).C

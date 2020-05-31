@@ -53,6 +53,10 @@ type pieceHashed struct {
 	ok bool
 }
 
+//conn sends this to signal that metadata are downloaded and Torrent should make
+//a hash check to see if they match the info hash. the value is the metadata_size
+type downloadedMetadata int64
+
 //conn sends this to signal that a block was downloaded
 type downloadedBlock block
 

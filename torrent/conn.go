@@ -59,6 +59,13 @@ type conn struct {
 	muPeerReqs     sync.Mutex
 	haveInfo       bool
 
+	numMetadataRespSent   int
+	metadataRequestTicker *time.Ticker
+	//TODO: change to map
+	metadataRejectedBlocks []int
+	metadataPendingBlocks  map[int]struct{}
+	metadataSize           int
+
 	//
 	debugVerifications int
 	//The number of outstanding request messages this peer supports
@@ -71,7 +78,7 @@ type conn struct {
 }
 
 //just wraps a msg with an error
-func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
+func newConn(t *Torrent, cn net.Conn, peer Peer, reserved peer_wire.Reserved) *conn {
 	logPrefix := t.cl.logger.Prefix() + "CN"
 	if peer.P.ID != nil {
 		logPrefix += fmt.Sprintf("%x ", peer.P.ID[14:])
@@ -79,19 +86,23 @@ func newConn(t *Torrent, cn net.Conn, peer Peer) *conn {
 		logPrefix += "------ "
 	}
 	return &conn{
-		cl:           t.cl,
-		t:            t,
-		logger:       log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags),
-		cn:           cn,
-		bwriter:      bufio.NewWriter(cn),
-		peer:         peer,
-		state:        newConnState(),
-		recvC:        make(chan interface{}, recvCSize),
-		sendC:        make(chan interface{}, sendCSize),
-		droppedC:     make(chan struct{}),
-		onFlightReqs: make(map[block]struct{}),
-		peerBf:       bitmap.Bitmap{RB: roaring.NewBitmap()},
-		peerReqs:     make(map[block]struct{}),
+		cl:                     t.cl,
+		t:                      t,
+		logger:                 log.New(t.cl.logger.Writer(), logPrefix, log.LstdFlags),
+		cn:                     cn,
+		bwriter:                bufio.NewWriter(cn),
+		peer:                   peer,
+		state:                  newConnState(),
+		recvC:                  make(chan interface{}, recvCSize),
+		sendC:                  make(chan interface{}, sendCSize),
+		droppedC:               make(chan struct{}),
+		onFlightReqs:           make(map[block]struct{}),
+		peerBf:                 bitmap.Bitmap{RB: roaring.NewBitmap()},
+		peerReqs:               make(map[block]struct{}),
+		reserved:               reserved,
+		metadataRequestTicker:  new(time.Ticker),
+		metadataRejectedBlocks: make([]int, 0),
+		metadataPendingBlocks:  make(map[int]struct{}, 0),
 	}
 }
 
@@ -154,9 +165,10 @@ func (c *conn) mainLoop() error {
 	//we need o quit chan in order to not leak readMsgs goroutine
 	quit := make(chan struct{})
 	defer func() {
-		if r := recover(); r != nil {
-			c.logger.Println(r)
-		}
+		/*if r := recover(); r != nil {
+			//c.logger.Println(r)
+			panic(r)
+		}*/
 		close(quit)
 		c.close()
 		err = nilOnEOF(err)
@@ -176,6 +188,14 @@ func (c *conn) mainLoop() error {
 			return nil
 		case <-c.keepAliveTimer.C:
 			err = c.sendKeepAlive()
+		case <-c.metadataRequestTicker.C:
+			if !c.haveInfo {
+				c.metadataRejectedBlocks = make([]int, 0)
+				err = c.requestMetadata()
+			} else {
+				c.metadataRequestTicker.Stop()
+			}
+
 		}
 		if err != nil {
 			return err
@@ -253,9 +273,9 @@ func (c *conn) wantBlocks() bool {
 		c.peerBf.Len() > 0 && len(c.onFlightReqs) < maxOnFlight/2
 }
 
-func (c *conn) maybeSendRequests() {
+func (c *conn) maybeSendRequests() error {
 	if !c.wantBlocks() {
-		return
+		return nil
 	}
 	sz := maxOnFlight - len(c.onFlightReqs)
 	if sz <= 0 {
@@ -268,7 +288,7 @@ func (c *conn) maybeSendRequests() {
 			panic("send requests")
 		}
 		c.cl.counters.Add("nonUsefulRequestReads", 1)
-		return
+		return nil
 	}
 	requests = requests[:n]
 	for _, req := range requests {
@@ -276,8 +296,11 @@ func (c *conn) maybeSendRequests() {
 			continue
 		}
 		c.onFlightReqs[req] = struct{}{}
-		c.sendMsgToPeer(req.reqMsg())
+		if err := c.sendMsgToPeer(req.reqMsg(), false); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 //returns false if its worth to keep the conn alive
@@ -305,7 +328,7 @@ func (c *conn) amSeeding() bool {
 func (c *conn) sendKeepAlive() error {
 	return c.sendMsgToPeer(&peer_wire.Msg{
 		Kind: peer_wire.KeepAlive,
-	})
+	}, false)
 }
 
 func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
@@ -315,7 +338,9 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 		case peer_wire.Port:
 		case peer_wire.Interested:
 			c.state.amInterested = true
-			defer c.maybeSendRequests()
+			defer func() {
+				err = c.maybeSendRequests()
+			}()
 		case peer_wire.NotInterested:
 			c.state.amInterested = false
 			//due to inconsistent states between Torrent and conn we may have requests on flight
@@ -353,7 +378,7 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 		default:
 			panic("unknown msg type")
 		}
-		err = c.sendMsgToPeer(v)
+		err = c.sendMsgToPeer(v, false)
 	case bitmap.Bitmap: //this equivalent to bitfield, we encode and write to wire.
 		c.myBf = v
 		if c.notUseful() {
@@ -363,21 +388,26 @@ func (c *conn) onTorrentMsg(cmd interface{}) (err error) {
 		err = c.sendMsgToPeer(&peer_wire.Msg{
 			Kind: peer_wire.Bitfield,
 			Bf:   c.bitfield(c.myBf),
-		})
+		}, false)
 	case requestsAvailable:
-		c.maybeSendRequests()
+		if c.haveInfo {
+			err = c.maybeSendRequests()
+		} else {
+			err = c.requestMetadata()
+		}
 	case haveInfo:
 		c.haveInfo = true
 		if c.peerBf.Len() > 0 {
 			c.t.pieces.onBitfield(c.peerBf)
 		}
+		err = c.maybeSendRequests()
 	case drop:
 		err = io.EOF
 	}
 	return
 }
 
-func (c *conn) sendMsgToPeer(msg *peer_wire.Msg) error {
+func (c *conn) sendMsgToPeer(msg *peer_wire.Msg, mustFlush bool) error {
 	limit := 1 << 16 //64KiB
 	n, err := c.bwriter.Write(msg.Encode())
 	if n > 0 {
@@ -386,7 +416,7 @@ func (c *conn) sendMsgToPeer(msg *peer_wire.Msg) error {
 	if err != nil {
 		return err
 	}
-	if c.bwriter.Buffered() > limit {
+	if c.bwriter.Buffered() > limit || mustFlush {
 		return c.flushWriter()
 	}
 	return nil
@@ -396,13 +426,16 @@ func (c *conn) flushWriter() error {
 	if c.bwriter.Buffered() <= 0 {
 		return nil
 	}
-	if !c.keepAliveTimer.Stop() {
-		select {
-		case <-c.keepAliveTimer.C:
-		default:
+	if c.keepAliveTimer != nil {
+
+		if !c.keepAliveTimer.Stop() {
+			select {
+			case <-c.keepAliveTimer.C:
+			default:
+			}
 		}
+		c.keepAliveTimer.Reset(keepAliveInterval)
 	}
-	c.keepAliveTimer.Reset(keepAliveInterval)
 	return c.bwriter.Flush()
 }
 
@@ -423,12 +456,15 @@ func (c *conn) onPeerMsg(msg *peer_wire.Msg) (err error) {
 	case peer_wire.Choke:
 		err = c.discardBlocks(true, false)
 		if err != nil {
-			return err
+			return
 		}
 		err = changeState(&c.state.isChoking, true)
 	case peer_wire.Unchoke:
 		err = changeState(&c.state.isChoking, false)
-		c.maybeSendRequests()
+		if err != nil {
+			return err
+		}
+		err = c.maybeSendRequests()
 	case peer_wire.Piece:
 		err = c.onPieceMsg(msg)
 	case peer_wire.Request:
@@ -550,41 +586,153 @@ func isClosed(ch chan struct{}) bool {
 	}
 }
 
+func (c *conn) remoteTCPAddr() (addr *net.TCPAddr) {
+	var err error
+	if addr, err = net.ResolveTCPAddr("tcp", c.cn.RemoteAddr().String()); err != nil {
+		panic(err)
+	}
+	return
+}
+
 type metainfoSize int64
 
 func (c *conn) onExtended(msg *peer_wire.Msg) (err error) {
+	if !c.cl.reserved.SupportExtended() || !c.reserved.SupportExtended() {
+		err = errors.New("received ext while not supporting it")
+	}
 	switch v := msg.ExtendedMsg.(type) {
 	case peer_wire.ExtHandshakeDict:
 		c.exts, err = v.Extensions()
+		if err != nil {
+			return
+		}
 		if _, ok := c.exts[peer_wire.ExtMetadataName]; ok {
 			if msize, ok := v.MetadataSize(); ok {
-				if err = c.sendMsgToTorrent(metainfoSize(msize)); err != nil {
-					//error
+				c.metadataSize = int(msize)
+				if c.t.utmetadata.add(msize) {
+					err = c.requestMetadata()
+				} else {
+					c.ban = true
+					err = io.EOF
 				}
 			}
 		}
 	case peer_wire.MetadataExtMsg:
+		if c.exts == nil {
+			err = errors.New("haven't received ext handshake yet")
+			return
+		}
 		switch v.Kind {
 		case peer_wire.MetadataDataID:
-		case peer_wire.MetadataRejID:
-		case peer_wire.MetadataReqID:
-			if !c.haveInfo {
-				c.sendMsgToPeer(&peer_wire.Msg{
-					Kind:       peer_wire.Extended,
-					ExtendedID: peer_wire.ExtMetadataID,
-					ExtendedMsg: peer_wire.MetadataExtMsg{
-						Kind:  peer_wire.MetadataRejID,
-						Piece: v.Piece,
-					},
-				})
+			var completed bool
+			if v.TotalSz != c.metadataSize {
+				err = errors.New("incompatible metadata size")
+				return
 			}
+			completed, err = c.t.utmetadata.writeBlock(v.Data, v.Piece, v.TotalSz, c.remoteTCPAddr().IP)
+			if err != nil {
+				return
+			}
+			if _, ok := c.metadataPendingBlocks[v.Piece]; ok {
+				delete(c.metadataPendingBlocks, v.Piece)
+			} else {
+				c.logger.Println("received unexpected metadata piece")
+			}
+			if completed {
+				err = c.sendMsgToTorrent(downloadedMetadata(c.metadataSize))
+			} else {
+				err = c.requestMetadata()
+			}
+		case peer_wire.MetadataRejID:
+			c.metadataRejectedBlocks = append(c.metadataRejectedBlocks, v.Piece)
+			if _, ok := c.metadataPendingBlocks[v.Piece]; ok {
+				delete(c.metadataPendingBlocks, v.Piece)
+			} else {
+				c.logger.Println("received unexpected metadata piece")
+			}
+			//maybe after 5 seconds the peer will have the block
+			if c.metadataRequestTicker.C == nil {
+				c.metadataRequestTicker = time.NewTicker(5 * time.Second)
+			}
+		case peer_wire.MetadataReqID:
+			var extMsg peer_wire.MetadataExtMsg
+			ut := c.t.utmetadata.correct()
+			if !c.haveInfo || c.numMetadataRespSent > 3*ut.numPieces || ut == nil ||
+				v.Piece >= ut.numPieces {
+				extMsg = peer_wire.MetadataExtMsg{
+					Kind:  peer_wire.MetadataRejID,
+					Piece: v.Piece,
+				}
+			} else {
+				b := make([]byte, ut.metadataPieceLength(v.Piece))
+				c.t.utmetadata.readBlock(b, v.Piece)
+				c.numMetadataRespSent++
+				extMsg = peer_wire.MetadataExtMsg{
+					Kind:    peer_wire.MetadataDataID,
+					Piece:   v.Piece,
+					TotalSz: len(ut.infoBytes),
+					Data:    b,
+				}
+			}
+			m, err := c.extensionMsg(peer_wire.ExtMetadataName, extMsg)
+			if err != nil {
+				return err
+			}
+			err = c.sendMsgToPeer(m, false)
 		default:
-			//unknown extension ID
+			//ignore uknown id
 		}
 	default:
-		//unknown extension ID
+		return fmt.Errorf("unknown extended msg type %T", v)
+	}
+	return
+}
+
+func (c *conn) requestMetadata() error {
+	ut := c.t.utmetadata.correct()
+	if ut != nil || c.haveInfo {
+		return nil
+	}
+	if c.metadataSize == 0 || c.exts == nil {
+		return nil
+	}
+	if _, ok := c.exts[peer_wire.ExtMetadataName]; !ok {
+		return nil
+	}
+	toRequest := 5 - len(c.metadataPendingBlocks)
+	if toRequest <= 0 {
+		return nil
+	}
+	blocks := c.t.utmetadata.fillRequest(c.metadataSize, toRequest, c.metadataRejectedBlocks)
+	for _, piece := range blocks {
+		msg, err := c.extensionMsg(peer_wire.ExtMetadataName, peer_wire.MetadataExtMsg{
+			Kind:  peer_wire.MetadataReqID,
+			Piece: piece,
+		})
+		if err != nil {
+			return nil
+		}
+		if _, ok := c.metadataPendingBlocks[piece]; !ok {
+			c.metadataPendingBlocks[piece] = struct{}{}
+			err = c.sendMsgToPeer(msg, false)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func (c *conn) extensionMsg(extname peer_wire.ExtensionName, value interface{}) (*peer_wire.Msg, error) {
+	id, ok := c.exts[extname]
+	if !ok {
+		return nil, errors.New("extension not supported")
+	}
+	return &peer_wire.Msg{
+		Kind:        peer_wire.Extended,
+		ExtendedID:  id,
+		ExtendedMsg: value,
+	}, nil
 }
 
 func (c *conn) discardBlocks(notifyTorrent, sendCancels bool) error {
@@ -592,7 +740,9 @@ func (c *conn) discardBlocks(notifyTorrent, sendCancels bool) error {
 		unsatisfiedRequests := []block{}
 		for req := range c.onFlightReqs {
 			if sendCancels {
-				c.sendMsgToPeer(req.cancelMsg())
+				if err := c.sendMsgToPeer(req.cancelMsg(), false); err != nil {
+					return err
+				}
 			}
 			unsatisfiedRequests = append(unsatisfiedRequests, req)
 		}
@@ -644,12 +794,15 @@ func (c *conn) upload() error {
 			if err := c.t.readBlock(data, req.pc, req.off); err != nil {
 				return nil
 			}
-			c.sendMsgToPeer(&peer_wire.Msg{
+			err := c.sendMsgToPeer(&peer_wire.Msg{
 				Kind:  peer_wire.Piece,
 				Index: uint32(req.pc),
 				Begin: uint32(req.off),
 				Block: data,
-			})
+			}, false)
+			if err != nil {
+				return err
+			}
 			return c.sendMsgToTorrent(uploadedBlock(req))
 		}()
 		if err != nil {
@@ -710,7 +863,10 @@ func (c *conn) onPieceMsg(msg *peer_wire.Msg) error {
 	}
 	if ok {
 		delete(c.onFlightReqs, bl)
-		c.maybeSendRequests()
+		err := c.maybeSendRequests()
+		if err != nil {
+			return err
+		}
 	}
 	if err := c.t.writeBlock(msg.Block, bl.pc, bl.off); err != nil {
 		if errors.Is(err, storage.ErrAlreadyWritten) {

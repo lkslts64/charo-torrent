@@ -17,6 +17,9 @@ func TestChoker(t *testing.T) {
 			t: &Torrent{
 				mi:            &metainfo.MetaInfo{},
 				uploadEnabled: true,
+				utmetadata: &utMetadatas{
+					m: make(map[int64]*utMetadata),
+				},
 			},
 			sendC: make(chan interface{}, 50), //ensure we have length
 			state: connState{
