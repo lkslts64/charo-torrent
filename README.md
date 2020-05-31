@@ -1,6 +1,6 @@
 # charo-torrent
 
-[![GoDoc](https://godoc.org/github.com/lkslts64/charo-torrent/torrent?status.svg)](https://godoc.org/github.com/lkslts64/charo-torrent/torrent)
+[![GoDoc](https://godoc.org/github.com/lkslts64/charo-torrent/torrent?status.svg)](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) [![Join the chat at https://gitter.im/lkslts64/charo-torrent](https://badges.gitter.im/lkslts64/charo-torrent.svg)](https://gitter.im/lkslts64/charo-torrent?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 This repository implements the BitTorrent protocol and comes with a minimal CLI BitTorrent
 client. The [torrent package](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) is documented can be used by other projects as well. Interfaces like [PieceSelector](https://godoc.org/github.com/lkslts64/charo-torrent/torrent#PieceSelector) make this package configurable and distinct from others. Aside from the [core protocol specification](https://www.bittorrent.org/beps/bep_0003.html), charo implements:
