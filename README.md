@@ -3,8 +3,9 @@
 [![GoDoc](https://godoc.org/github.com/lkslts64/charo-torrent/torrent?status.svg)](https://godoc.org/github.com/lkslts64/charo-torrent/torrent)
 
 This repository implements the BitTorrent protocol and comes with a minimal CLI BitTorrent
-client. The [torrent package](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) is very simple to use and can be used as a library by other projects. Interfaces like [PieceSelector](https://godoc.org/github.com/lkslts64/charo-torrent/torrent#PieceSelector) make this library configurable and distinct from others. Aside from the [core protocol specification](https://www.bittorrent.org/beps/bep_0003.html), charo implements:
+client. The [torrent package](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) is documented can be used by other projects as well. Interfaces like [PieceSelector](https://godoc.org/github.com/lkslts64/charo-torrent/torrent#PieceSelector) make this package configurable and distinct from others. Aside from the [core protocol specification](https://www.bittorrent.org/beps/bep_0003.html), charo implements:
 
+* [Extension for Peers to Send Metadata Files (aka Magnet Links)](https://www.bittorrent.org/beps/bep_0009.html)
 * [UDP Tracker Protocol](https://www.bittorrent.org/beps/bep_0015.html)
 * [DHT Protocol](https://www.bittorrent.org/beps/bep_0005.html) ([anacrolix package](https://github.com/anacrolix/dht))
 * [Tracker Scrape Extension](https://www.bittorrent.org/beps/bep_0048.html)
@@ -38,4 +39,4 @@ Proper usage of the library is documented at the [api reference](https://godoc.o
 
 ## Contribute
 
-Contributions are welcome!
+Contributions are welcome! Come to chat at gitter
