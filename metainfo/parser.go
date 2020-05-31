@@ -1,8 +1,13 @@
 package metainfo
 
 import (
+	"encoding/base32"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
+	"strings"
 )
 
 //Parser parses an input source (e.g file,uri) into a MetaInfo struct
@@ -25,7 +30,53 @@ type MagnetParser struct {
 }
 
 func (mp *MagnetParser) Parse() (*MetaInfo, error) {
-	return nil, nil
+	const xtPrefix = "urn:btih:"
+	u, err := url.Parse(mp.URI)
+	if err != nil {
+		err = fmt.Errorf("error parsing uri: %s", err)
+		return nil, nil
+	}
+	if u.Scheme != "magnet" {
+		err = fmt.Errorf("unexpected scheme: %q", u.Scheme)
+		return nil, nil
+	}
+	xt := u.Query().Get("xt")
+	if !strings.HasPrefix(xt, xtPrefix) {
+		err = fmt.Errorf("bad xt parameter")
+		return nil, nil
+	}
+	infoHash := xt[len(xtPrefix):]
+	// BTIH hash can be in HEX or BASE32 encoding
+	// will assign appropriate func judging from symbol length
+	var decode func(dst, src []byte) (int, error)
+	switch len(infoHash) {
+	case 40:
+		decode = hex.Decode
+	case 32:
+		decode = base32.StdEncoding.Decode
+	}
+	if decode == nil {
+		err = fmt.Errorf("unhandled xt parameter encoding: encoded length %d", len(infoHash))
+		return nil, nil
+	}
+	var (
+		ihash [20]byte
+	)
+	n, err := decode(ihash[:], []byte(infoHash))
+	if err != nil {
+		err = fmt.Errorf("error decoding xt: %s", err)
+		return nil, nil
+	}
+	if n != 20 {
+		panic(n)
+	}
+	//m.DisplayName = u.Query().Get("dn")
+	//m.Trackers = u.Query()["tr"]
+	return &MetaInfo{
+		Info: &InfoDict{
+			Hash: ihash,
+		},
+	}, nil
 }
 
 type ReaderParser struct {
