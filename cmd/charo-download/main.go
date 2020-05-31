@@ -51,10 +51,7 @@ func main() {
 loop:
 	for {
 		select {
-		case err := <-infoC:
-			if err != nil {
-				log.Fatal(err)
-			}
+		case <-infoC:
 			err = t.StartDataTransfer()
 			if err != nil {
 				log.Fatal(err)
