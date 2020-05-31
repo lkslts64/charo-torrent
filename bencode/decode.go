@@ -242,7 +242,7 @@ func (r benReader) readBenList(v reflect.Value) error {
 	if err != nil {
 		return err
 	}
-	//create a new value whos type is the type of the elements of the slice(v).
+	//create a new value whose type is the type of the elements of the slice(v).
 	//this is the type that we will expect to be contained in the bencoded string.
 	//loop and call decode for each bencoded element that you traverse
 	//until you traverse an 'e' who is the first byte of a bencoded value.
