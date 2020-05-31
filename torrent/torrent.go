@@ -75,22 +75,19 @@ type Torrent struct {
 	//closes when the Torrent closes
 	ClosedC  chan struct{}
 	isClosed bool
-	//when this closes it signals all conns to exit
-	dropC chan struct{}
 	//closes when all pieces have been downloaded
 	DownloadedDataC chan struct{}
-	//fires when we get the info dictionary
-	InfoC chan error
+	//closes when we get the info dictionary
+	InfoC chan struct{}
+	//when this closes it signals all conns to exit
+	dropC chan struct{}
 	//channel to send requests to piece hasher goroutine
 	pieceQueuedHashingC chan int
 	//response channel of piece hasher
 	pieceHashedC          chan pieceHashed
 	queuedForVerification map[int]struct{}
-	//Info field of `mi` is nil if we dont have it.
-	//Restrict access to metainfo before we get the
-	//whole mi.Info part.
-	mi         *metainfo.MetaInfo
-	utmetadata *utMetadatas
+	mi                    *metainfo.MetaInfo
+	utmetadata            *utMetadatas
 	//length of data to be downloaded
 	length         int
 	stats          Stats
@@ -112,7 +109,7 @@ func newTorrent(cl *Client) *Torrent {
 		wantPeersThreshold:        100,
 		dropC:                     make(chan struct{}),
 		DownloadedDataC:           make(chan struct{}),
-		InfoC:                     make(chan error),
+		InfoC:                     make(chan struct{}),
 		ClosedC:                   make(chan struct{}),
 		trackerAnnouncerResponseC: make(chan trackerAnnouncerResponse, 1),
 		trackerAnnouncerTimer:     newExpiredTimer(),
@@ -530,7 +527,8 @@ func (t *Torrent) metadataCompleted(infoSize int64) {
 		t.broadcastToConns(requestsAvailable{})
 		t.utmetadata.reset(int(infoSize))
 	} else if err := bencode.Decode(ut.infoBytes, t.mi.Info); err != nil {
-		log.Fatal()
+		//TODO: close gracefully (dont leak goroutines)
+		t.close()
 	} else {
 		t.utmetadata.setCorrect(infoSize)
 		t.gotInfo()

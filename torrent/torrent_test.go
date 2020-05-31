@@ -635,7 +635,7 @@ func TestMetadataExtension(t *testing.T) {
 	leecherTr, err := leecher.AddFromParser(&metainfo.InfoHashParser{seederTr.mi.Info.Hash})
 	require.NoError(t, err)
 	leecherTr.AddPeers(addrToPeer(seeder.addr(), SourceIncoming))
-	assert.NoError(t, <-leecherTr.InfoC)
+	<-leecherTr.InfoC
 	assert.Equal(t, seederTr.mi.Info, leecherTr.mi.Info)
 	require.NoError(t, leecherTr.StartDataTransfer())
 	<-leecherTr.DownloadedDataC
@@ -684,7 +684,7 @@ func testMetadataExtensionMallicious(t *testing.T, uts []*utMetadata) {
 	time.AfterFunc(2*time.Second, func() {
 		require.NoError(t, leecherTr.AddPeers(addrToPeer(honest, SourceIncoming)))
 	})
-	assert.NoError(t, <-leecherTr.InfoC)
+	<-leecherTr.InfoC
 	require.NoError(t, leecherTr.StartDataTransfer())
 	<-leecherTr.DownloadedDataC
 }
