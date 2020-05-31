@@ -32,12 +32,12 @@ func (t *Torrent) Swarm() []Peer {
 }
 
 //StartDataTransfer enables downloading/uploading the torrent's data.
-// It should be called once for each Torrent.
-// It requires the info first.
+//It should be called once for each Torrent.
+//It requires the info first i.e one should ensure that t.InfoC is closed
 //After the download is complete, the Torrent transits in seeding mode
 //(i.e altruistically upload) until it's closed.
 //If the data are already there, StartDataTransfer returns immediatly and
-//and seeds the torrent.
+//seeds the torrent.
 func (t *Torrent) StartDataTransfer() error {
 	l := t.newLocker()
 	l.lock()

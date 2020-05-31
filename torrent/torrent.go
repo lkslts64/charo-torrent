@@ -77,7 +77,7 @@ type Torrent struct {
 	isClosed bool
 	//closes when all pieces have been downloaded
 	DownloadedDataC chan struct{}
-	//closes when we get the info dictionary
+	//closes when we get the info dictionary.
 	InfoC chan struct{}
 	//when this closes it signals all conns to exit
 	dropC chan struct{}
