@@ -36,6 +36,16 @@ type addrPort struct {
 	port uint16
 }
 
+//works only if ch is a close only channel
+func isChanClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func parseAddr(address string) (*addrPort, error) {
 	shost, sport, err := net.SplitHostPort(address)
 	if err != nil {
@@ -60,4 +70,13 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func contains(s []int, v int) bool {
+	for _, num := range s {
+		if num == v {
+			return true
+		}
+	}
+	return false
 }
