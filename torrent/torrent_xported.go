@@ -58,6 +58,9 @@ func (t *Torrent) StartDataTransfer() error {
 	if !t.haveAll() {
 		//notify conns to start downloading
 		t.pieces.setDownloadEnabled(true)
+		for _, c := range t.conns {
+			c.reviewInterestsOnBitfield()
+		}
 		t.broadcastToConns(requestsAvailable{})
 	}
 	t.tryAnnounceAll()
