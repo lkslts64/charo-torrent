@@ -21,6 +21,19 @@ func (f freqMap) add(n int64) {
 	}
 }
 
+func (f freqMap) remove(n int64) {
+	if _, ok := f[n]; ok {
+		f[n]--
+		if f[n] == 0 {
+			delete(f, n)
+		}
+	}
+}
+
+func (f freqMap) len() int {
+	return len(f)
+}
+
 func (f freqMap) initKey(n int64) {
 	if _, ok := f[n]; ok {
 		return
