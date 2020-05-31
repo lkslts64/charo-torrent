@@ -113,7 +113,9 @@ func (btl *btListener) Accept() (*conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	btl.cl.mu.Lock()
 	t, ok := btl.cl.torrents[hs.InfoHash]
+	btl.cl.mu.Unlock()
 	if !ok {
 		return nil, errors.New("peer handshake contain infohash that client doesn't manage")
 	}
