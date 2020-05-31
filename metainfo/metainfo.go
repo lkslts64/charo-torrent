@@ -1,6 +1,8 @@
 package metainfo
 
 import (
+	"crypto/sha1"
+	"errors"
 	"fmt"
 	_ "fmt"
 	"io/ioutil"
@@ -18,7 +20,7 @@ type MetaInfo struct {
 	CreationDate int        `bencode:"creation date" empty:"omit"`
 	Encoding     string     `bencode:"encoding" empty:"omit"`
 	Info         *InfoDict  `bencode:"info"`
-	//URLList      []string    `bencode:"url-list" empty:"omit"`
+	InfoBytes    []byte     `bencode:"-"`
 }
 
 func loadMetainfoFromBytes(data []byte) (*MetaInfo, error) {
@@ -34,9 +36,17 @@ func loadMetainfoFromBytes(data []byte) (*MetaInfo, error) {
 	//TODO: we find here the has but we must also the infoBytes for
 	//metadata extension. Why parse the file twice?
 	err = meta.Info.setInfoHash(data)
-	if err != nil {
-		return nil, fmt.Errorf("load metainfo: %w", err)
+
+	infoBytes, ok, err := bencode.Get(data, "info")
+	if !ok {
+		return nil, errors.New("set info hash: key info doesn't exist in dict")
 	}
+	if err != nil {
+		return nil, fmt.Errorf("set info hash: %w", err)
+	}
+	meta.InfoBytes = infoBytes
+	h := sha1.Sum(infoBytes)
+	meta.Info.Hash = h
 	return &meta, nil
 }
 
