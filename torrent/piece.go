@@ -319,12 +319,11 @@ func (p *Piece) CompletedBlocks() int {
 func newPiece(t *Torrent, i int) *Piece {
 	pieceLen := t.pieceLen(uint32(i))
 	lastBlockLen := t.blockRequestSize
-	var extra int
+	blocks := pieceLen / t.blockRequestSize
 	if lastBytes := pieceLen % t.blockRequestSize; lastBytes != 0 {
-		extra = 1
+		blocks++
 		lastBlockLen = lastBytes
 	}
-	blocks := pieceLen/t.blockRequestSize + extra
 	//set all blocks to unrequested
 	var unrequestedBlocks bitmap.Bitmap
 	for j := 0; j < blocks; j++ {
