@@ -5,7 +5,7 @@
 [![GoDoc](https://godoc.org/github.com/lkslts64/charo-torrent/torrent?status.svg)](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) [![Join the chat at https://gitter.im/lkslts64/charo-torrent](https://badges.gitter.im/lkslts64/charo-torrent.svg)](https://gitter.im/lkslts64/charo-torrent?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 This repository implements the BitTorrent protocol and comes with a minimal CLI BitTorrent
-client. The [torrent package](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) is well documented and can be used by other projects as well. Interfaces like [PieceSelector](https://godoc.org/github.com/lkslts64/charo-torrent/torrent#PieceSelector) make this package configurable and distinct from others. Aside from the [core protocol specification](https://www.bittorrent.org/beps/bep_0003.html), charo implements:
+client. The [torrent package](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) is written with focus on scalability, it is well documented and can be used by other projects as well. Interfaces like [PieceSelector](https://godoc.org/github.com/lkslts64/charo-torrent/torrent#PieceSelector) make this package configurable and distinct from others. Aside from the [core protocol specification](https://www.bittorrent.org/beps/bep_0003.html), charo implements:
 
 * [Extension for Peers to Send Metadata Files (aka Magnet Links)](https://www.bittorrent.org/beps/bep_0009.html)
 * [UDP Tracker Protocol](https://www.bittorrent.org/beps/bep_0015.html)
@@ -30,9 +30,14 @@ To download a torrent from a file:
     $ charo-download -torrentfile <file>
     The downloaded files will be available under the current working directory.
 
+To download a torrent from a magnet:
+
+    <magnet> is a [magnet URI scheme](https://en.wikipedia.org/wiki/Magnet_URI_scheme)
+    $ charo-download -magnet <magnet>
+
 ## Library Usage
 
-Proper usage of the library is documented at the [api reference](https://godoc.org/github.com/lkslts64/charo-torrent/torrent).
+Read the docs [docs](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) or check the [minimal cli client](cmd/charo-download/main.go).
 
 ## Other notable Go torrent packages
 
@@ -41,4 +46,8 @@ Proper usage of the library is documented at the [api reference](https://godoc.o
 
 ## Contribute
 
-Contributions are welcome! Come to chat at gitter
+Contributions are welcome! Come to chat on gitter
+
+## Credits
+
+Logo designed by [Leia]()
