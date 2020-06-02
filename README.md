@@ -1,3 +1,5 @@
+![charo logo](./logo.png)
+
 # charo-torrent
 
 [![GoDoc](https://godoc.org/github.com/lkslts64/charo-torrent/torrent?status.svg)](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) [![Join the chat at https://gitter.im/lkslts64/charo-torrent](https://badges.gitter.im/lkslts64/charo-torrent.svg)](https://gitter.im/lkslts64/charo-torrent?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
