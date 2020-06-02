@@ -32,7 +32,7 @@ To download a torrent from a file:
 
 To download a torrent from a magnet:
 
-    <magnet> is a magnet URI scheme
+    <magnet> is a magnet URI
     $ charo-download -magnet <magnet>
 
 ## Library Usage
