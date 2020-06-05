@@ -32,12 +32,12 @@ To download a torrent from a file:
 
 To download a torrent from a magnet:
 
-    <magnet> is a [magnet URI scheme](https://en.wikipedia.org/wiki/Magnet_URI_scheme)
+    <magnet> is a magnet URI
     $ charo-download -magnet <magnet>
 
 ## Library Usage
 
-Read the docs [docs](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) or check the [minimal cli client](cmd/charo-download/main.go).
+Read the [docs](https://godoc.org/github.com/lkslts64/charo-torrent/torrent) or check the [minimal cli client](cmd/charo-download/main.go).
 
 ## Other notable Go torrent packages
 
