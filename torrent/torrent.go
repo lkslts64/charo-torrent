@@ -61,11 +61,10 @@ type Torrent struct {
 	lastAnnounceResp             *tracker.AnnounceResp
 	numAnnounces                 int
 	numTrackerAnnouncesSend      int
-	//
-	dhtAnnounceResp  *dht.Announce
-	dhtAnnounceTimer *time.Timer
-	canAnnounceDht   bool
-	numDhtAnnounces  int
+	dhtAnnounceResp              *dht.Announce
+	dhtAnnounceTimer             *time.Timer
+	canAnnounceDht               bool
+	numDhtAnnounces              int
 	//fires when an exported method wants to be invoked
 	userC chan chan interface{}
 	//these bools are set true when we should actively download/upload the torrent's data.
@@ -457,24 +456,22 @@ func (t *Torrent) writeStatus(b *strings.Builder) {
 }
 
 func (t *Torrent) state() string {
-	if t.isClosed {
-		return "closed"
-	}
-	if t.seeding() {
-		return "seeding"
-	}
-	if !t.haveInfo() {
-		return "downloading info"
-	}
 	switch {
+	case t.isClosed:
+		return "closed"
+	case t.seeding():
+		return "seeding"
+	case !t.haveInfo():
+		return "downloading info"
 	case t.uploadEnabled && t.downloadEnabled:
 		return "uploading/downloading"
 	case t.uploadEnabled:
 		return "uploading only"
 	case t.downloadEnabled:
 		return "downloading only"
+	default:
+		return "waiting for downloading request"
 	}
-	return "waiting for downloading request"
 }
 
 func (t *Torrent) blockDownloaded(c *connInfo, b block) {
@@ -624,6 +621,7 @@ func (t *Torrent) banIP(ip net.IP) {
 	//myAddr := t.cl.listener.Addr().(*net.TCPAddr)
 	myAddr := getOutboundIP()
 	if ip.Equal(myAddr) || ip.Equal(net.ParseIP("127.0.0.1")) {
+		//filter these IPs for testing
 		return
 	}
 	t.cl.banIP(ip)
@@ -790,7 +788,6 @@ func (t *Torrent) pieceLen(i uint32) (pieceLen int) {
 	return
 }
 
-//call this when we get info
 func (t *Torrent) blockSize() int {
 	if maxRequestBlockSz > t.mi.Info.PieceLen {
 		return t.mi.Info.PieceLen

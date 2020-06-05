@@ -301,19 +301,33 @@ func (p *Piece) Blocks() int {
 	return p.blocks
 }
 
-//PendingBlocks returns the number of pendingBlocks blocks of p
+//PendingBlocks returns the number of pendingBlocks blocks of p.
 func (p *Piece) PendingBlocks() int {
 	return p.blocks - (p.unrequestedBlocks.Len() + p.completeBlocks.Len())
 }
 
-//UnrequestedBlocks returns the number of unrequested blocks of p
+//UnrequestedBlocks returns the number of unrequested blocks of p.
 func (p *Piece) UnrequestedBlocks() int {
 	return p.unrequestedBlocks.Len()
 }
 
-//CompletedBlocks returns the number of completed blocks of p
+//CompletedBlocks returns the number of completed blocks of p.
 func (p *Piece) CompletedBlocks() int {
 	return p.completeBlocks.Len()
+}
+
+//Data Returns the data of the piece. Requires that the piece has been downloaded otherwise
+//an error is returned.
+func (p *Piece) Data() (b []byte, err error) {
+	b = make([]byte, p.length())
+	if err = p.t.readBlock(b, p.index, 0); err != nil {
+		err = errors.New("piece has not been downloaded yet")
+	}
+	return
+}
+
+func (p *Piece) length() int {
+	return p.t.blockRequestSize*(p.blocks-1) + p.lastBlockLen
 }
 
 func newPiece(t *Torrent, i int) *Piece {
