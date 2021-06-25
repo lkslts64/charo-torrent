@@ -23,8 +23,13 @@ As a side note, charo doesn't support IPv6 yet.
 
 Go >= 1.13 is required
 
-1. Library: `go get github.com/lkslts64/charo-torrent/torrent`
-2. Client: `go get github.com/lkslts64/charo-torrent/cmd/charo-download`
+1. Library: 
+     * `go get -d github.com/lkslts64/charo-torrent/torrent`
+     * `go install github.com/lkslts64/charo-torrent/torrent@latest`
+
+4. Client: 
+     * `go get -d github.com/lkslts64/charo-torrent/cmd/charo-download`
+     * `go install github.com/lkslts64/charo-torrent/cmd/charo-download@latest`
 
 ## Client Usage
 
