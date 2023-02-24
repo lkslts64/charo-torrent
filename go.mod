@@ -10,8 +10,6 @@ require (
 	github.com/dustin/go-humanize v1.0.0
 	github.com/gosuri/uilive v0.0.3
 	github.com/stretchr/testify v1.4.0
-	go.uber.org/atomic v1.5.1
-	golang.org/x/lint v0.0.0-20191125180803-fdd1cda4f05f // indirect
-	golang.org/x/net v0.0.0-20191007182048-72f939374954 // indirect
-	golang.org/x/tools v0.0.0-20200107184032-11e9d9cc0042 // indirect
+	golang.org/x/net v0.7.0 // indirect
+	golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898 // indirect
 )
